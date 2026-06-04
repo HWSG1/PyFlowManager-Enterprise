@@ -1,29 +1,19 @@
-﻿/*
-PyFlow Manager - Script de creación limpia y semilla base.
-Generado a partir del script SQL original y del manual adjunto.
-Notas:
-1) No incluye rutas físicas MDF/LDF para que SQL Server use su carpeta DATA predeterminada.
-2) No crea login SQL de servidor. Use el login corporativo o SQL login definido por el DBA y apúntelo en la cadena de conexión del backend.
-3) Usuario inicial de aplicación: admin / PyFlow123* con hash PBKDF2 indicado por el solicitante.
+/*
+PyFlow Manager - Azure SQL Database
+Archivo 02 - Creación de objetos, semilla base y usuario de aplicación.
+
+IMPORTANTE:
+1) Ejecutar este script conectado directamente a la base Azure SQL destino, por ejemplo: PyFlowManager.
+2) Azure SQL Database no permite cambiar de base con USE como en SQL Server on-premise.
+3) Este script NO crea logins de servidor. Crea un usuario contenido de base de datos para la aplicación.
+4) Cambiar la contraseña temporal antes de ejecutar en producción.
 */
-/* ADVERTENCIA: ejecutar sobre una base nueva/vacía. Si PyFlowManager ya tiene objetos, respalde y elimine la base antes de recrearla. */
-USE [master]
+
+SET ANSI_NULLS ON
 GO
-IF DB_ID(N'PyFlowManager') IS NULL
-BEGIN
-    CREATE DATABASE [PyFlowManager];
-END
+SET QUOTED_IDENTIFIER ON
 GO
-ALTER DATABASE [PyFlowManager] SET COMPATIBILITY_LEVEL = 150
-GO
-ALTER DATABASE [PyFlowManager] SET RECOVERY FULL
-GO
-ALTER DATABASE [PyFlowManager] SET PAGE_VERIFY CHECKSUM
-GO
-ALTER DATABASE [PyFlowManager] SET QUERY_STORE = ON
-GO
-USE [PyFlowManager]
-GO
+
 /****** Objeto: Table [dbo].[Schedules] Fecha de script: 03/06/2026 07:53:14 p. m. ******/
 SET ANSI_NULLS ON
 GO
@@ -1482,21 +1472,12 @@ BEGIN
     SET @execution_id = SCOPE_IDENTITY();
 END;
 GO
-USE [master]
-GO
-ALTER DATABASE [PyFlowManager] SET  READ_WRITE 
-GO
-
-
-
 -- ============================================================
 --  SEMILLA BASE PYFLOW MANAGER
 --  Incluye ambientes, autenticación, roles, permisos, temas,
 --  parámetros del sistema y usuario administrador por defecto.
 -- ============================================================
 
-USE PyFlowManager
-GO
 
 SET XACT_ABORT ON;
 BEGIN TRANSACTION;
@@ -1642,24 +1623,31 @@ IF NOT EXISTS (SELECT 1 FROM dbo.UserPreferences WHERE user_id = 1 AND preferenc
 COMMIT TRANSACTION;
 GO
 
-USE master;
+-- ============================================================
+--  USUARIO DE BASE DE DATOS PARA LA APLICACIÓN - AZURE SQL
+--  Usuario contenido. No requiere CREATE LOGIN en master.
+--  Cambiar la contraseña antes de ejecutar en producción.
+-- ============================================================
+
+IF NOT EXISTS (
+    SELECT 1
+    FROM sys.database_principals
+    WHERE name = N'pyflow_app'
+)
+BEGIN
+    CREATE USER [pyflow_app]
+    WITH PASSWORD = N'CAMBIAR_PASSWORD_SEGURO_2026!';
+END
 GO
 
-CREATE LOGIN pyflow_user
-WITH PASSWORD = 'PyFlow@2026!';
+ALTER ROLE db_owner ADD MEMBER [pyflow_app];
 GO
 
-
-ALTER LOGIN pyflow_user ENABLE;
-GO
-
-USE PyFlowManager_2019;
-GO
-
-CREATE USER pyflow_user
-FOR LOGIN pyflow_user;
-GO
-
-ALTER ROLE db_owner
-ADD MEMBER pyflow_user;
+-- Validación rápida
+SELECT
+    DB_NAME() AS BaseActual,
+    name AS UsuarioDB,
+    type_desc
+FROM sys.database_principals
+WHERE name IN (N'pyflow_app');
 GO

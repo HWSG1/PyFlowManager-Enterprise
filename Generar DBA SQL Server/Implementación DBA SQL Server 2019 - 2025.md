@@ -297,5 +297,5 @@ Se solicita:
 ## 15. Contacto técnico
 
 Sistema: PyFlow Manager  
-Responsable técnico: Equipo de desarrollo / Contact Center  
+Responsable técnico: Odair Josué Umanzor Murillo
 Base de datos: SQL Server 2019 o superior

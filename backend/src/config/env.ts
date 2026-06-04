@@ -9,7 +9,8 @@ export const env = {
 
   db: {
     server: process.env.DB_SERVER || 'localhost',
-    port: Number(process.env.DB_PORT || 1433),
+    instanceName: process.env.DB_INSTANCE || '',
+    port: process.env.DB_PORT ? Number(process.env.DB_PORT) : undefined,
     database: process.env.DB_DATABASE || 'PyFlowManager',
     user: process.env.DB_USER || 'sa',
     password: process.env.DB_PASSWORD || '',

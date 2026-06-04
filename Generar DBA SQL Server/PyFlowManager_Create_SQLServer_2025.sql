@@ -1650,3 +1650,24 @@ IF NOT EXISTS (SELECT 1 FROM dbo.UserPreferences WHERE user_id = 1 AND preferenc
 
 COMMIT TRANSACTION;
 GO
+
+USE master;
+GO
+
+CREATE LOGIN pyflow_user
+WITH PASSWORD = 'PyFlow@2026!';
+GO
+
+ALTER LOGIN pyflow_user ENABLE;
+GO
+
+USE PyFlowManager_2019;
+GO
+
+CREATE USER pyflow_user
+FOR LOGIN pyflow_user;
+GO
+
+ALTER ROLE db_owner
+ADD MEMBER pyflow_user;
+GO
