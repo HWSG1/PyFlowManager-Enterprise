@@ -83,21 +83,59 @@ router.post('/global-variables', async (req, res, next) => {
   try {
     const variables = Array.isArray(req.body?.variables) ? req.body.variables : [];
     const pool = await getPool();
+
     for (const item of variables) {
       const id = item.id ? Number(item.id) : null;
       const varKey = String(item.var_key || item.key || '').trim();
       const varValue = item.var_value ?? item.value ?? '';
       const isSecret = item.is_secret ? 1 : 0;
       const description = item.description || null;
+
       if (!varKey) continue;
-      if (id) {
-        await pool.request().input('id', sql.Int, id).input('var_key', sql.NVarChar(150), varKey).input('var_value', sql.NVarChar(sql.MAX), String(varValue)).input('is_secret', sql.Bit, isSecret).input('description', sql.NVarChar(500), description).query(`UPDATE dbo.GlobalVariables SET var_key=@var_key, var_value=CASE WHEN is_secret=1 AND @var_value='********' THEN var_value ELSE @var_value END, is_secret=@is_secret, description=@description, updated_at=GETDATE() WHERE id=@id`);
-      } else {
-        await pool.request().input('var_key', sql.NVarChar(150), varKey).input('var_value', sql.NVarChar(sql.MAX), String(varValue)).input('is_secret', sql.Bit, isSecret).input('description', sql.NVarChar(500), description).query(`INSERT INTO dbo.GlobalVariables(var_key,var_value,is_secret,description) VALUES(@var_key,@var_value,@is_secret,@description)`);
-      }
+
+      await pool.request()
+        .input('id', sql.Int, id)
+        .input('var_key', sql.NVarChar(150), varKey)
+        .input('var_value', sql.NVarChar(sql.MAX), String(varValue))
+        .input('is_secret', sql.Bit, isSecret)
+        .input('description', sql.NVarChar(500), description)
+        .query(`
+          MERGE dbo.GlobalVariables AS target
+          USING (
+            SELECT 
+              @id AS id,
+              @var_key AS var_key,
+              @var_value AS var_value,
+              @is_secret AS is_secret,
+              @description AS description
+          ) AS source
+          ON 
+            target.id = source.id
+            OR target.var_key = source.var_key
+
+          WHEN MATCHED THEN
+            UPDATE SET
+              var_key = source.var_key,
+              var_value =
+                CASE
+                  WHEN target.is_secret = 1 AND source.var_value = '********'
+                  THEN target.var_value
+                  ELSE source.var_value
+                END,
+              is_secret = source.is_secret,
+              description = source.description,
+              updated_at = GETDATE()
+
+          WHEN NOT MATCHED THEN
+            INSERT (var_key, var_value, is_secret, description)
+            VALUES (source.var_key, source.var_value, source.is_secret, source.description);
+        `);
     }
+
     res.json({ ok: true });
-  } catch (err) { next(err); }
+  } catch (err) {
+    next(err);
+  }
 });
 
 router.delete('/global-variables/:id', async (req, res, next) => {

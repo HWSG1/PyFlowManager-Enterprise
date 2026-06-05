@@ -1,0 +1,1186 @@
+# =========================================================
+# GNS FORMULARIOS Y EVALUACIONES - Genesys Cloud -> SAP HANA
+# =========================================================
+#
+# FORMAS DE EJECUCIÓN
+# ---------------------------------------------------------
+# 1. EJECUCIÓN AUTOMÁTICA
+#    Calcula automáticamente desde el mismo día del mes anterior
+#    hasta hoy 00:00, en zona horaria America/Tegucigalpa.
+#
+#    py .\GNS_Form_Evaluaciones.py
+#
+# 2. EJECUTAR UNA FECHA ESPECÍFICA
+#
+#    py .\GNS_Form_Evaluaciones.py --date 2026-05-27
+#
+# 3. EJECUTAR UN RANGO LOCAL
+#
+#    py .\GNS_Form_Evaluaciones.py --start-date 2026-05-01 --end-date 2026-05-27
+#
+# 4. EJECUTAR UTC EXACTO COMO KNIME
+#
+#    py .\GNS_Form_Evaluaciones.py --start-utc 2026-05-01T06:00:00.000Z --end-utc 2026-05-28T06:00:00.000Z
+#
+# 5. SOLO FORMULARIOS
+#
+#    py .\GNS_Form_Evaluaciones.py --solo-formularios
+#
+# 6. SOLO EVALUACIONES
+#
+#    py .\GNS_Form_Evaluaciones.py --solo-evaluaciones
+#
+# 7. PROBAR SIN CARGAR A HANA
+#
+#    py .\GNS_Form_Evaluaciones.py --dry-run
+#
+# VARIABLES OPCIONALES EN .env
+# ---------------------------------------------------------
+# HPR_HOST_ESPEJO=150.150.70.167  # Host réplica para SELECT
+# HANA_FORM_EVALUACIONES_TABLE=GNS_API_FORM_EVALUACIONES
+# HANA_EVALUACIONES_TABLE=GNS_API_EVALUACIONES
+# API_SLEEP_SECONDS=1
+# API_MAX_RETRIES=5
+# HANA_BATCH_SIZE=1000
+# GENESYS_TIMEZONE=America/Tegucigalpa
+#
+# DEPENDENCIA
+# ---------------------------------------------------------
+# Para evaluaciones, este script lee usuarios desde:
+# BI_SS.GNS_API_USUARIOS
+#
+# Por eso conviene ejecutar antes:
+# py ".\GNS Usuarios.py"
+# =========================================================
+
+import os
+import sys
+import time
+import math
+import argparse
+import logging
+import traceback
+from dataclasses import dataclass
+from datetime import datetime, date, timedelta, timezone
+from zoneinfo import ZoneInfo
+from typing import Any, Dict, List, Tuple, Optional
+
+import requests
+
+try:
+    from dotenv import load_dotenv
+except Exception:
+    def load_dotenv(*args, **kwargs):
+        return False
+
+try:
+    from hdbcli import dbapi
+except ImportError:
+    dbapi = None
+
+# =========================================================
+# PYFLOW MANAGER PARAMS
+# =========================================================
+# PyFlow detecta este bloque para solicitar parámetros y mapear variables globales.
+# Si no se ingresan fechas, el script carga los últimos DAYS_BACK días cerrados.
+
+PYFLOW_PARAMS = {
+    "GENESYS_CLIENT_ID": {"type": "global", "global_key": "GENESYS_CLIENT_ID", "label": "Genesys Client ID", "required": True},
+    "GENESYS_CLIENT_SECRET": {"type": "global", "global_key": "GENESYS_CLIENT_SECRET", "label": "Genesys Client Secret", "required": True, "secret": True},
+    "GENESYS_REGION": {"type": "global", "global_key": "GENESYS_REGION", "label": "Genesys Region / Domain", "required": True},
+    "HPR_HOST": {"type": "global", "global_key": "HPR_HOST", "label": "SAP HANA Host Escritura", "required": True},
+    "HPR_HOST_ESPEJO": {"type": "global", "global_key": "HPR_HOST_ESPEJO", "label": "SAP HANA Host Espejo Lectura", "required": True},
+    "HPR_PORT": {"type": "global", "global_key": "HPR_PORT", "label": "SAP HANA Port", "required": True},
+    "HPR_USER": {"type": "global", "global_key": "HPR_USER", "label": "SAP HANA User", "required": True},
+    "HPR_PASSWORD": {"type": "global", "global_key": "HPR_PASSWORD", "label": "SAP HANA Password", "required": True, "secret": True},
+    "HANA_SCHEMA": {"type": "text", "label": "Esquema HANA", "required": True, "default": "BI_SS"},
+    "HANA_USERS_TABLE": {"type": "text", "label": "Tabla usuarios Genesys", "required": True, "default": "GNS_API_USUARIOS"},
+    "HANA_FORM_EVALUACIONES_TABLE": {"type": "text", "label": "Tabla formularios/preguntas", "required": True, "default": "GNS_API_FORM_EVALUACIONES"},
+    "HANA_EVALUACIONES_TABLE": {"type": "text", "label": "Tabla evaluaciones", "required": True, "default": "GNS_API_EVALUACIONES"},
+    "RUN_MODE": {"type": "select", "label": "Modo ejecución", "required": True, "options": ["formularios_y_evaluaciones", "solo_formularios", "solo_evaluaciones"], "default": "formularios_y_evaluaciones"},
+    "DATE": {"type": "date", "label": "Fecha específica local", "required": False},
+    "START_DATE": {"type": "date", "label": "Fecha inicial local", "required": False},
+    "END_DATE": {"type": "date", "label": "Fecha final local", "required": False},
+    "START_UTC": {"type": "text", "label": "Inicio UTC exacto", "required": False},
+    "END_UTC": {"type": "text", "label": "Fin UTC exacto", "required": False},
+    "DAYS_BACK": {"type": "number", "label": "Días hacia atrás si no se indican fechas", "required": False, "default": "5"},
+    "GENESYS_TIMEZONE": {"type": "text", "label": "Zona horaria Genesys", "required": True, "default": "America/Tegucigalpa"},
+    "HANA_BATCH_SIZE": {"type": "number", "label": "Filas por lote HANA", "required": False, "default": "1000"},
+    "REQUEST_TIMEOUT": {"type": "number", "label": "Timeout HTTP segundos", "required": False, "default": "120"},
+    "API_SLEEP_SECONDS": {"type": "number", "label": "Pausa entre requests", "required": False, "default": "1"},
+    "API_MAX_RETRIES": {"type": "number", "label": "Reintentos HTTP", "required": False, "default": "5"},
+    "DRY_RUN": {"type": "select", "label": "Modo prueba sin insertar", "required": True, "options": ["true", "false"], "default": "false"}
+}
+
+LOGGER_NAME = "gns_form_evaluaciones_pyflow"
+
+
+def _clean_env_value(value: Any, default: Optional[str] = None) -> Optional[str]:
+    if value is None:
+        return default
+    text = str(value).strip()
+    if text == "" or text.lower() in ("null", "none", "undefined"):
+        return default
+    return text
+
+
+def env_str(name: str, default: Optional[str] = None, required: bool = False) -> str:
+    value = _clean_env_value(os.getenv(name), default)
+    if required and not value:
+        raise ValueError(f"Falta configurar variable/parámetro requerido: {name}")
+    return "" if value is None else str(value)
+
+
+def env_int(name: str, default: int, required: bool = False) -> int:
+    value = env_str(name, str(default), required=required)
+    try:
+        return int(value)
+    except Exception:
+        raise ValueError(f"El parámetro {name} debe ser numérico. Valor recibido: {value!r}")
+
+
+def env_float(name: str, default: float, required: bool = False) -> float:
+    value = env_str(name, str(default), required=required)
+    try:
+        return float(value)
+    except Exception:
+        raise ValueError(f"El parámetro {name} debe ser numérico. Valor recibido: {value!r}")
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = env_str(name, "", required=False).lower()
+    if not value:
+        return default
+    return value in ("1", "true", "yes", "y", "si", "sí")
+
+
+def normalize_genesys_domain(value: str) -> str:
+    value = env_str("GENESYS_REGION", value, required=False)
+    value = str(value or "mypurecloud.com").strip()
+    value = value.replace("https://", "").replace("http://", "").strip("/")
+    if value.startswith("api."):
+        value = value[4:]
+    if value.startswith("login."):
+        value = value[6:]
+    return value
+
+
+def genesys_api_url_from_region(default_region: str = "mypurecloud.com") -> str:
+    return f"https://api.{normalize_genesys_domain(default_region)}"
+
+
+def genesys_login_url_from_region(default_region: str = "mypurecloud.com") -> str:
+    return f"https://login.{normalize_genesys_domain(default_region)}/oauth/token"
+
+
+def log_params(logger: logging.Logger, names: List[str]) -> None:
+    logger.info("Parámetros recibidos / aplicados:")
+    secret_words = ("SECRET", "PASSWORD", "TOKEN", "KEY")
+    for name in names:
+        value = env_str(name, "")
+        if any(w in name.upper() for w in secret_words) and value:
+            value = "********"
+        logger.info("- %s: %s", name, value if value != "" else "<vacío>")
+
+
+@dataclass
+class Config:
+    genesys_client_id: str
+    genesys_client_secret: str
+    genesys_region_base_url: str
+    genesys_login_url: str
+
+    hana_host: str
+    hana_host_espejo: str
+    hana_port: int
+    hana_user: str
+    hana_password: str
+    hana_schema: str
+
+    users_table: str
+    forms_table: str
+    evaluations_table: str
+
+    timezone_name: str
+    batch_size: int
+    request_timeout: int
+    api_sleep_seconds: float
+    api_max_retries: int
+
+
+def get_env(name: str, default: Optional[str] = None, required: bool = True) -> str:
+    return env_str(name, default, required=required)
+
+
+def load_config() -> Config:
+    load_dotenv()
+
+    region_base = get_env("GENESYS_REGION_BASE_URL", genesys_api_url_from_region(), required=False).rstrip("/")
+
+    return Config(
+        genesys_client_id=get_env("GENESYS_CLIENT_ID"),
+        genesys_client_secret=get_env("GENESYS_CLIENT_SECRET"),
+        genesys_region_base_url=region_base,
+        genesys_login_url=get_env("GENESYS_LOGIN_URL", genesys_login_url_from_region(), required=False),
+
+        hana_host=get_env("HPR_HOST", required=True),
+        hana_host_espejo=get_env("HPR_HOST_ESPEJO", required=True),
+        hana_port=env_int("HPR_PORT", 30015, required=True),
+        hana_user=get_env("HPR_USER", required=True),
+        hana_password=get_env("HPR_PASSWORD", required=True),
+        hana_schema=get_env("HANA_SCHEMA", "BI_SS", required=False),
+
+        users_table=get_env("HANA_USERS_TABLE", "GNS_API_USUARIOS", required=False),
+        forms_table=get_env("HANA_FORM_EVALUACIONES_TABLE", "GNS_API_FORM_EVALUACIONES", required=False),
+        evaluations_table=get_env("HANA_EVALUACIONES_TABLE", "GNS_API_EVALUACIONES", required=False),
+
+        timezone_name=get_env("GENESYS_TIMEZONE", "America/Tegucigalpa", required=False),
+        batch_size=env_int("HANA_BATCH_SIZE", 1000),
+        request_timeout=env_int("REQUEST_TIMEOUT", 120),
+        api_sleep_seconds=env_float("API_SLEEP_SECONDS", 1.0),
+        api_max_retries=env_int("API_MAX_RETRIES", 5),
+    )
+
+
+def setup_logger() -> logging.Logger:
+    logger = logging.getLogger(LOGGER_NAME)
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    logger.propagate = False
+
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(message)s",
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+    console = logging.StreamHandler(sys.stdout)
+    console.setFormatter(formatter)
+    logger.addHandler(console)
+
+
+    return logger
+
+
+def hana_connect_write(config: Config):
+    """Conexión SAP HANA para escrituras: INSERT, UPDATE, DELETE, MERGE."""
+    if dbapi is None:
+        raise RuntimeError("No está instalado hdbcli. Ejecuta: pip install hdbcli")
+    return dbapi.connect(
+        address=config.hana_host,
+        port=config.hana_port,
+        user=config.hana_user,
+        password=config.hana_password
+    )
+
+
+def hana_connect_read(config: Config):
+    """Conexión SAP HANA para lecturas: SELECT y catálogos."""
+    if dbapi is None:
+        raise RuntimeError("No está instalado hdbcli. Ejecuta: pip install hdbcli")
+    return dbapi.connect(
+        address=config.hana_host_espejo,
+        port=config.hana_port,
+        user=config.hana_user,
+        password=config.hana_password
+    )
+
+
+def to_utc_z(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def parse_dates(args: argparse.Namespace, tz_name: str) -> Tuple[str, str, str]:
+    tz = ZoneInfo(tz_name)
+
+    if args.start_utc and args.end_utc:
+        return args.start_utc, args.end_utc, "UTC manual"
+
+    if args.date:
+        d = date.fromisoformat(args.date)
+        start_local = datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=tz)
+        end_local = start_local + timedelta(days=1)
+        return to_utc_z(start_local), to_utc_z(end_local), f"Día local {args.date}"
+
+    if args.start_date and args.end_date:
+        d1 = date.fromisoformat(args.start_date)
+        d2 = date.fromisoformat(args.end_date)
+
+        if d2 < d1:
+            raise ValueError("La fecha final no puede ser menor que la fecha inicial.")
+
+        start_local = datetime(d1.year, d1.month, d1.day, 0, 0, 0, tzinfo=tz)
+        end_local = datetime(d2.year, d2.month, d2.day, 0, 0, 0, tzinfo=tz) + timedelta(days=1)
+
+        return (
+            to_utc_z(start_local),
+            to_utc_z(end_local),
+            f"Rango local {args.start_date} al {args.end_date}"
+        )
+
+    # Automático PyFlow: últimos DAYS_BACK días cerrados.
+    # Ejemplo con DAYS_BACK=5 y hoy 2026-05-31:
+    # 2026-05-26 00:00 -> 2026-05-31 00:00 hora local.
+    days_back = env_int("DAYS_BACK", 5)
+    if days_back <= 0:
+        raise ValueError("DAYS_BACK debe ser mayor a 0.")
+
+    today = datetime.now(tz)
+    end_dt = today.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_dt = end_dt - timedelta(days=days_back)
+
+    return to_utc_z(start_dt), to_utc_z(end_dt), f"Automático últimos {days_back} días cerrados"
+
+
+def get_access_token(config: Config, logger: logging.Logger) -> str:
+    logger.info("Solicitando token OAuth en Genesys Cloud...")
+
+    response = requests.post(
+        config.genesys_login_url,
+        data={
+            "grant_type": "client_credentials",
+            "client_id": config.genesys_client_id,
+            "client_secret": config.genesys_client_secret,
+        },
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=config.request_timeout,
+    )
+
+    response.raise_for_status()
+    token = response.json().get("access_token")
+
+    if not token:
+        raise RuntimeError("No se recibió access_token desde Genesys.")
+
+    logger.info("Token obtenido correctamente.")
+    return token
+
+
+def genesys_headers(token: str) -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+
+
+def request_with_retries(
+    method: str,
+    url: str,
+    config: Config,
+    logger: logging.Logger,
+    token: Optional[str] = None,
+    **kwargs
+) -> requests.Response:
+
+    headers = kwargs.pop("headers", {})
+    if token:
+        headers.update(genesys_headers(token))
+
+    last_exc: Optional[Exception] = None
+
+    for attempt in range(1, config.api_max_retries + 1):
+        try:
+            response = requests.request(
+                method,
+                url,
+                headers=headers,
+                timeout=config.request_timeout,
+                **kwargs
+            )
+
+            if response.status_code == 429:
+                retry_after = response.headers.get("Retry-After")
+                wait_seconds = int(retry_after) if retry_after and retry_after.isdigit() else min(60, 5 * attempt)
+                logger.warning(
+                    "Rate limit 429 | intento %s/%s | esperando %s segundos | %s",
+                    attempt,
+                    config.api_max_retries,
+                    wait_seconds,
+                    url
+                )
+                time.sleep(wait_seconds)
+                continue
+
+            if 500 <= response.status_code <= 599:
+                wait_seconds = min(60, 3 * attempt)
+                logger.warning(
+                    "Error servidor %s | intento %s/%s | esperando %s segundos | %s",
+                    response.status_code,
+                    attempt,
+                    config.api_max_retries,
+                    wait_seconds,
+                    url
+                )
+                time.sleep(wait_seconds)
+                continue
+
+            response.raise_for_status()
+            return response
+
+        except Exception as exc:
+            last_exc = exc
+            wait_seconds = min(60, 3 * attempt)
+            logger.warning(
+                "Error request | intento %s/%s | esperando %s segundos | %s | %s",
+                attempt,
+                config.api_max_retries,
+                wait_seconds,
+                url,
+                exc
+            )
+            time.sleep(wait_seconds)
+
+    if last_exc:
+        raise last_exc
+
+    raise RuntimeError(f"No se pudo completar request: {url}")
+
+
+def clean_text(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).replace("\t", "").strip()
+    return text if text != "" else None
+
+
+def bool_to_hana(value: Any) -> Optional[bool]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if str(value).strip().lower() in ("true", "1", "yes", "y", "si", "sí"):
+        return True
+    if str(value).strip().lower() in ("false", "0", "no", "n"):
+        return False
+    return None
+
+
+def safe_num(value: Any) -> Any:
+    return None if value in (None, "") else value
+
+
+# =========================================================
+# HANA GENERIC HELPERS
+# =========================================================
+
+def delete_all_from_table(config: Config, table_name: str, logger: logging.Logger) -> int:
+    logger.info('Eliminando registros existentes en "%s"."%s"...', config.hana_schema, table_name)
+
+    conn = hana_connect_write(config)
+    cursor = conn.cursor()
+
+    try:
+        sql = f'DELETE FROM "{config.hana_schema}"."{table_name}"'
+        cursor.execute(sql)
+        deleted = cursor.rowcount
+        conn.commit()
+        logger.info("Registros eliminados previamente: %s", deleted)
+        return deleted
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def insert_rows(
+    config: Config,
+    table_name: str,
+    columns: List[str],
+    rows: List[Dict[str, Any]],
+    logger: logging.Logger
+) -> Tuple[int, int]:
+
+    if not rows:
+        logger.warning('No hay filas para cargar en "%s"."%s".', config.hana_schema, table_name)
+        return 0, 0
+
+    quoted_cols = ", ".join(f'"{c}"' for c in columns)
+    placeholders = ", ".join(["?"] * len(columns))
+
+    sql = (
+        f'INSERT INTO "{config.hana_schema}"."{table_name}" '
+        f'({quoted_cols}) VALUES ({placeholders})'
+    )
+
+    loaded = 0
+    failed = 0
+
+    conn = hana_connect_write(config)
+    cursor = conn.cursor()
+
+    try:
+        logger.info('Iniciando carga INSERT en "%s"."%s"...', config.hana_schema, table_name)
+
+        for start in range(0, len(rows), config.batch_size):
+            batch = rows[start:start + config.batch_size]
+            values = [tuple(row.get(c) for c in columns) for row in batch]
+
+            try:
+                cursor.executemany(sql, values)
+                conn.commit()
+                loaded += len(batch)
+
+                logger.info(
+                    "Carga parcial confirmada | tabla: %s | lote: %s | cargados acumulados: %s/%s",
+                    table_name,
+                    len(batch),
+                    loaded,
+                    len(rows)
+                )
+
+            except Exception as exc:
+                conn.rollback()
+                failed += len(batch)
+                logger.exception(
+                    "Error cargando lote en tabla %s desde fila %s: %s",
+                    table_name,
+                    start + 1,
+                    exc
+                )
+
+    finally:
+        cursor.close()
+        conn.close()
+
+    return loaded, failed
+
+
+def get_users_from_hana(config: Config, logger: logging.Logger) -> List[str]:
+    logger.info('Leyendo usuarios desde "%s"."%s"...', config.hana_schema, config.users_table)
+
+    conn = hana_connect_read(config)
+    cursor = conn.cursor()
+
+    try:
+        sql = f'SELECT DISTINCT "ID" AS "USERID" FROM "{config.hana_schema}"."{config.users_table}" WHERE "ID" IS NOT NULL'
+        cursor.execute(sql)
+        users = [row[0] for row in cursor.fetchall() if row and row[0]]
+        logger.info("Usuarios obtenidos para consultar evaluaciones: %s", len(users))
+        return users
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def get_question_lookup_from_hana(config: Config, logger: logging.Logger) -> Dict[str, str]:
+    logger.info('Leyendo catálogo de preguntas desde "%s"."%s"...', config.hana_schema, config.forms_table)
+
+    conn = hana_connect_read(config)
+    cursor = conn.cursor()
+
+    try:
+        sql = (
+            f'SELECT DISTINCT "ID_PREGUNTA", "PREGUNTA" '
+            f'FROM "{config.hana_schema}"."{config.forms_table}" '
+            f'WHERE "ID_PREGUNTA" IS NOT NULL'
+        )
+        cursor.execute(sql)
+        lookup = {row[0]: row[1] for row in cursor.fetchall() if row and row[0]}
+        logger.info("Preguntas disponibles para cruce: %s", len(lookup))
+        return lookup
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def delete_evaluations_range(
+    config: Config,
+    start_date: str,
+    end_date: str,
+    logger: logging.Logger
+) -> int:
+
+    logger.info(
+        'Eliminando evaluaciones existentes en "%s"."%s" para rango %s -> %s...',
+        config.hana_schema,
+        config.evaluations_table,
+        start_date,
+        end_date
+    )
+
+    conn = hana_connect_write(config)
+    cursor = conn.cursor()
+
+    try:
+        # En el flujo KNIME el endpoint filtra por startTime/endTime.
+        # Se elimina por CONVERSATIONDATE porque viene del JSON de evaluación.
+        sql = (
+            f'DELETE FROM "{config.hana_schema}"."{config.evaluations_table}" '
+            f'WHERE "CONVERSATIONDATE" >= ? AND "CONVERSATIONDATE" < ?'
+        )
+
+        cursor.execute(sql, (start_date, end_date))
+        deleted = cursor.rowcount
+        conn.commit()
+
+        logger.info("Registros de evaluaciones eliminados previamente: %s", deleted)
+        return deleted
+
+    except Exception as exc:
+        conn.rollback()
+        logger.warning(
+            "No se pudo eliminar por CONVERSATIONDATE. Se continuará sin borrar rango. Error: %s",
+            exc
+        )
+        return 0
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+# =========================================================
+# FORMULARIOS
+# =========================================================
+
+def fetch_published_forms(config: Config, token: str, logger: logging.Logger) -> List[Dict[str, Any]]:
+    logger.info("Consultando formularios publicados de evaluación...")
+
+    page_size = 25
+    page_number = 1
+    forms_basic: List[Dict[str, Any]] = []
+    total = None
+
+    while True:
+        url = (
+            f"{config.genesys_region_base_url}"
+            f"/api/v2/quality/publishedforms/evaluations"
+            f"?pageSize={page_size}&pageNumber={page_number}&expand=publishHistory"
+        )
+
+        response = request_with_retries("GET", url, config, logger, token=token)
+        data = response.json()
+
+        entities = data.get("entities") or []
+        if total is None:
+            total = data.get("total", len(entities))
+            total_pages = max(1, math.ceil(total / page_size)) if total else 1
+        else:
+            total_pages = max(1, math.ceil(total / page_size)) if total else page_number
+
+        forms_basic.extend(entities)
+
+        logger.info(
+            "Página formularios %s/%s procesada | formularios en página: %s | acumulado: %s",
+            page_number,
+            total_pages,
+            len(entities),
+            len(forms_basic)
+        )
+
+        if not entities or page_number >= total_pages:
+            break
+
+        page_number += 1
+        time.sleep(config.api_sleep_seconds)
+
+    logger.info("Formularios base obtenidos: %s", len(forms_basic))
+
+    detailed_forms: List[Dict[str, Any]] = []
+
+    for idx, item in enumerate(forms_basic, start=1):
+        self_uri = item.get("selfUri")
+        form_id = item.get("id")
+
+        if self_uri:
+            url = self_uri if self_uri.startswith("http") else f"{config.genesys_region_base_url}{self_uri}"
+        elif form_id:
+            url = f"{config.genesys_region_base_url}/api/v2/quality/publishedforms/evaluations/{form_id}"
+        else:
+            continue
+
+        logger.info("Consultando detalle formulario %s/%s | %s", idx, len(forms_basic), form_id or url)
+
+        response = request_with_retries("GET", url, config, logger, token=token)
+        detailed_forms.append(response.json())
+
+        time.sleep(config.api_sleep_seconds)
+
+    logger.info("Detalles de formularios obtenidos: %s", len(detailed_forms))
+    return detailed_forms
+
+
+def transform_forms(forms: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    load_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    for form in forms:
+        form_id = form.get("id")
+        form_name = clean_text(form.get("name"))
+        published = bool_to_hana(form.get("published"))
+
+        for group in form.get("questionGroups") or []:
+            group_id = group.get("id")
+            group_name = clean_text(group.get("name"))
+
+            for question in group.get("questions") or []:
+                rows.append({
+                    "ID_FORMULARIO": form_id,
+                    "FORMULARIO": form_name,
+                    "PUBLISHED": published,
+                    "ID_QUESTION_GROUP": group_id,
+                    "CUESTIONARIO": group_name,
+                    "ID_PREGUNTA": question.get("id"),
+                    "PREGUNTA": clean_text(question.get("text")),
+                    "FECHA_CARGA": load_ts,
+                })
+
+    return rows
+
+
+def run_forms(config: Config, token: str, logger: logging.Logger, dry_run: bool) -> Tuple[int, int, Dict[str, str]]:
+    forms = fetch_published_forms(config, token, logger)
+    rows = transform_forms(forms)
+
+    logger.info("Filas de formulario/preguntas transformadas: %s", len(rows))
+
+    if dry_run:
+        logger.warning("DRY RUN activo. No se cargará catálogo de formularios a HANA.")
+        lookup = {r["ID_PREGUNTA"]: r["PREGUNTA"] for r in rows if r.get("ID_PREGUNTA")}
+        return len(rows), 0, lookup
+
+    delete_all_from_table(config, config.forms_table, logger)
+
+    columns = [
+        "ID_FORMULARIO",
+        "FORMULARIO",
+        "PUBLISHED",
+        "ID_QUESTION_GROUP",
+        "CUESTIONARIO",
+        "ID_PREGUNTA",
+        "PREGUNTA",
+        "FECHA_CARGA",
+    ]
+
+    loaded, failed = insert_rows(config, config.forms_table, columns, rows, logger)
+
+    lookup = {r["ID_PREGUNTA"]: r["PREGUNTA"] for r in rows if r.get("ID_PREGUNTA")}
+
+    return loaded, failed, lookup
+
+
+# =========================================================
+# EVALUACIONES
+# =========================================================
+
+def fetch_evaluations_for_user(
+    config: Config,
+    token: str,
+    user_id: str,
+    start_date: str,
+    end_date: str,
+    logger: logging.Logger
+) -> List[Dict[str, Any]]:
+
+    url = (
+        f"{config.genesys_region_base_url}"
+        f"/api/v2/quality/evaluations/query"
+        f"?agentUserId={user_id}"
+        f"&startTime={start_date}"
+        f"&endTime={end_date}"
+        f"&expandAnswerTotalScores=true"
+        f"&includeDeletedUsers=true"
+    )
+
+    response = request_with_retries("GET", url, config, logger, token=token)
+    data = response.json()
+
+    return data.get("entities") or []
+
+
+def first_or_value(value: Any) -> Any:
+    if isinstance(value, list):
+        return value[0] if value else None
+    return value
+
+
+def transform_evaluations(
+    evaluations: List[Dict[str, Any]],
+    question_lookup: Dict[str, str]
+) -> List[Dict[str, Any]]:
+
+    rows: List[Dict[str, Any]] = []
+
+    for ev in evaluations:
+        answers = ev.get("answers") or {}
+        conversation = ev.get("conversation") or {}
+        evaluation_form = ev.get("evaluationForm") or {}
+        evaluator = ev.get("evaluator") or {}
+        agent = ev.get("agent") or {}
+        queue = ev.get("queue") or {}
+        agent_team = ev.get("agentTeam") or {}
+        evaluation_source = ev.get("evaluationSource") or {}
+        ai_scoring = ev.get("aiScoring") or {}
+
+        base = {
+            "EVALUATIONID": ev.get("id"),
+            "CONVERSATIONID": conversation.get("id"),
+            "EVALUATIONFORMID": evaluation_form.get("id"),
+            "EVALUATIONFORMNAME": clean_text(evaluation_form.get("name")),
+            "EVALUATORID": evaluator.get("id"),
+            "AGENTID": agent.get("id"),
+            "STATUS": ev.get("status"),
+            "AGENTHASREAD": bool_to_hana(ev.get("agentHasRead")),
+            "ASSIGNEEAPPLICABLE": bool_to_hana(ev.get("assigneeApplicable")),
+            "RELEASEDATE": ev.get("releaseDate"),
+            "ASSIGNEDDATE": ev.get("assignedDate"),
+            "CREATEDDATE": ev.get("createdDate"),
+            "CHANGEDDATE": ev.get("changedDate"),
+            "SUBMITTEDDATE": ev.get("submittedDate"),
+            "QUEUEID": queue.get("id"),
+            "MEDIATYPE": first_or_value(ev.get("mediaType")),
+            "CONVERSATIONDATE": ev.get("conversationDate"),
+            "CONVERSATIONENDDATE": ev.get("conversationEndDate"),
+            "NEVERRELEASE": bool_to_hana(ev.get("neverRelease")),
+            "DATEASSIGNEECHANGED": ev.get("dateAssigneeChanged"),
+            "AGENTTEAMID": agent_team.get("id"),
+            "HASASSISTANCEFAILED": bool_to_hana(ev.get("hasAssistanceFailed")),
+            "EVALUATIONSOURCEID": evaluation_source.get("id"),
+            "EVALUATIONSOURCETYPE": evaluation_source.get("type"),
+            "DISPUTECOUNT": safe_num(ev.get("disputeCount")),
+            "VERSION": safe_num(ev.get("version")),
+            "DECLINEDREVIEW": bool_to_hana(ev.get("declinedReview")),
+            "EVALUATIONCONTEXTID": ev.get("evaluationContextId"),
+            "AISCORINGPENDING": bool_to_hana(ai_scoring.get("pending")),
+            "SYSTEMSUBMITTED": bool_to_hana(ev.get("systemSubmitted")),
+            "MISSINGREQUIREDANSWER": bool_to_hana(ev.get("missingRequiredAnswer")),
+            "TOTALSCORE": safe_num(answers.get("totalScore")),
+            "TOTALCRITICALSCORE": safe_num(answers.get("totalCriticalScore")),
+            "TOTALNONCRITICALSCORE": safe_num(answers.get("totalNonCriticalScore")),
+            "ANYFAILEDKILLQUESTIONS": bool_to_hana(answers.get("anyFailedKillQuestions")),
+            "COMMENTS": clean_text(answers.get("comments")),
+        }
+
+        question_group_scores = answers.get("questionGroupScores") or []
+
+        # Si no hay questionGroupScores, dejamos una fila base sin pregunta.
+        if not question_group_scores:
+            row = base.copy()
+            row.update({
+                "QUESTIONGROUPID": None,
+                "TOTALSCORE_QG": None,
+                "MAXTOTALSCORE": None,
+                "MARKEDNA": None,
+                "SYSTEMMARKEDNA": None,
+                "TOTALCRITICALSCORE_QG": None,
+                "MAXTOTALCRITICALSCORE": None,
+                "TOTALNONCRITICALSCORE_QG": None,
+                "MAXTOTALNONCRITICALSCORE": None,
+                "TOTALSCOREUNWEIGHTED": None,
+                "MAXTOTALSCOREUNWEIGHTED": None,
+                "TOTALCRITICALSCOREUNWEIGHTED": None,
+                "MAXTOTALCRITICALSCOREUNWEIGHTED": None,
+                "TOTALNONCRITICALSCOREUNWEIGHTED": None,
+                "MAXTOTALNONCRITICALSCOREUNWEIGHTED": None,
+                "QUESTIONID": None,
+                "ANSWERID": None,
+                "SCORE": None,
+                "MARKEDNA_Q": None,
+                "COMMENTS_Q": None,
+                "FAILEDKILLQUESTION": None,
+                "QUESTION_NAME": None,
+            })
+            row["MERGE_KEY"] = f'{row.get("EVALUATIONID")}-{row.get("CONVERSATIONID")}-None-None'
+            rows.append(row)
+            continue
+
+        for qg in question_group_scores:
+            qg_base = {
+                "QUESTIONGROUPID": qg.get("questionGroupId"),
+                "TOTALSCORE_QG": safe_num(qg.get("totalScore")),
+                "MAXTOTALSCORE": safe_num(qg.get("maxTotalScore")),
+                "MARKEDNA": bool_to_hana(qg.get("markedNA")),
+                "SYSTEMMARKEDNA": bool_to_hana(qg.get("systemMarkedNA")),
+                "TOTALCRITICALSCORE_QG": safe_num(qg.get("totalCriticalScore")),
+                "MAXTOTALCRITICALSCORE": safe_num(qg.get("maxTotalCriticalScore")),
+                "TOTALNONCRITICALSCORE_QG": safe_num(qg.get("totalNonCriticalScore")),
+                "MAXTOTALNONCRITICALSCORE": safe_num(qg.get("maxTotalNonCriticalScore")),
+                "TOTALSCOREUNWEIGHTED": safe_num(qg.get("totalScoreUnweighted")),
+                "MAXTOTALSCOREUNWEIGHTED": safe_num(qg.get("maxTotalScoreUnweighted")),
+                "TOTALCRITICALSCOREUNWEIGHTED": safe_num(qg.get("totalCriticalScoreUnweighted")),
+                "MAXTOTALCRITICALSCOREUNWEIGHTED": safe_num(qg.get("maxTotalCriticalScoreUnweighted")),
+                "TOTALNONCRITICALSCOREUNWEIGHTED": safe_num(qg.get("totalNonCriticalScoreUnweighted")),
+                "MAXTOTALNONCRITICALSCOREUNWEIGHTED": safe_num(qg.get("maxTotalNonCriticalScoreUnweighted")),
+            }
+
+            question_scores = qg.get("questionScores") or []
+
+            if not question_scores:
+                row = base.copy()
+                row.update(qg_base)
+                row.update({
+                    "QUESTIONID": None,
+                    "ANSWERID": None,
+                    "SCORE": None,
+                    "MARKEDNA_Q": None,
+                    "COMMENTS_Q": None,
+                    "FAILEDKILLQUESTION": None,
+                    "QUESTION_NAME": None,
+                })
+                row["MERGE_KEY"] = f'{row.get("EVALUATIONID")}-{row.get("CONVERSATIONID")}-{row.get("QUESTIONGROUPID")}-None'
+                rows.append(row)
+                continue
+
+            for qs in question_scores:
+                question_id = qs.get("questionId")
+                row = base.copy()
+                row.update(qg_base)
+                row.update({
+                    "QUESTIONID": question_id,
+                    "ANSWERID": qs.get("answerId"),
+                    "SCORE": safe_num(qs.get("score")),
+                    "MARKEDNA_Q": bool_to_hana(qs.get("markedNA")),
+                    "COMMENTS_Q": clean_text(qs.get("comments")),
+                    "FAILEDKILLQUESTION": bool_to_hana(qs.get("failedKillQuestion")),
+                    "QUESTION_NAME": question_lookup.get(question_id),
+                })
+                row["MERGE_KEY"] = (
+                    f'{row.get("EVALUATIONID")}-'
+                    f'{row.get("CONVERSATIONID")}-'
+                    f'{row.get("QUESTIONGROUPID")}-'
+                    f'{row.get("QUESTIONID")}'
+                )
+                rows.append(row)
+
+    return rows
+
+
+def run_evaluations(
+    config: Config,
+    token: str,
+    start_date: str,
+    end_date: str,
+    question_lookup: Dict[str, str],
+    logger: logging.Logger,
+    dry_run: bool
+) -> Tuple[int, int, int, int]:
+
+    if not question_lookup:
+        question_lookup = get_question_lookup_from_hana(config, logger)
+
+    users = get_users_from_hana(config, logger)
+
+    all_rows: List[Dict[str, Any]] = []
+    users_ok = 0
+    users_error = 0
+
+    for idx, user_id in enumerate(users, start=1):
+        try:
+            logger.info("Consultando evaluaciones usuario %s/%s | %s", idx, len(users), user_id)
+
+            evaluations = fetch_evaluations_for_user(
+                config,
+                token,
+                user_id,
+                start_date,
+                end_date,
+                logger
+            )
+
+            rows = transform_evaluations(evaluations, question_lookup)
+            all_rows.extend(rows)
+            users_ok += 1
+
+            logger.info(
+                "Usuario procesado OK | evaluaciones: %s | filas obtenidas: %s | acumulado filas: %s",
+                len(evaluations),
+                len(rows),
+                len(all_rows)
+            )
+
+            time.sleep(config.api_sleep_seconds)
+
+        except Exception as exc:
+            users_error += 1
+            logger.exception("Error consultando usuario %s: %s", user_id, exc)
+            time.sleep(max(config.api_sleep_seconds, 3))
+
+    logger.info("Extracción evaluaciones finalizada. Filas transformadas: %s", len(all_rows))
+
+    if dry_run:
+        logger.warning("DRY RUN activo. No se cargarán evaluaciones a HANA.")
+        return len(all_rows), 0, users_ok, users_error
+
+    delete_evaluations_range(config, start_date, end_date, logger)
+
+    columns = [
+        "EVALUATIONID",
+        "CONVERSATIONID",
+        "EVALUATIONFORMID",
+        "EVALUATIONFORMNAME",
+        "EVALUATORID",
+        "AGENTID",
+        "STATUS",
+        "AGENTHASREAD",
+        "ASSIGNEEAPPLICABLE",
+        "RELEASEDATE",
+        "ASSIGNEDDATE",
+        "CREATEDDATE",
+        "CHANGEDDATE",
+        "SUBMITTEDDATE",
+        "QUEUEID",
+        "MEDIATYPE",
+        "CONVERSATIONDATE",
+        "CONVERSATIONENDDATE",
+        "NEVERRELEASE",
+        "DATEASSIGNEECHANGED",
+        "AGENTTEAMID",
+        "HASASSISTANCEFAILED",
+        "EVALUATIONSOURCEID",
+        "EVALUATIONSOURCETYPE",
+        "DISPUTECOUNT",
+        "VERSION",
+        "DECLINEDREVIEW",
+        "EVALUATIONCONTEXTID",
+        "AISCORINGPENDING",
+        "SYSTEMSUBMITTED",
+        "MISSINGREQUIREDANSWER",
+        "TOTALSCORE",
+        "TOTALCRITICALSCORE",
+        "TOTALNONCRITICALSCORE",
+        "ANYFAILEDKILLQUESTIONS",
+        "COMMENTS",
+        "QUESTIONGROUPID",
+        "TOTALSCORE_QG",
+        "MAXTOTALSCORE",
+        "MARKEDNA",
+        "SYSTEMMARKEDNA",
+        "TOTALCRITICALSCORE_QG",
+        "MAXTOTALCRITICALSCORE",
+        "TOTALNONCRITICALSCORE_QG",
+        "MAXTOTALNONCRITICALSCORE",
+        "TOTALSCOREUNWEIGHTED",
+        "MAXTOTALSCOREUNWEIGHTED",
+        "TOTALCRITICALSCOREUNWEIGHTED",
+        "MAXTOTALCRITICALSCOREUNWEIGHTED",
+        "TOTALNONCRITICALSCOREUNWEIGHTED",
+        "MAXTOTALNONCRITICALSCOREUNWEIGHTED",
+        "QUESTIONID",
+        "ANSWERID",
+        "SCORE",
+        "MARKEDNA_Q",
+        "COMMENTS_Q",
+        "FAILEDKILLQUESTION",
+        "QUESTION_NAME",
+        "MERGE_KEY",
+    ]
+
+    loaded, failed = insert_rows(config, config.evaluations_table, columns, all_rows, logger)
+
+    return loaded, failed, users_ok, users_error
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Carga formularios y evaluaciones Genesys Cloud Quality a SAP HANA"
+    )
+
+    parser.add_argument("--date", default=env_str("DATE", ""), help="Fecha local específica. Ejemplo: 2026-05-27")
+    parser.add_argument("--start-date", default=env_str("START_DATE", ""), help="Fecha local inicial inclusiva. Ejemplo: 2026-05-01")
+    parser.add_argument("--end-date", default=env_str("END_DATE", ""), help="Fecha local final inclusiva. Ejemplo: 2026-05-27")
+    parser.add_argument("--start-utc", default=env_str("START_UTC", ""), help="Fecha UTC exacta. Ejemplo: 2026-05-01T06:00:00.000Z")
+    parser.add_argument("--end-utc", default=env_str("END_UTC", ""), help="Fecha UTC exacta. Ejemplo: 2026-05-28T06:00:00.000Z")
+
+    parser.add_argument("--solo-formularios", action="store_true", help="Solo carga catálogo de formularios/preguntas.")
+    parser.add_argument("--solo-evaluaciones", action="store_true", help="Solo carga evaluaciones. Usa catálogo existente de preguntas.")
+    parser.add_argument("--dry-run", action="store_true", help="Ejecuta API y transformación, pero no carga a HANA.")
+
+    args = parser.parse_args()
+
+    run_mode = env_str("RUN_MODE", "")
+    if run_mode == "solo_formularios":
+        args.solo_formularios = True
+    elif run_mode == "solo_evaluaciones":
+        args.solo_evaluaciones = True
+    if env_bool("DRY_RUN", False):
+        args.dry_run = True
+
+    logger = setup_logger()
+    start_time = time.time()
+
+    forms_loaded = 0
+    forms_failed = 0
+    eval_loaded = 0
+    eval_failed = 0
+    users_ok = 0
+    users_error = 0
+    general_errors: List[str] = []
+
+    try:
+        config = load_config()
+        start_date, end_date, date_mode = parse_dates(args, config.timezone_name)
+
+        logger.info("=" * 80)
+        logger.info("INICIO PROCESO GNS FORMULARIOS Y EVALUACIONES")
+        log_params(logger, ["GENESYS_CLIENT_ID", "GENESYS_CLIENT_SECRET", "GENESYS_REGION", "HPR_HOST", "HPR_HOST_ESPEJO", "HPR_PORT", "HPR_USER", "HPR_PASSWORD", "HANA_SCHEMA", "HANA_USERS_TABLE", "HANA_FORM_EVALUACIONES_TABLE", "HANA_EVALUACIONES_TABLE", "RUN_MODE", "DATE", "START_DATE", "END_DATE", "START_UTC", "END_UTC", "DAYS_BACK", "DRY_RUN"])
+        logger.info("Modo fecha: %s", date_mode)
+        logger.info("startTime API: %s", start_date)
+        logger.info("endTime API: %s", end_date)
+        logger.info("Zona horaria: %s", config.timezone_name)
+        logger.info("HANA escritura: %s:%s", config.hana_host, config.hana_port)
+        logger.info("HANA lectura/espejo: %s:%s", config.hana_host_espejo, config.hana_port)
+        logger.info("Tabla usuarios: %s.%s", config.hana_schema, config.users_table)
+        logger.info("Tabla formularios: %s.%s", config.hana_schema, config.forms_table)
+        logger.info("Tabla evaluaciones: %s.%s", config.hana_schema, config.evaluations_table)
+        logger.info("=" * 80)
+
+        token = get_access_token(config, logger)
+
+        question_lookup: Dict[str, str] = {}
+
+        if not args.solo_evaluaciones:
+            logger.info("=" * 80)
+            logger.info("PASO 1/2: CARGA DE FORMULARIOS/PREGUNTAS")
+            logger.info("=" * 80)
+
+            forms_loaded, forms_failed, question_lookup = run_forms(
+                config,
+                token,
+                logger,
+                args.dry_run
+            )
+
+        if not args.solo_formularios:
+            logger.info("=" * 80)
+            logger.info("PASO 2/2: CARGA DE EVALUACIONES")
+            logger.info("=" * 80)
+
+            eval_loaded, eval_failed, users_ok, users_error = run_evaluations(
+                config,
+                token,
+                start_date,
+                end_date,
+                question_lookup,
+                logger,
+                args.dry_run
+            )
+
+    except Exception as exc:
+        general_errors.append(str(exc))
+        logger.exception("El proceso terminó con error general: %s", exc)
+        logger.error(traceback.format_exc())
+
+    duration = time.time() - start_time
+
+    logger.info("=" * 80)
+    logger.info("RESUMEN FINAL")
+    logger.info("Formularios/preguntas cargados: %s", forms_loaded)
+    logger.info("Formularios/preguntas fallidos: %s", forms_failed)
+    logger.info("Usuarios evaluaciones OK: %s", users_ok)
+    logger.info("Usuarios evaluaciones con error: %s", users_error)
+    logger.info("Filas evaluaciones cargadas: %s", eval_loaded)
+    logger.info("Filas evaluaciones fallidas: %s", eval_failed)
+    logger.info("Errores generales: %s", len(general_errors))
+
+    for err in general_errors[:20]:
+        logger.error("Detalle error: %s", err)
+
+    logger.info("Duración total: %.2f segundos", duration)
+    logger.info("=" * 80)
+
+    return 0 if not general_errors and forms_failed == 0 and eval_failed == 0 and users_error == 0 else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
