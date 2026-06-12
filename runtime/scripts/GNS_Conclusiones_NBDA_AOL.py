@@ -159,6 +159,13 @@ PYFLOW_PARAMS = {
         "required": False,
         "default": "runtime/exports"
     },
+    "REPORT_TYPE": {
+        "type": "select",
+        "label": "Tipo de datos a generar",
+        "required": True,
+        "options": ["Reporte consolidado", "Data", "Consolidado + Data"],
+        "default": "Reporte consolidado"
+    },
     "PAGE_SIZE": {
         "type": "number",
         "label": "Tamaño página Genesys",
@@ -1133,38 +1140,129 @@ def _format_excel_sheet(ws) -> None:
         ws.column_dimensions[col_letter].width = min(max_length + 2, 55)
 
 
+def normalize_report_type(value: str) -> str:
+    """Normaliza el tipo de salida para aceptar valores desde PyFlow o CLI."""
+    text = str(value or "Reporte consolidado").strip().lower()
+    text = text.replace("_", " ").replace("+", " + ")
+    text = " ".join(text.split())
+
+    if text in ("data", "datos", "detalle"):
+        return "Data"
+
+    if text in (
+        "consolidado + data",
+        "reporte consolidado + data",
+        "consolidado y data",
+        "ambos",
+        "todo"
+    ):
+        return "Consolidado + Data"
+
+    return "Reporte consolidado"
+
+
+def build_data_for_analysis(df_detail: pd.DataFrame) -> pd.DataFrame:
+    """
+    Prepara la hoja Data con una estructura más cómoda para análisis.
+    Mantiene métricas de volumen y tiempos promedio devueltas por Genesys.
+    """
+    columns = [
+        "Fecha conclusión",
+        "Día",
+        "Mes",
+        "Año",
+        "Banca",
+        "conclusion",
+        "Nombre de código de conclusión",
+        "ID de código de conclusión",
+        "Nombre de cola",
+        "ID de cola",
+        "Manejo",
+        "Retención",
+        "Manejo medio",
+        "Conversación media",
+        "Retención media",
+        "ACW medio",
+        "Inicio del intervalo",
+        "Fin del intervalo",
+    ]
+
+    if df_detail.empty:
+        return pd.DataFrame(columns=columns)
+
+    df = df_detail.copy()
+
+    for col in columns:
+        if col not in df.columns:
+            df[col] = None
+
+    df = df[columns].copy()
+
+    numeric_cols = [
+        "Día", "Mes", "Año", "Manejo", "Retención",
+        "Manejo medio", "Conversación media", "Retención media", "ACW medio"
+    ]
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+    df = df.rename(columns={
+        "conclusion": "Conclusión limpia",
+        "Manejo": "Volumen",
+        "Retención": "Cantidad retenciones/hold",
+        "Manejo medio": "Tiempo manejo medio (seg)",
+        "Conversación media": "Tiempo conversación media (seg)",
+        "Retención media": "Tiempo retención media (seg)",
+        "ACW medio": "Tiempo ACW medio (seg)",
+    })
+
+    return df.sort_values(
+        ["Fecha conclusión", "Banca", "Nombre de código de conclusión", "Nombre de cola"],
+        ascending=[True, True, True, True]
+    )
+
+
 def create_excel(
     df_detail: pd.DataFrame,
     df_summary: pd.DataFrame,
     output_path: Path,
-    logger: logging.Logger
+    logger: logging.Logger,
+    report_type: str = "Reporte consolidado"
 ) -> Path:
 
     logger.info("Generando Excel: %s", output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    report_type = normalize_report_type(report_type)
+    logger.info("Tipo de archivo solicitado: %s", report_type)
+
+    df_data = build_data_for_analysis(df_detail)
     df_aol = build_conclusion_daily_matrix(df_detail, "AOL")
     df_nbda = build_conclusion_daily_matrix(df_detail, "NBDA")
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        # Requerimiento: 3 pestañas.
-        # 1) Resumen igual al existente.
-        # 2) Conclusiones AOL acumuladas por día/mes.
-        # 3) Conclusiones NBDA acumuladas por día/mes.
-        df_summary.to_excel(writer, sheet_name="Resumen", index=False)
-        df_aol.to_excel(writer, sheet_name="Conclusiones AOL", index=False)
-        df_nbda.to_excel(writer, sheet_name="Conclusiones NBDA", index=False)
+        sheets_to_format: List[str] = []
+
+        if report_type in ("Reporte consolidado", "Consolidado + Data"):
+            df_summary.to_excel(writer, sheet_name="Resumen", index=False)
+            df_aol.to_excel(writer, sheet_name="Conclusiones AOL", index=False)
+            df_nbda.to_excel(writer, sheet_name="Conclusiones NBDA", index=False)
+            sheets_to_format.extend(["Resumen", "Conclusiones AOL", "Conclusiones NBDA"])
+
+        if report_type in ("Data", "Consolidado + Data"):
+            df_data.to_excel(writer, sheet_name="Data", index=False)
+            sheets_to_format.append("Data")
 
         wb = writer.book
 
-        for sheet_name in ["Resumen", "Conclusiones AOL", "Conclusiones NBDA"]:
+        for sheet_name in sheets_to_format:
             _format_excel_sheet(wb[sheet_name])
 
-        ws = wb["Resumen"]
+        if "Resumen" in wb.sheetnames:
+            ws = wb["Resumen"]
 
-        for row in range(2, ws.max_row + 1):
-            ws[f"C{row}"].number_format = "0%"
-            ws[f"E{row}"].number_format = "0%"
+            for row in range(2, ws.max_row + 1):
+                ws[f"C{row}"].number_format = "0%"
+                ws[f"E{row}"].number_format = "0%"
 
     logger.info("Excel generado correctamente.")
     return output_path
@@ -1331,6 +1429,12 @@ def main() -> int:
     parser.add_argument("--cc", default=env_str("EMAIL_CC", ""), help="CC separados por coma.")
     parser.add_argument("--subject", default=env_str("EMAIL_SUBJECT", ""), help="Asunto del correo.")
     parser.add_argument("--dry-run", action="store_true", help="Genera Excel pero no envía correo.")
+    parser.add_argument(
+        "--report-type",
+        default=env_str("REPORT_TYPE", "Reporte consolidado"),
+        choices=["Reporte consolidado", "Data", "Consolidado + Data"],
+        help="Tipo de Excel a generar."
+    )
 
     args = parser.parse_args()
     if env_bool("SEND_EMAIL", False):
@@ -1358,12 +1462,14 @@ def main() -> int:
         log_params(logger, [
             "GENESYS_CLIENT_ID", "GENESYS_CLIENT_SECRET", "GENESYS_REGION",
             "DATE", "START_DATE", "END_DATE", "START_UTC", "END_UTC", "AUTO_START_DAY",
-            "GENESYS_TIMEZONE", "OUTPUT_DIR", "SEND_EMAIL", "EMAIL_TO", "EMAIL_CC",
+            "GENESYS_TIMEZONE", "OUTPUT_DIR", "REPORT_TYPE", "SEND_EMAIL", "EMAIL_TO", "EMAIL_CC",
             "EMAIL_SUBJECT", "INCLUDE_SUMMARY_TABLE_IN_EMAIL", "WRAPUP_FILTER_CHUNK_SIZE", "GRAPH_TENANT_ID", "GRAPH_CLIENT_ID",
             "GRAPH_CLIENT_SECRET", "GRAPH_SENDER_EMAIL", "GRAPH_AUTHORITY_URL", "GRAPH_SCOPE",
             "GRAPH_SAVE_TO_SENT_ITEMS", "DRY_RUN"
         ])
+        args.report_type = normalize_report_type(args.report_type)
         logger.info("Modo fecha: %s", date_mode)
+        logger.info("Tipo de reporte: %s", args.report_type)
         logger.info("Inicio UTC: %s", start_utc)
         logger.info("Fin UTC: %s", end_utc)
         logger.info("Inicio local: %s", start_local.strftime("%Y-%m-%d %H:%M:%S"))
@@ -1402,7 +1508,8 @@ def main() -> int:
             df_detail,
             df_summary,
             output_path,
-            logger
+            logger,
+            args.report_type
         )
 
         if args.send_email and not args.dry_run:
