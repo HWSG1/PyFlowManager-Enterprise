@@ -284,30 +284,52 @@ Chart.register(...registerables);
 
               <div class="flex items-center justify-between">
                 <span class="text-slate-400">Backend</span>
-                <span class="text-emerald-400 font-semibold">Activo</span>
+                <span
+                  class="font-semibold"
+                  [class.text-emerald-400]="dashboard?.systemHealth?.backend"
+                  [class.text-rose-400]="!dashboard?.systemHealth?.backend">
+                  {{ dashboard?.systemHealth?.backend ? 'Activo' : 'Inactivo' }}
+                </span>
               </div>
 
               <div class="flex items-center justify-between">
                 <span class="text-slate-400">Scheduler</span>
-                <span class="text-emerald-400 font-semibold">Activo</span>
+                <span
+                  class="font-semibold"
+                  [class.text-emerald-400]="dashboard?.systemHealth?.scheduler"
+                  [class.text-rose-400]="!dashboard?.systemHealth?.scheduler">
+                  {{ dashboard?.systemHealth?.scheduler ? 'Activo' : 'Inactivo' }}
+                </span>
               </div>
 
               <div class="flex items-center justify-between">
                 <span class="text-slate-400">SQL Server</span>
-                <span class="text-emerald-400 font-semibold">Activo</span>
+                <span
+                  class="font-semibold"
+                  [class.text-emerald-400]="dashboard?.systemHealth?.database"
+                  [class.text-rose-400]="!dashboard?.systemHealth?.database">
+                  {{ dashboard?.systemHealth?.database ? 'Activo' : 'Inactivo' }}
+                </span>
               </div>
 
               <div class="flex items-center justify-between">
                 <span class="text-slate-400">RAM</span>
                 <span class="text-blue-400 font-semibold">
-                  {{ dashboard?.systemHealth?.memoryUsage || 0 }}%
+                  {{ formatPercent(dashboard?.systemHealth?.memoryUsage) }}
+                  <span class="text-slate-500">
+                    ({{ formatGb(dashboard?.systemHealth?.memoryUsedGb) }} /
+                    {{ formatGb(dashboard?.systemHealth?.memoryTotalGb) }})
+                  </span>
                 </span>
               </div>
 
               <div class="flex items-center justify-between">
-                <span class="text-slate-400">CPU Cores</span>
+                <span class="text-slate-400">CPU</span>
                 <span class="text-cyan-400 font-semibold">
-                  {{ dashboard?.systemHealth?.cpuCount || 0 }}
+                  {{ formatPercent(dashboard?.systemHealth?.cpuUsage) }}
+                  <span class="text-slate-500">
+                    ({{ dashboard?.systemHealth?.cpuCount || 0 }} cores)
+                  </span>
                 </span>
               </div>
 
@@ -498,5 +520,15 @@ export class DashboardComponent implements AfterViewInit, OnDestroy {
     if (h > 0) return `${h}h ${m}m`;
     if (m > 0) return `${m}m ${s}s`;
     return `${s}s`;
+  }
+
+  formatPercent(value: any): string {
+    const number = Number(value);
+    return Number.isFinite(number) ? `${number.toFixed(2)}%` : '0.00%';
+  }
+
+  formatGb(value: any): string {
+    const number = Number(value);
+    return Number.isFinite(number) ? `${number.toFixed(2)}GB` : '--';
   }
 }

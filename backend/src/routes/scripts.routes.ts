@@ -166,6 +166,7 @@ router.post('/', upload.single('file'), async (req, res, next) => {
           .input('label', sql.NVarChar(255), config.label || key)
           .input('options_json', sql.NVarChar(sql.MAX), config.options ? JSON.stringify(config.options) : null)
           .input('is_required', sql.Bit, config.required ? 1 : 0)
+          .input('global_key', sql.NVarChar(150), config.global_key || null)
           .query(`
             INSERT INTO dbo.ScriptParameters (
               script_id,
@@ -177,7 +178,8 @@ router.post('/', upload.single('file'), async (req, res, next) => {
               description,
               label,
               options_json,
-              is_required
+              is_required,
+              global_key
             )
             VALUES (
               @script_id,
@@ -189,7 +191,8 @@ router.post('/', upload.single('file'), async (req, res, next) => {
               @description,
               @label,
               @options_json,
-              @is_required
+              @is_required,
+              @global_key
             )
           `);
       }
@@ -210,22 +213,113 @@ router.get('/:id/parameters', async (req, res, next) => {
       .input('script_id', sql.Int, scriptId)
       .query(`
         SELECT
-          id,
-          script_id,
-          param_key,
-          param_value,
-          param_type,
-          control_type,
-          label,
-          options_json,
-          is_required,
-          global_key
-        FROM dbo.ScriptParameters
-        WHERE script_id = @script_id
-        ORDER BY id
+          sp.id,
+          sp.script_id,
+          sp.param_key,
+          sp.param_value,
+          sp.param_type,
+          sp.control_type,
+          sp.label,
+          sp.options_json,
+          sp.is_required,
+          sp.global_key,
+          s.name AS script_name
+        FROM dbo.ScriptParameters sp
+        INNER JOIN dbo.Scripts s
+          ON s.id = sp.script_id
+        WHERE sp.script_id = @script_id
+          AND (
+            s.name <> 'GNS_Usuarios.py'
+            OR sp.param_key NOT IN (
+              'PAGE_SIZE',
+              'COMMIT_EVERY',
+              'DRY_RUN',
+              'REQUEST_TIMEOUT_SECONDS',
+              'MAX_RETRIES'
+            )
+          )
+          AND (
+            s.name <> 'GNS_IVR.py'
+            OR sp.param_key NOT IN (
+              'DATE',
+              'START_DATE',
+              'END_DATE',
+              'START_UTC',
+              'END_UTC',
+              'GENESYS_TIMEZONE',
+              'MAX_RANGE_DAYS',
+              'JOB_PAGE_SIZE',
+              'REQUEST_TIMEOUT',
+              'MAX_API_RETRIES',
+              'POLL_SECONDS',
+              'MAX_POLL_ATTEMPTS',
+              'API_SLEEP_SECONDS',
+              'HANA_BATCH_SIZE',
+              'MAX_CONVERSATIONS',
+              'ENRICH_CLIENTS_FROM_HANA',
+              'QUALTRICS_DELAY_SECONDS'
+            )
+          )
+        ORDER BY sp.id
       `);
 
-    res.json(result.recordset);
+    const rows = result.recordset;
+    const isGnsIvr = rows.some((row: any) => row.script_name === 'GNS_IVR.py');
+
+    if (isGnsIvr) {
+      const runMode = rows.find((row: any) => row.param_key === 'RUN_MODE');
+      if (runMode) {
+        runMode.label = 'Modo de ejecucion';
+        runMode.options_json = JSON.stringify([
+          'cargar_hana',
+          'cargar_y_autoservicio',
+          'cargar_y_abandono',
+          'solo_autoservicio',
+          'solo_abandono',
+          'cargar_y_ambos',
+          'enviar_encuesta',
+          'cargar_hana_y_enviar_encuesta',
+          'todo'
+        ]);
+      }
+
+      const hasParam = (key: string) => rows.some((row: any) => row.param_key === key);
+      const baseId = rows.length ? Math.max(...rows.map((row: any) => Number(row.id) || 0)) + 1 : 1;
+
+      if (!hasParam('TOKEN_QUALTRICTS')) {
+        rows.push({
+          id: baseId,
+          script_id: scriptId,
+          param_key: 'TOKEN_QUALTRICTS',
+          param_value: '',
+          param_type: 'global',
+          control_type: 'text',
+          label: 'Token Qualtrics',
+          options_json: null,
+          is_required: true,
+          global_key: 'TOKEN_QUALTRICTS',
+          script_name: 'GNS_IVR.py'
+        });
+      }
+
+      if (!hasParam('POST_AUTOSERVICIO_QUALTRICTS_QA')) {
+        rows.push({
+          id: baseId + 1,
+          script_id: scriptId,
+          param_key: 'POST_AUTOSERVICIO_QUALTRICTS_QA',
+          param_value: '',
+          param_type: 'global',
+          control_type: 'text',
+          label: 'Endpoint Qualtrics',
+          options_json: null,
+          is_required: true,
+          global_key: 'POST_AUTOSERVICIO_QUALTRICTS_QA',
+          script_name: 'GNS_IVR.py'
+        });
+      }
+    }
+
+    res.json(rows);
   } catch (err) {
     next(err);
   }

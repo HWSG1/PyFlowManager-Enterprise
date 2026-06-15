@@ -1,4 +1,4 @@
-import { Component, OnInit, OnDestroy } from '@angular/core';
+﻿import { Component, ElementRef, OnInit, OnDestroy, ViewChild } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { PyflowService } from '../../services/pyflow.service';
@@ -79,62 +79,103 @@ import { environment } from '../../../environments/environment';
             </div>
           </div>
 
-          <!-- Script Params -->
+          <!-- Script / Execution Params -->
           <div class="bg-slate-950 border border-slate-800 p-5 rounded-xl shrink-0">
-            <h4 class="font-semibold text-white text-sm mb-3">Parámetros del Script</h4>
+            <div class="flex items-center justify-between gap-3 mb-3">
+              <h4 class="font-semibold text-white text-sm">
+                {{ viewingExecutionParameters ? 'Parámetros de la Ejecución' : 'Parámetros del Script' }}
+              </h4>
 
-            @if (scriptParams.length === 0) {
+              @if (viewingExecutionParameters) {
+                <span class="text-[10px] text-blue-400 code-font">
+                  EX-{{ viewingExecutionParameters }}
+                </span>
+              }
+            </div>
+
+            @if (viewingExecutionParameters) {
+              @if (executionParams.length === 0) {
+                <div class="text-xs text-slate-500 border border-slate-800 rounded-lg p-3 bg-slate-900/40">
+                  Esta ejecución no tiene parámetros registrados.
+                </div>
+              } @else {
+                <div class="flex flex-col gap-2">
+                  @for (param of executionParams; track param.id || param.param_key) {
+                    <div class="border border-slate-800 rounded-lg p-3 bg-slate-900/50">
+                      <div class="text-[10px] uppercase tracking-wide text-slate-500 font-semibold">
+                        {{ param.param_key }}
+                      </div>
+                      <div class="text-xs text-slate-200 code-font mt-1 break-all">
+                        {{ param.param_value || '--' }}
+                      </div>
+                    </div>
+                  }
+                </div>
+              }
+            } @else if (scriptParams.length === 0) {
               <div class="text-xs text-slate-500 border border-slate-800 rounded-lg p-3 bg-slate-900/40">
                 No existen parámetros configurados para este script.
               </div>
             } @else {
               <div class="flex flex-col gap-3">
-                @for (param of scriptParams; track param.id) {
-                  @if (isGlobalParam(param)) {
-                    <div class="border border-emerald-900/60 bg-emerald-950/20 rounded-lg p-3">
-                      <div class="text-xs text-emerald-400 font-semibold">
-                        ✓ Variable global configurada:
-                      </div>
-                      <div class="text-xs text-slate-200 code-font mt-1">
-                        {{ param.global_key || param.param_key }}
-                      </div>
-                    </div>
-                  } @else {
-                    <div>
-                      <label class="text-xs text-slate-400 font-semibold block mb-1">
-                        {{ param.label || param.param_key }}
-                        @if (param.is_required) {
-                          <span class="text-rose-400">*</span>
-                        }
-                      </label>
+                @for (param of scriptInputParams(); track param.id) {
+                  <div>
+                    <label class="text-xs text-slate-400 font-semibold block mb-1">
+                      {{ param.label || param.param_key }}
+                      @if (param.is_required) {
+                        <span class="text-rose-400">*</span>
+                      }
+                    </label>
 
-                      @if (param.control_type === 'select') {
-                        <select
-                          [(ngModel)]="paramValues[param.param_key]"
-                          class="w-full bg-slate-900 border border-slate-800 rounded px-2.5 py-1.5 text-xs text-slate-300 focus:outline-none focus:border-blue-500">
-                          <option value="">Seleccione...</option>
-                          @for (opt of parseOptions(param.options_json); track opt) {
-                            <option [value]="opt">{{ opt }}</option>
+                    @if (param.control_type === 'select') {
+                      <select
+                        [(ngModel)]="paramValues[param.param_key]"
+                        class="w-full bg-slate-900 border border-slate-800 rounded px-2.5 py-1.5 text-xs text-slate-300 focus:outline-none focus:border-blue-500">
+                        <option value="">Seleccione...</option>
+                        @for (opt of parseOptions(param.options_json); track opt) {
+                          <option [value]="opt">{{ opt }}</option>
+                        }
+                      </select>
+                    } @else if (param.control_type === 'date') {
+                      <input type="date" [(ngModel)]="paramValues[param.param_key]"
+                        class="w-full bg-slate-900 border border-slate-800 rounded px-2.5 py-1.5 text-xs text-slate-300 focus:outline-none focus:border-blue-500">
+                    } @else if (param.control_type === 'datetime') {
+                      <input type="datetime-local" [(ngModel)]="paramValues[param.param_key]"
+                        class="w-full bg-slate-900 border border-slate-800 rounded px-2.5 py-1.5 text-xs text-slate-300 focus:outline-none focus:border-blue-500">
+                    } @else if (param.control_type === 'number') {
+                      <input type="number" [(ngModel)]="paramValues[param.param_key]"
+                        class="w-full bg-slate-900 border border-slate-800 rounded px-2.5 py-1.5 text-xs text-slate-300 focus:outline-none focus:border-blue-500">
+                    } @else if (param.control_type === 'textarea') {
+                      <textarea rows="3" [(ngModel)]="paramValues[param.param_key]"
+                        class="w-full bg-slate-900 border border-slate-800 rounded px-2.5 py-1.5 text-xs text-slate-300 focus:outline-none focus:border-blue-500"></textarea>
+                    } @else {
+                      <input type="text" [(ngModel)]="paramValues[param.param_key]"
+                        class="w-full bg-slate-900 border border-slate-800 rounded px-2.5 py-1.5 text-xs text-slate-300 focus:outline-none focus:border-blue-500">
+                    }
+                  </div>
+                }
+
+                @if (sortedGlobalParams().length > 0) {
+                  <div class="pt-2 border-t border-slate-800/70">
+                    <div class="text-[10px] uppercase tracking-wide text-slate-500 font-semibold mb-2">Variables globales</div>
+                    <div class="flex flex-col gap-3">
+                      @for (param of sortedGlobalParams(); track param.id) {
+                        <div [class]="globalParamClass(param)">
+                          <div [class]="globalParamTitleClass(param)">
+                            {{ isGlobalParamConfigured(param) ? '✓ Variable global configurada:' : '✕ Variable global no configurada:' }}
+                          </div>
+                          <div class="text-xs text-slate-200 code-font mt-1">
+                            {{ globalParamKey(param) }}
+                          </div>
+                          @if (!isGlobalParamConfigured(param)) {
+                            <div class="text-[11px] text-rose-300 mt-2">
+                              Agrega esta variable en Configuración para poder ejecutar el script.
+                            </div>
                           }
-                        </select>
-                      } @else if (param.control_type === 'date') {
-                        <input type="date" [(ngModel)]="paramValues[param.param_key]"
-                          class="w-full bg-slate-900 border border-slate-800 rounded px-2.5 py-1.5 text-xs text-slate-300 focus:outline-none focus:border-blue-500">
-                      } @else if (param.control_type === 'datetime') {
-                        <input type="datetime-local" [(ngModel)]="paramValues[param.param_key]"
-                          class="w-full bg-slate-900 border border-slate-800 rounded px-2.5 py-1.5 text-xs text-slate-300 focus:outline-none focus:border-blue-500">
-                      } @else if (param.control_type === 'number') {
-                        <input type="number" [(ngModel)]="paramValues[param.param_key]"
-                          class="w-full bg-slate-900 border border-slate-800 rounded px-2.5 py-1.5 text-xs text-slate-300 focus:outline-none focus:border-blue-500">
-                      } @else if (param.control_type === 'textarea') {
-                        <textarea rows="3" [(ngModel)]="paramValues[param.param_key]"
-                          class="w-full bg-slate-900 border border-slate-800 rounded px-2.5 py-1.5 text-xs text-slate-300 focus:outline-none focus:border-blue-500"></textarea>
-                      } @else {
-                        <input type="text" [(ngModel)]="paramValues[param.param_key]"
-                          class="w-full bg-slate-900 border border-slate-800 rounded px-2.5 py-1.5 text-xs text-slate-300 focus:outline-none focus:border-blue-500">
+                        </div>
                       }
                     </div>
-                  }
+                  </div>
                 }
               </div>
             }
@@ -240,7 +281,10 @@ import { environment } from '../../../environments/environment';
               </button>
             </div>
 
-            <div class="h-[360px] overflow-y-auto custom-scrollbar bg-slate-950/80 p-4 code-font text-xs leading-relaxed flex flex-col gap-1">
+            <div
+              #consolePane
+              (scroll)="onConsoleScroll()"
+              class="h-[360px] overflow-y-auto custom-scrollbar bg-slate-950/80 p-4 code-font text-xs leading-relaxed flex flex-col gap-1">
               @for (line of consoleLines; track $index) {
                 <div [class]="line.cls">{{ line.text }}</div>
               }
@@ -303,6 +347,8 @@ import { environment } from '../../../environments/environment';
   `
 })
 export class ScriptDetailComponent implements OnInit, OnDestroy {
+  @ViewChild('consolePane') consolePane?: ElementRef<HTMLDivElement>;
+
   isRunning = false;
   progress = 0;
   timer = '--:--';
@@ -316,11 +362,15 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
   ];
 
   scriptParams: any[] = [];
+  executionParams: any[] = [];
+  viewingExecutionParameters: number | null = null;
   paramValues: Record<string, any> = {};
 
   private intervalId: ReturnType<typeof setInterval> | null = null;
   private eventSource: EventSource | null = null;
   private currentExecutionId: number | null = null;
+  private consoleSessionId = 0;
+  private shouldFollowConsole = true;
 
   constructor(public svc: PyflowService) {}
 
@@ -338,6 +388,52 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
 
   isGlobalParam(param: any): boolean {
     return String(param?.control_type || '').toLowerCase() === 'global';
+  }
+
+  scriptInputParams(): any[] {
+    return this.scriptParams.filter(param => !this.isGlobalParam(param));
+  }
+
+  sortedGlobalParams(): any[] {
+    return this.scriptParams
+      .filter(param => this.isGlobalParam(param))
+      .sort((a, b) => {
+        const aConfigured = this.isGlobalParamConfigured(a) ? 1 : 0;
+        const bConfigured = this.isGlobalParamConfigured(b) ? 1 : 0;
+
+        if (aConfigured !== bConfigured) {
+          return aConfigured - bConfigured;
+        }
+
+        return this.globalParamKey(a).localeCompare(this.globalParamKey(b));
+      });
+  }
+
+  globalParamKey(param: any): string {
+    return String(param?.global_key || param?.param_key || '').trim();
+  }
+
+  isGlobalParamConfigured(param: any): boolean {
+    const key = this.globalParamKey(param).toLowerCase();
+    if (!key) return false;
+
+    return this.svc.envParams().some(item =>
+      String(item.key || '').trim().toLowerCase() === key
+    );
+  }
+
+  globalParamClass(param: any): string {
+    const base = 'border rounded-lg p-3';
+
+    return this.isGlobalParamConfigured(param)
+      ? `${base} border-emerald-900/60 bg-emerald-950/20`
+      : `${base} border-rose-900/70 bg-rose-950/20`;
+  }
+
+  globalParamTitleClass(param: any): string {
+    return this.isGlobalParamConfigured(param)
+      ? 'text-xs text-emerald-400 font-semibold'
+      : 'text-xs text-rose-400 font-semibold';
   }
 
   loadScriptParameters() {
@@ -395,6 +491,51 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
     this.consoleLines = [
       { text: '[SYSTEM] Consola limpiada.', cls: 'text-slate-500' }
     ];
+    this.shouldFollowConsole = true;
+    this.scrollConsoleToBottom(true);
+  }
+
+  onConsoleScroll() {
+    const el = this.consolePane?.nativeElement;
+    if (!el) return;
+
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    this.shouldFollowConsole = distanceFromBottom < 24;
+  }
+
+  private scrollConsoleToBottom(force = false) {
+    if (!force && !this.shouldFollowConsole) return;
+
+    setTimeout(() => {
+      const el = this.consolePane?.nativeElement;
+      if (!el) return;
+
+      el.scrollTop = el.scrollHeight;
+    }, 0);
+  }
+
+  private readProgress(message: any): number | null {
+    const match = String(message || '').trim().match(/^PYFLOW_PROGRESS=(\d{1,3})(?:\.\d+)?$/i);
+    if (!match) return null;
+
+    const progress = Number(match[1]);
+    if (!Number.isFinite(progress)) return null;
+
+    return Math.max(0, Math.min(100, progress));
+  }
+
+  private stopConsoleWatch() {
+    this.consoleSessionId++;
+
+    if (this.intervalId) {
+      clearInterval(this.intervalId);
+      this.intervalId = null;
+    }
+
+    if (this.eventSource) {
+      this.eventSource.close();
+      this.eventSource = null;
+    }
   }
 
   runScript() {
@@ -404,7 +545,12 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
       return;
     }
 
+    this.stopConsoleWatch();
+    this.viewingExecutionParameters = null;
+    this.executionParams = [];
     this.consoleLines = [];
+    this.shouldFollowConsole = true;
+    this.scrollConsoleToBottom(true);
     this.statusText = 'Iniciando...';
     this.progress = 5;
     this.isRunning = true;
@@ -428,6 +574,7 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
           text: `[SYSTEM] Ejecución EX-${result.executionId} iniciada`,
           cls: 'text-blue-400'
         });
+        this.scrollConsoleToBottom();
 
         this.connectExecutionStream(result.executionId);
       })
@@ -439,24 +586,32 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
           text: `[ERROR] ${err.message}`,
           cls: 'text-red-400'
         });
+        this.scrollConsoleToBottom();
       });
   }
 
   connectExecutionStream(executionId: number) {
-    if (this.eventSource) {
-      this.eventSource.close();
-    }
+    this.stopConsoleWatch();
+    const sessionId = this.consoleSessionId;
 
     const seen = new Set<string>();
 
     const loadLogsFromDb = () => {
       this.svc.getExecutionLogs(executionId).subscribe({
         next: rows => {
+          if (sessionId !== this.consoleSessionId || this.currentExecutionId !== executionId) return;
+
           for (const row of rows) {
             const key = `${row.id}-${row.message}`;
 
             if (seen.has(key)) continue;
             seen.add(key);
+
+            const progress = this.readProgress(row.message);
+            if (progress !== null) {
+              this.progress = progress;
+              continue;
+            }
 
             let css = 'text-slate-300';
 
@@ -470,14 +625,10 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
               text: `[${row.log_level}] ${row.message}`,
               cls: css
             });
+            this.scrollConsoleToBottom();
           }
 
-          setTimeout(() => {
-            const consoleDiv = document.querySelector('.custom-scrollbar');
-            if (consoleDiv) {
-              consoleDiv.scrollTop = consoleDiv.scrollHeight;
-            }
-          }, 50);
+          this.scrollConsoleToBottom();
         }
       });
     };
@@ -492,7 +643,25 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
     this.eventSource = new EventSource(`${environment.apiUrl}/executions/${executionId}/stream`);
 
     this.eventSource.onmessage = event => {
+      if (sessionId !== this.consoleSessionId || this.currentExecutionId !== executionId) return;
+
       const payload = JSON.parse(event.data);
+
+      if (payload.progress !== undefined) {
+        const progress = Number(payload.progress);
+        if (Number.isFinite(progress)) {
+          this.progress = Math.max(0, Math.min(100, progress));
+          this.statusText = 'Ejecutando';
+        }
+        return;
+      }
+
+      const progressFromMessage = this.readProgress(payload.message);
+      if (progressFromMessage !== null) {
+        this.progress = progressFromMessage;
+        this.statusText = 'Ejecutando';
+        return;
+      }
 
       if (payload.done) {
         this.isRunning = false;
@@ -514,6 +683,8 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
     };
 
     this.eventSource.onerror = () => {
+      if (sessionId !== this.consoleSessionId || this.currentExecutionId !== executionId) return;
+
       this.eventSource?.close();
       this.eventSource = null;
     };
@@ -532,16 +703,9 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
           text: '[CANCELLED] Ejecución cancelada manualmente.',
           cls: 'text-amber-400'
         });
+        this.scrollConsoleToBottom();
 
-        if (this.intervalId) {
-          clearInterval(this.intervalId);
-          this.intervalId = null;
-        }
-
-        if (this.eventSource) {
-          this.eventSource.close();
-          this.eventSource = null;
-        }
+        this.stopConsoleWatch();
 
         this.svc.loadExecutions();
         this.svc.loadScripts();
@@ -551,18 +715,13 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
           text: `[ERROR] No se pudo cancelar: ${err?.error?.message || err.message}`,
           cls: 'text-red-400'
         });
+        this.scrollConsoleToBottom();
       }
     });
   }
 
   ngOnDestroy() {
-    if (this.intervalId) {
-      clearInterval(this.intervalId);
-    }
-
-    if (this.eventSource) {
-      this.eventSource.close();
-    }
+    this.stopConsoleWatch();
   }
 
   statusBadge(status: string): string {
@@ -579,16 +738,17 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
     const cleanId = Number(String(executionId).replace('EX-', ''));
 
     this.currentExecutionId = cleanId;
+    this.stopConsoleWatch();
     this.clearConsole();
-
-    if (this.intervalId) {
-      clearInterval(this.intervalId);
-      this.intervalId = null;
-    }
+    this.shouldFollowConsole = true;
+    this.loadExecutionParametersForLog(cleanId);
+    const sessionId = this.consoleSessionId;
 
     const loadLogs = () => {
       this.svc.getExecutionLogs(cleanId).subscribe({
         next: rows => {
+          if (sessionId !== this.consoleSessionId || this.currentExecutionId !== cleanId) return;
+
           this.consoleLines = [];
 
           if (!rows || rows.length === 0) {
@@ -596,9 +756,16 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
               text: `[SYSTEM] No hay logs registrados para EX-${cleanId}.`,
               cls: 'text-slate-500'
             });
+            this.scrollConsoleToBottom();
           }
 
           for (const row of rows) {
+            const progress = this.readProgress(row.message);
+            if (progress !== null) {
+              this.progress = progress;
+              continue;
+            }
+
             let css = 'text-slate-300';
 
             if (row.log_level === 'ERROR') css = 'text-red-400';
@@ -611,6 +778,7 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
               text: `[${row.log_level}] ${row.message}`,
               cls: css
             });
+            this.scrollConsoleToBottom();
           }
 
           this.svc.loadExecutions();
@@ -632,12 +800,7 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
             }
           }
 
-          setTimeout(() => {
-            const consoleDiv = document.querySelector('.custom-scrollbar');
-            if (consoleDiv) {
-              consoleDiv.scrollTop = consoleDiv.scrollHeight;
-            }
-          }, 50);
+          this.scrollConsoleToBottom();
         }
       });
     };
@@ -654,6 +817,26 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
   this.showDeleteConfirm = false;
   this.deleteConfirmText = '';
 }
+
+  loadExecutionParametersForLog(executionId: number) {
+    this.viewingExecutionParameters = executionId;
+    this.executionParams = [];
+
+    this.svc.getExecutionParameters(executionId).subscribe({
+      next: rows => {
+        if (this.viewingExecutionParameters !== executionId) return;
+        this.executionParams = rows || [];
+      },
+      error: err => {
+        if (this.viewingExecutionParameters !== executionId) return;
+
+        this.svc.showToast(
+          `Error cargando parametros de ejecucion: ${err?.error?.message || err.message}`,
+          'error'
+        );
+      }
+    });
+  }
 
   deleteScriptDefinitively() {
     if (!this.script || this.deleteConfirmText !== 'ELIMINAR') return;
@@ -674,3 +857,6 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
   }
   
 }
+
+
+

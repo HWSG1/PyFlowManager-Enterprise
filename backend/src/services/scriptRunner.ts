@@ -28,6 +28,16 @@ function normalizeExitCode(code: number | null): number {
   return Math.trunc(code);
 }
 
+function parseProgressLine(line: string): number | null {
+  const match = line.trim().match(/^PYFLOW_PROGRESS=(\d{1,3})(?:\.\d+)?$/i);
+  if (!match) return null;
+
+  const progress = Number(match[1]);
+  if (!Number.isFinite(progress)) return null;
+
+  return Math.max(0, Math.min(100, progress));
+}
+
 export async function runScript(
   scriptId: number,
   triggeredByUserId?: number,
@@ -258,6 +268,15 @@ if (!skipQueueCheck) {
     const lines = data.split(/\r?\n/).filter(Boolean);
 
     for (const line of lines) {
+      const progress = parseProgressLine(line);
+      if (progress !== null) {
+        emitExecutionLog(executionId, {
+          progress,
+          source: 'progress'
+        });
+        continue;
+      }
+
       await addExecutionLog(executionId, 'INFO', line);
       emitExecutionLog(executionId, {
         level: 'INFO',

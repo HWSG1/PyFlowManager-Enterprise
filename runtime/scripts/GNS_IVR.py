@@ -66,7 +66,7 @@ PYFLOW_PARAMS = {
 
     "RUN_MODE": {
         "type": "select",
-        "label": "Modo de ejecución",
+        "label": "Modo de ejecucion",
         "required": True,
         "options": [
             "cargar_hana",
@@ -74,21 +74,15 @@ PYFLOW_PARAMS = {
             "cargar_y_abandono",
             "solo_autoservicio",
             "solo_abandono",
-            "cargar_y_ambos"
+            "cargar_y_ambos",
+            "enviar_encuesta",
+            "cargar_hana_y_enviar_encuesta",
+            "todo"
         ],
         "default": "cargar_hana"
     },
-
-    "DATE": {"type": "date", "label": "Fecha específica local", "required": False},
-    "START_DATE": {"type": "date", "label": "Fecha inicial local", "required": False},
-    "END_DATE": {"type": "date", "label": "Fecha final local", "required": False},
-    "START_UTC": {"type": "text", "label": "Inicio UTC exacto", "required": False},
-    "END_UTC": {"type": "text", "label": "Fin UTC exacto", "required": False},
-
-    "GENESYS_TIMEZONE": {"type": "text", "label": "Zona horaria", "required": True, "default": "America/Tegucigalpa"},
-    "DAYS_BACK": {"type": "number", "label": "Días hacia atrás si no se indican fechas", "required": False, "default": "1"},
-    "MAX_RANGE_DAYS": {"type": "number", "label": "Máximo días por ejecución", "required": True, "default": "30"},
-    "PROCESS_BY_DAY": {"type": "select", "label": "Procesar día por día", "required": True, "options": ["true", "false"], "default": "true"},
+    "DAYS_BACK": {"type": "number", "label": "Dias hacia atras si no se indican fechas", "required": False, "default": "1"},
+    "PROCESS_BY_DAY": {"type": "select", "label": "Procesar dia por dia", "required": True, "options": ["true", "false"], "default": "true"},
 
     "DELETE_RANGE_BEFORE_LOAD": {"type": "select", "label": "Borrar rango antes de cargar IVR", "required": True, "options": ["true", "false"], "default": "true"},
     "DRY_RUN": {"type": "select", "label": "Modo prueba sin escribir HANA", "required": True, "options": ["true", "false"], "default": "false"},
@@ -96,17 +90,21 @@ PYFLOW_PARAMS = {
     "OUTPUT_DIR": {"type": "text", "label": "Carpeta de salida para Excel/CSV", "required": False},
     "OUTPUT_FORMAT": {"type": "select", "label": "Formato salida", "required": True, "options": ["xlsx", "csv"], "default": "xlsx"},
 
-    "JOB_PAGE_SIZE": {"type": "number", "label": "Tamaño página Genesys job", "required": False, "default": "100"},
-    "REQUEST_TIMEOUT": {"type": "number", "label": "Timeout HTTP segundos", "required": False, "default": "120"},
-    "MAX_API_RETRIES": {"type": "number", "label": "Reintentos API", "required": False, "default": "5"},
-    "POLL_SECONDS": {"type": "number", "label": "Segundos entre consulta de job", "required": False, "default": "10"},
-    "MAX_POLL_ATTEMPTS": {"type": "number", "label": "Máximo intentos de espera job", "required": False, "default": "120"},
-    "API_SLEEP_SECONDS": {"type": "number", "label": "Pausa entre requests", "required": False, "default": "1"},
-    "HANA_BATCH_SIZE": {"type": "number", "label": "Filas por lote HANA", "required": False, "default": "1000"},
-    "MAX_CONVERSATIONS": {"type": "number", "label": "Máximo conversaciones; 0 = sin límite", "required": False, "default": "0"},
-
     "ONLY_WITH_IVR": {"type": "select", "label": "Conservar solo conversaciones con IVR", "required": True, "options": ["true", "false"], "default": "true"},
-    "ENRICH_CLIENTS_FROM_HANA": {"type": "select", "label": "Enriquecer salidas con datos cliente desde HANA espejo", "required": True, "options": ["true", "false"], "default": "true"}
+
+    "TOKEN_QUALTRICTS": {
+        "type": "global",
+        "global_key": "TOKEN_QUALTRICTS",
+        "label": "Token Qualtrics",
+        "required": True,
+        "secret": True
+    },
+    "POST_AUTOSERVICIO_QUALTRICTS_QA": {
+        "type": "global",
+        "global_key": "POST_AUTOSERVICIO_QUALTRICTS_QA",
+        "label": "Endpoint Qualtrics",
+        "required": True
+    },
 }
 
 LOGGER_NAME = "gns_ivr_pyflow"
@@ -275,6 +273,9 @@ class Config:
     max_conversations: int
     only_with_ivr: bool
     enrich_clients_from_hana: bool
+    qualtrics_token: str
+    qualtrics_endpoint: str
+    qualtrics_delay_seconds: int
 
 
 def load_config() -> Config:
@@ -315,7 +316,126 @@ def load_config() -> Config:
         max_conversations=env_int("MAX_CONVERSATIONS", 0),
         only_with_ivr=env_bool("ONLY_WITH_IVR", True),
         enrich_clients_from_hana=env_bool("ENRICH_CLIENTS_FROM_HANA", True),
+        qualtrics_token=env_str("TOKEN_QUALTRICTS", ""),
+        qualtrics_endpoint=env_str("POST_AUTOSERVICIO_QUALTRICTS_QA", ""),
+        qualtrics_delay_seconds=env_int("QUALTRICS_DELAY_SECONDS", 5),
     )
+
+
+def pyflow_progress(value: int) -> None:
+    value = max(0, min(100, int(value)))
+    print(f"PYFLOW_PROGRESS={value}", flush=True)
+
+
+def limpiar_valor_qualtrics(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(value, date):
+        return value.strftime("%Y-%m-%d")
+
+    texto = str(value).strip()
+    if re.match(r"^\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}:\d{3}$", texto):
+        return texto[:-4]
+    if re.match(r"^\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}\.\d{3,6}$", texto):
+        return texto.split(".")[0]
+    return texto
+
+
+def enviar_encuesta_qualtrics(config: Config, cliente: Dict[str, Any], logger: logging.Logger) -> bool:
+    correo = limpiar_valor_qualtrics(
+        cliente.get("CLIENTE_E_MAIL")
+        or cliente.get("E_MAIL")
+        or ""
+    )
+
+    if not correo:
+        logger.warning(
+            "Cliente sin correo. No se envia encuesta. DNI: %s",
+            cliente.get("ETIQUETA_EXTERNA")
+        )
+        return False
+
+    payload: Dict[str, str] = {}
+    for key, value in cliente.items():
+        payload[str(key)] = limpiar_valor_qualtrics(value)
+    payload["E_MAIL"] = correo
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-API-TOKEN": config.qualtrics_token
+    }
+
+    try:
+        logger.info(
+            "Payload Qualtrics enviado: %s",
+            json.dumps(payload, ensure_ascii=False)[:3000]
+        )
+        response = requests.post(
+            config.qualtrics_endpoint,
+            json=payload,
+            headers=headers,
+            timeout=30
+        )
+        logger.info(
+            "Respuesta Qualtrics | Status=%s | Body=%s",
+            response.status_code,
+            response.text[:1000]
+        )
+        if response.status_code in (200, 201, 202):
+            logger.info(
+                "Encuesta enviada | Correo=%s | DNI=%s",
+                correo,
+                cliente.get("ETIQUETA_EXTERNA")
+            )
+            return True
+
+        logger.error("Error Qualtrics %s | %s", response.status_code, response.text)
+        return False
+    except Exception as exc:
+        logger.error("Error enviando encuesta: %s", str(exc))
+        return False
+
+
+def enviar_encuestas_qualtrics(config: Config, rows: List[Dict[str, Any]], logger: logging.Logger) -> Tuple[int, int]:
+    if not config.qualtrics_token or not config.qualtrics_endpoint:
+        raise ValueError("Para enviar encuestas debes configurar TOKEN_QUALTRICTS y POST_AUTOSERVICIO_QUALTRICTS_QA.")
+
+    logger.info("Enviando encuestas Qualtrics a clientes Full Autoservicio...")
+    enviadas = 0
+    sin_correo = 0
+    total_clientes = len(rows)
+
+    for index, cliente in enumerate(rows, start=1):
+        correo = limpiar_valor_qualtrics(
+            cliente.get("CLIENTE_E_MAIL")
+            or cliente.get("E_MAIL")
+            or ""
+        )
+        if not correo:
+            sin_correo += 1
+
+        if enviar_encuesta_qualtrics(config, cliente, logger):
+            enviadas += 1
+
+        if total_clientes:
+            pyflow_progress(80 + int((index / total_clientes) * 15))
+
+        if index < total_clientes:
+            logger.info(
+                "Esperando %s segundos antes del siguiente envio Qualtrics...",
+                config.qualtrics_delay_seconds
+            )
+            time.sleep(config.qualtrics_delay_seconds)
+
+    logger.info(
+        "Encuestas Qualtrics enviadas: %s | Sin correo: %s | Total Full Autoservicio: %s",
+        enviadas,
+        sin_correo,
+        total_clientes
+    )
+    return enviadas, sin_correo
 
 
 def calculate_interval(args: argparse.Namespace, config: Config) -> Tuple[datetime, datetime, str]:
@@ -857,7 +977,10 @@ def query_client_profiles(config: Config, etiquetas: List[str], logger: logging.
     logger.info("Consultando datos de cliente en HANA espejo para %s identificaciones...", len(etiquetas))
     sql_tpl = '''
         SELECT DISTINCT
-            TRIM(COALESCE(cdc.IDENTIFICACION_1, cdc.IDENTIFICACION_2)) AS ETIQUETA_EXTERNA,
+            COALESCE(
+                NULLIF(TRIM(TO_NVARCHAR(cdc.IDENTIFICACION_1)), ''),
+                NULLIF(TRIM(TO_NVARCHAR(cdc.IDENTIFICACION_2)), '')
+            ) AS ETIQUETA_EXTERNA,
             cdc.TEL_CELULAR,
             cdc.TEL_PRINCIPAL,
             cdc.DEPARTAMENTO,
@@ -879,8 +1002,8 @@ def query_client_profiles(config: Config, etiquetas: List[str], logger: logging.
             cdc.NIVEL_EDUCATIVO,
             cdc.FECHA_ULTIMA_ACTUALIZACION
         FROM DS_STG.CRM_DIM_CLIENTES cdc
-        WHERE (TRIM(cdc.IDENTIFICACION_1) IN ({placeholders})
-               OR TRIM(cdc.IDENTIFICACION_2) IN ({placeholders}))
+        WHERE (TRIM(TO_NVARCHAR(cdc.IDENTIFICACION_1)) IN ({placeholders})
+               OR TRIM(TO_NVARCHAR(cdc.IDENTIFICACION_2)) IN ({placeholders}))
     '''
     cols = ["ETIQUETA_EXTERNA", "TEL_CELULAR", "TEL_PRINCIPAL", "DEPARTAMENTO", "ESTADO_CIVIL", "PAIS", "NOMBRE_LEGAL", "PRIMER_NOMBRE", "PRIMER_APELLIDO", "E_MAIL", "SEGMENTO_BANCA", "GENERO", "TIPO_SECTOR_ECONOMICO", "NIVEL_EDUCATIVO", "FECHA_ULTIMA_ACTUALIZACION"]
     lookup: Dict[str, Dict[str, Any]] = {}
@@ -984,18 +1107,33 @@ def main() -> int:
     deleted = 0
     loaded = 0
     failed = 0
+    surveys_sent = 0
+    surveys_without_email = 0
     output_files: List[str] = []
     errors: List[str] = []
     try:
+        pyflow_progress(2)
         config = load_config()
         if args.dry_run:
             config.dry_run = True
         run_mode = env_str("RUN_MODE", "cargar_hana")
-        valid_modes = {"cargar_hana", "cargar_y_autoservicio", "cargar_y_abandono", "solo_autoservicio", "solo_abandono", "cargar_y_ambos"}
+        valid_modes = {
+            "cargar_hana",
+            "cargar_y_autoservicio",
+            "cargar_y_abandono",
+            "solo_autoservicio",
+            "solo_abandono",
+            "cargar_y_ambos",
+            "enviar_encuesta",
+            "cargar_hana_y_enviar_encuesta",
+            "todo",
+        }
         if run_mode not in valid_modes:
             raise ValueError(f"RUN_MODE inválido: {run_mode}. Valores válidos: {sorted(valid_modes)}")
+        send_surveys = run_mode in ("enviar_encuesta", "cargar_hana_y_enviar_encuesta", "todo")
         start_dt, end_dt, date_mode = calculate_interval(args, config)
         windows = build_windows(start_dt, end_dt, config.process_by_day)
+        pyflow_progress(5)
         logger.info("=" * 80)
         logger.info("INICIO PROCESO GNS IVR")
         log_params(logger, [
@@ -1003,7 +1141,7 @@ def main() -> int:
             "HPR_HOST", "HPR_HOST_ESPEJO", "HPR_PORT", "HPR_USER", "HPR_PASSWORD",
             "HANA_SCHEMA", "HANA_IVR_TABLE", "RUN_MODE", "DATE", "START_DATE", "END_DATE", "START_UTC", "END_UTC",
             "GENESYS_TIMEZONE", "DAYS_BACK", "MAX_RANGE_DAYS", "PROCESS_BY_DAY", "DELETE_RANGE_BEFORE_LOAD", "DRY_RUN", "OUTPUT_DIR", "OUTPUT_FORMAT",
-            "ONLY_WITH_IVR", "ENRICH_CLIENTS_FROM_HANA"
+            "ONLY_WITH_IVR", "ENRICH_CLIENTS_FROM_HANA", "TOKEN_QUALTRICTS", "POST_AUTOSERVICIO_QUALTRICTS_QA"
         ])
         logger.info("Modo fecha: %s", date_mode)
         logger.info("Inicio UTC: %s", to_utc_z(start_dt))
@@ -1011,7 +1149,9 @@ def main() -> int:
         logger.info("Ventanas a procesar: %s", len(windows))
         logger.info("=" * 80)
         token = get_access_token(config, logger)
+        pyflow_progress(10)
         divisions_lookup = fetch_divisions_lookup(config, token, logger)
+        pyflow_progress(15)
         all_rows: List[Dict[str, Any]] = []
         for idx, (w_start, w_end) in enumerate(windows, start=1):
             logger.info("-" * 80)
@@ -1021,24 +1161,30 @@ def main() -> int:
             rows = transform_conversations(conversations, config, divisions_lookup)
             all_rows.extend(rows)
             logger.info("Ventana procesada | conversaciones: %s | filas IVR: %s | acumulado filas IVR: %s", len(conversations), len(rows), len(all_rows))
+            pyflow_progress(15 + int((idx / max(len(windows), 1)) * 35))
             time.sleep(config.api_sleep_seconds)
         total_ivr_rows = len(all_rows)
+        pyflow_progress(50)
         logger.info("=" * 80)
         logger.info("Extracción finalizada | conversaciones: %s | filas IVR: %s", total_conversations, total_ivr_rows)
-        must_load = run_mode in ("cargar_hana", "cargar_y_autoservicio", "cargar_y_abandono", "cargar_y_ambos")
+        must_load = run_mode in ("cargar_hana", "cargar_y_autoservicio", "cargar_y_abandono", "cargar_y_ambos", "cargar_hana_y_enviar_encuesta", "todo")
         if must_load:
             if config.dry_run:
                 logger.warning("DRY_RUN=true. No se escribirá en SAP HANA.")
             else:
                 # Validamos columnas ANTES de borrar para evitar pérdida de datos si la estructura de HANA no coincide.
                 load_columns = resolve_load_columns(config, logger)
+                pyflow_progress(55)
                 if config.delete_range_before_load:
                     deleted = delete_ivr_range(config, start_dt, end_dt, logger)
+                pyflow_progress(60)
                 loaded, failed = merge_ivr_rows(config, all_rows, logger, load_columns)
-        need_auto = run_mode in ("cargar_y_autoservicio", "solo_autoservicio", "cargar_y_ambos")
-        need_abandono = run_mode in ("cargar_y_abandono", "solo_abandono", "cargar_y_ambos")
+                pyflow_progress(70)
+        need_auto = run_mode in ("cargar_y_autoservicio", "solo_autoservicio", "cargar_y_ambos", "enviar_encuesta", "cargar_hana_y_enviar_encuesta", "todo")
+        need_abandono = run_mode in ("cargar_y_abandono", "solo_abandono", "cargar_y_ambos", "todo")
         if need_auto or need_abandono:
             autoservicio_rows, abandono_rows = build_segment_bases(all_rows)
+            pyflow_progress(72)
             if config.enrich_clients_from_hana:
                 etiquetas = []
                 if need_auto:
@@ -1046,14 +1192,18 @@ def main() -> int:
                 if need_abandono:
                     etiquetas.extend([r.get("ETIQUETA_EXTERNA") for r in abandono_rows])
                 client_lookup = query_client_profiles(config, etiquetas, logger)
+                pyflow_progress(78)
                 if need_auto:
                     autoservicio_rows = enrich_rows(autoservicio_rows, client_lookup)
                 if need_abandono:
                     abandono_rows = enrich_rows(abandono_rows, client_lookup)
             if need_auto:
-                path = write_output(autoservicio_rows, config.output_dir, "GNS_IVR_Full_Autoservicio", config.output_format, logger)
-                if path:
-                    output_files.append(path)
+                if send_surveys:
+                    surveys_sent, surveys_without_email = enviar_encuestas_qualtrics(config, autoservicio_rows, logger)
+                if run_mode in ("cargar_y_autoservicio", "solo_autoservicio", "cargar_y_ambos", "todo"):
+                    path = write_output(autoservicio_rows, config.output_dir, "GNS_IVR_Full_Autoservicio", config.output_format, logger)
+                    if path:
+                        output_files.append(path)
             if need_abandono:
                 path = write_output(abandono_rows, config.output_dir, "GNS_IVR_Abandono_Real", config.output_format, logger)
                 if path:
@@ -1062,6 +1212,7 @@ def main() -> int:
             logger.error("Proceso finalizó con filas fallidas en HANA: %s", failed)
         else:
             logger.info("Proceso finalizado correctamente.")
+        pyflow_progress(100)
     except Exception as exc:
         errors.append(str(exc))
         logger.exception("Error general: %s", exc)
@@ -1074,6 +1225,8 @@ def main() -> int:
     logger.info("Registros eliminados HANA: %s", deleted)
     logger.info("Filas cargadas/actualizadas HANA: %s", loaded)
     logger.info("Filas fallidas HANA: %s", failed)
+    logger.info("Encuestas Qualtrics enviadas: %s", surveys_sent)
+    logger.info("Encuestas sin correo: %s", surveys_without_email)
     logger.info("Archivos generados: %s", len(output_files))
     for path in output_files:
         logger.info("Archivo: %s", path)

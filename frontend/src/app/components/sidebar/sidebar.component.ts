@@ -32,11 +32,22 @@ interface NavItem {
 
       <div class="p-4 border-t border-slate-800 bg-panel/40 text-xs text-slate-500 max-md:hidden">
         <div class="flex items-center gap-2 mb-1">
-          <span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
-          <span class="text-slate-300 font-semibold">PyEngine Running</span>
+          <span
+            class="w-2 h-2 rounded-full"
+            [class.bg-emerald-500]="svc.dashboard()?.systemHealth?.backend"
+            [class.animate-pulse]="svc.dashboard()?.systemHealth?.backend"
+            [class.bg-rose-500]="!svc.dashboard()?.systemHealth?.backend"></span>
+          <span class="text-slate-300 font-semibold">
+            PyEngine {{ svc.dashboard()?.systemHealth?.backend ? 'Running' : 'Sin conexión' }}
+          </span>
         </div>
-        <p>Carga de CPU: 12%</p>
-        <p>Memoria: 1.4GB / 8GB</p>
+        <p>Carga de CPU: {{ formatPercent(svc.dashboard()?.systemHealth?.cpuUsage) }}</p>
+        <p>
+          Memoria:
+          {{ formatGb(svc.dashboard()?.systemHealth?.memoryUsedGb) }} /
+          {{ formatGb(svc.dashboard()?.systemHealth?.memoryTotalGb) }}
+          ({{ formatPercent(svc.dashboard()?.systemHealth?.memoryUsage) }})
+        </p>
       </div>
     </aside>
   `
@@ -89,5 +100,15 @@ export class SidebarComponent {
     const active = 'text-blue-400 bg-slate-900 border-l-4 border-blue-500';
     const inactive = 'text-slate-400 hover:text-slate-100 hover:bg-slate-900/50 border-l-4 border-transparent';
     return `${base} ${this.svc.activeTab() === tab ? active : inactive}`;
+  }
+
+  formatPercent(value: any): string {
+    const number = Number(value);
+    return Number.isFinite(number) ? `${number.toFixed(2)}%` : '--';
+  }
+
+  formatGb(value: any): string {
+    const number = Number(value);
+    return Number.isFinite(number) ? `${number.toFixed(2)}GB` : '--';
   }
 }

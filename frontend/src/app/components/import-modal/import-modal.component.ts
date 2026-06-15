@@ -23,8 +23,11 @@ import { PyflowService } from '../../services/pyflow.service';
             <input #fileInput type="file" accept=".py" hidden (change)="onFileSelected($event)" />
 
             <div
-              class="border-2 border-dashed border-slate-800 hover:border-blue-500/60 rounded-xl p-8 text-center cursor-pointer bg-slate-950/30 transition-all flex flex-col items-center gap-2.5"
+              [class]="dropZoneClass()"
               (click)="fileInput.click()"
+              (dragover)="onDragOver($event)"
+              (dragleave)="onDragLeave($event)"
+              (drop)="onDrop($event)"
             >
               <div class="p-3 bg-blue-600/10 text-blue-400 rounded-full">
                 ⬆
@@ -87,6 +90,8 @@ export class ImportModalComponent {
   scriptDesc = '';
   scriptCategory = 'BI & Analytics';
   selectedFile: File | null = null;
+  isDragging = false;
+  readonly maxFileSizeMb = 25;
 
   constructor(public svc: PyflowService) {}
 
@@ -101,7 +106,31 @@ export class ImportModalComponent {
   onFileSelected(event: Event) {
     const input = event.target as HTMLInputElement;
     const file = input.files?.[0];
+    this.selectFile(file);
+  }
 
+  onDragOver(event: DragEvent) {
+    event.preventDefault();
+    event.stopPropagation();
+    this.isDragging = true;
+  }
+
+  onDragLeave(event: DragEvent) {
+    event.preventDefault();
+    event.stopPropagation();
+    this.isDragging = false;
+  }
+
+  onDrop(event: DragEvent) {
+    event.preventDefault();
+    event.stopPropagation();
+    this.isDragging = false;
+
+    const file = event.dataTransfer?.files?.[0];
+    this.selectFile(file);
+  }
+
+  selectFile(file?: File) {
     if (!file) return;
 
     if (!file.name.toLowerCase().endsWith('.py')) {
@@ -109,10 +138,22 @@ export class ImportModalComponent {
       return;
     }
 
+    if (file.size > this.maxFileSizeMb * 1024 * 1024) {
+      this.svc.showToast(`El archivo supera el tamano maximo de ${this.maxFileSizeMb}MB`, 'error');
+      return;
+    }
+
     this.selectedFile = file;
     this.scriptName = file.name;
 
     this.svc.showToast(`Archivo seleccionado: ${file.name}`, 'success');
+  }
+
+  dropZoneClass() {
+    const base = 'border-2 border-dashed rounded-xl p-8 text-center cursor-pointer transition-all flex flex-col items-center gap-2.5';
+    return this.isDragging
+      ? `${base} border-blue-500 bg-blue-950/30`
+      : `${base} border-slate-800 bg-slate-950/30 hover:border-blue-500/60`;
   }
 
   importScript() {
@@ -150,12 +191,5 @@ export class ImportModalComponent {
         );
       }
     });
-
-    this.scriptName = '';
-    this.scriptDesc = '';
-    this.scriptCategory = 'BI & Analytics';
-    this.selectedFile = null;
-
-    this.close();
   }
 }

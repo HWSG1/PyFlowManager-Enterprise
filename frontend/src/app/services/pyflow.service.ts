@@ -117,6 +117,7 @@ export class PyflowService {
   }
 
   refreshAll() {
+    this.loadDashboard();
     this.loadScripts();
     this.loadExecutions();
     this.loadSchedules();

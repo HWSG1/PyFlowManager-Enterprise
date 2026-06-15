@@ -1,11 +1,11 @@
-"""
-Migración de flujo KNIME "GNS Usuarios" a Python.
+﻿"""
+MigraciÃ³n de flujo KNIME "GNS Usuarios" a Python.
 
-Qué hace:
+QuÃ© hace:
 1. Obtiene token OAuth Client Credentials de Genesys Cloud.
 2. Consulta /api/v2/users de forma paginada.
 3. Extrae campos: ID, NAME, DIVISION_ID, EMAIL, USERNAME, STATE, JABBERID, TITLE.
-4. Convierte NAME a mayúsculas, igual que el nodo String Manipulation de KNIME.
+4. Convierte NAME a mayÃºsculas, igual que el nodo String Manipulation de KNIME.
 5. Realiza UPSERT/MERGE en SAP HANA sobre BI_SS.GNS_API_USUARIOS.
 6. Muestra progreso en consola y resumen final.
 
@@ -45,9 +45,9 @@ import requests
 # =========================================================
 # PYFLOW MANAGER PARAMS
 # =========================================================
-# PyFlow detecta este bloque para solicitar parámetros y mapear variables globales.
-# Las llaves del diccionario son los nombres que el script leerá desde variables
-# de entorno durante la ejecución.
+# PyFlow detecta este bloque para solicitar parÃ¡metros y mapear variables globales.
+# Las llaves del diccionario son los nombres que el script leerÃ¡ desde variables
+# de entorno durante la ejecuciÃ³n.
 
 PYFLOW_PARAMS = {
     "GENESYS_CLIENT_ID": {"type": "global", "global_key": "GENESYS_CLIENT_ID", "label": "Genesys Client ID", "required": True},
@@ -58,15 +58,15 @@ PYFLOW_PARAMS = {
     "HPR_USER": {"type": "global", "global_key": "HPR_USER", "label": "SAP HANA User", "required": True},
     "HPR_PASSWORD": {"type": "global", "global_key": "HPR_PASSWORD", "label": "SAP HANA Password", "required": True, "secret": True},
     "HANA_SCHEMA": {"type": "text", "label": "Esquema HANA", "required": True, "default": "BI_SS"},
-    "HANA_TABLE": {"type": "text", "label": "Tabla destino usuarios", "required": True, "default": "GNS_API_USUARIOS"},
-    "PAGE_SIZE": {"type": "number", "label": "Tamaño página Genesys", "required": False, "default": "100"},
-    "COMMIT_EVERY": {"type": "number", "label": "Filas por commit HANA", "required": False, "default": "500"},
-    "DRY_RUN": {"type": "select", "label": "Modo prueba sin insertar", "required": True, "options": ["true", "false"], "default": "false"},
-    "REQUEST_TIMEOUT_SECONDS": {"type": "number", "label": "Timeout HTTP segundos", "required": False, "default": "90"},
-    "MAX_RETRIES": {"type": "number", "label": "Reintentos HTTP", "required": False, "default": "5"}
+    "HANA_TABLE": {"type": "text", "label": "Tabla destino usuarios", "required": True, "default": "GNS_API_USUARIOS"}
 }
 
 LOGGER_NAME = "gns_usuarios_pyflow"
+
+
+def pyflow_progress(percent: int) -> None:
+    percent = max(0, min(100, int(percent)))
+    print(f"PYFLOW_PROGRESS={percent}", flush=True)
 
 
 def _clean_env_value(value: Any, default: Optional[str] = None) -> Optional[str]:
@@ -82,7 +82,7 @@ def _clean_env_value(value: Any, default: Optional[str] = None) -> Optional[str]
 def env_str(name: str, default: Optional[str] = None, required: bool = False) -> str:
     value = _clean_env_value(os.getenv(name), default)
     if required and not value:
-        raise ValueError(f"Falta configurar variable/parámetro requerido: {name}")
+        raise ValueError(f"Falta configurar variable/parÃ¡metro requerido: {name}")
     return "" if value is None else str(value)
 
 
@@ -91,7 +91,7 @@ def env_int(name: str, default: int, required: bool = False) -> int:
     try:
         return int(value)
     except Exception:
-        raise ValueError(f"El parámetro {name} debe ser numérico. Valor recibido: {value!r}")
+        raise ValueError(f"El parÃ¡metro {name} debe ser numÃ©rico. Valor recibido: {value!r}")
 
 
 def env_float(name: str, default: float, required: bool = False) -> float:
@@ -99,14 +99,14 @@ def env_float(name: str, default: float, required: bool = False) -> float:
     try:
         return float(value)
     except Exception:
-        raise ValueError(f"El parámetro {name} debe ser numérico. Valor recibido: {value!r}")
+        raise ValueError(f"El parÃ¡metro {name} debe ser numÃ©rico. Valor recibido: {value!r}")
 
 
 def env_bool(name: str, default: bool = False) -> bool:
     value = env_str(name, "", required=False).lower()
     if not value:
         return default
-    return value in ("1", "true", "yes", "y", "si", "sí")
+    return value in ("1", "true", "yes", "y", "si", "sÃ­")
 
 
 def normalize_genesys_domain(value: str) -> str:
@@ -149,13 +149,13 @@ def setup_logger() -> logging.Logger:
 
 
 def log_params(logger: logging.Logger, names: List[str]) -> None:
-    logger.info("Parámetros recibidos / aplicados:")
+    logger.info("ParÃ¡metros recibidos / aplicados:")
     secret_words = ("SECRET", "PASSWORD", "TOKEN", "KEY")
     for name in names:
         value = env_str(name, "")
         if any(w in name.upper() for w in secret_words) and value:
             value = "********"
-        logger.info("- %s: %s", name, value if value != "" else "<vacío>")
+        logger.info("- %s: %s", name, value if value != "" else "<vacÃ­o>")
 
 try:
     from dotenv import load_dotenv
@@ -221,8 +221,9 @@ def get_access_token(config: Config, logger: logging.Logger) -> str:
     response.raise_for_status()
     token = response.json().get("access_token")
     if not token:
-        raise RuntimeError("Genesys no devolvió access_token.")
+        raise RuntimeError("Genesys no devolviÃ³ access_token.")
     logger.info("Token obtenido correctamente.")
+    pyflow_progress(10)
     return token
 
 
@@ -244,7 +245,7 @@ def request_with_retry(
 
         wait_seconds = min(30, 2 ** attempt)
         logger.warning(
-            "Intento %s/%s falló con HTTP %s. Reintentando en %s segundos...",
+            "Intento %s/%s fallÃ³ con HTTP %s. Reintentando en %s segundos...",
             attempt,
             retries,
             response.status_code,
@@ -279,12 +280,14 @@ def fetch_users(config: Config, token: str, logger: logging.Logger) -> List[Dict
         users.extend(entities)
 
         logger.info(
-            "Página %s/%s procesada | usuarios en página: %s | acumulado: %s",
+            "PÃ¡gina %s/%s procesada | usuarios en pÃ¡gina: %s | acumulado: %s",
             page_number,
             page_count,
             len(entities),
             len(users),
         )
+
+        pyflow_progress(10 + int((page_number / max(page_count, 1)) * 40))
 
         if not entities and page_number >= page_count:
             break
@@ -322,14 +325,15 @@ def transform_user(user: Dict[str, Any]) -> Dict[str, Optional[str]]:
 def transform_users(users: Iterable[Dict[str, Any]], logger: logging.Logger) -> List[Dict[str, Optional[str]]]:
     rows = [transform_user(user) for user in users]
     rows = [row for row in rows if row.get("ID")]
-    logger.info("Usuarios transformados válidos para carga: %s", len(rows))
+    logger.info("Usuarios transformados vÃ¡lidos para carga: %s", len(rows))
+    pyflow_progress(60)
     return rows
 
 
 def hana_connect(config: Config):
     if dbapi is None:
         raise RuntimeError(
-            "No está instalado hdbcli. Ejecuta: pip install hdbcli"
+            "No estÃ¡ instalado hdbcli. Ejecuta: pip install hdbcli"
         )
     return dbapi.connect(
         address=config.HPR_HOST,
@@ -383,6 +387,7 @@ def upsert_users_to_hana(
                         loaded,
                         len(rows),
                     )
+                    pyflow_progress(65 + int((loaded / max(len(rows), 1)) * 30))
                 except Exception as exc:
                     conn.rollback()
                     failed += len(batch)
@@ -400,6 +405,7 @@ def upsert_users_to_hana(
 def main() -> int:
     logger = setup_logging()
     start_time = time.time()
+    pyflow_progress(1)
 
     summary = {
         "genesys_obtenidos": 0,
@@ -411,7 +417,8 @@ def main() -> int:
 
     try:
         config = Config.from_env()
-        log_params(logger, ["GENESYS_CLIENT_ID", "GENESYS_CLIENT_SECRET", "GENESYS_REGION", "HPR_HOST", "HPR_PORT", "HPR_USER", "HPR_PASSWORD", "HANA_SCHEMA", "HANA_TABLE", "PAGE_SIZE", "COMMIT_EVERY", "DRY_RUN"])
+        log_params(logger, ["GENESYS_CLIENT_ID", "GENESYS_CLIENT_SECRET", "GENESYS_REGION", "HPR_HOST", "HPR_PORT", "HPR_USER", "HPR_PASSWORD", "HANA_SCHEMA", "HANA_TABLE"])
+        pyflow_progress(5)
         token = get_access_token(config, logger)
         raw_users = fetch_users(config, token, logger)
         summary["genesys_obtenidos"] = len(raw_users)
@@ -422,16 +429,13 @@ def main() -> int:
         loaded = 0
         failed = 0
 
-        if env_bool("DRY_RUN", False):
-            logger.warning("DRY RUN activo. No se cargará información a HANA.")
-        else:
-            loaded, failed = upsert_users_to_hana(config, rows, logger)
+        loaded, failed = upsert_users_to_hana(config, rows, logger)
 
         summary["cargados"] = loaded
         summary["fallidos"] = failed
 
     except Exception as exc:
-        logger.exception("El proceso terminó con error: %s", exc)
+        logger.exception("El proceso terminÃ³ con error: %s", exc)
         logger.error(traceback.format_exc())
         summary["errores"].append(str(exc))
 
@@ -440,15 +444,17 @@ def main() -> int:
     logger.info("=" * 70)
     logger.info("RESUMEN FINAL")
     logger.info("Usuarios obtenidos desde Genesys: %s", summary["genesys_obtenidos"])
-    logger.info("Usuarios transformados válidos: %s", summary["transformados"])
+    logger.info("Usuarios transformados vÃ¡lidos: %s", summary["transformados"])
     logger.info("Filas cargadas/actualizadas en HANA: %s", summary["cargados"])
     logger.info("Filas fallidas: %s", summary["fallidos"])
     logger.info("Errores generales: %s", len(summary["errores"]))
     if summary["errores"]:
         for err in summary["errores"]:
             logger.error("Detalle error: %s", err)
-    logger.info("Duración total: %s segundos", elapsed)
+    logger.info("DuraciÃ³n total: %s segundos", elapsed)
     logger.info("=" * 70)
+
+    pyflow_progress(100)
 
     return 1 if summary["errores"] or summary["fallidos"] else 0
 

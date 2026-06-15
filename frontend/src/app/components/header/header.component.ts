@@ -22,23 +22,12 @@ import { FormsModule } from '@angular/forms';
         <div>
           <span class="font-bold text-lg tracking-wider text-white">PyFlow</span>
           <span class="text-blue-500 font-medium text-sm ml-1">Manager</span>
-          <span class="text-[10px] bg-slate-800 text-slate-400 px-2 py-0.5 rounded-full ml-2 border border-slate-700">v2.4-Enterprise</span>
+          <span class="text-[10px] bg-slate-800 text-slate-400 px-2 py-0.5 rounded-full ml-2 border border-slate-700">v1.0</span>
         </div>
       </div>
 
       <!-- Right side -->
       <div class="flex items-center gap-6">
-        <!-- Search -->
-        <div class="relative w-80 max-md:hidden">
-          <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2"
-               viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
-          </svg>
-          <input type="text" placeholder="Buscar scripts, ejecuciones o logs..."
-                 class="w-full bg-slate-900 border border-slate-800 rounded-lg pl-9 pr-4 py-1.5 text-sm
-                        focus:outline-none focus:border-blue-500 text-slate-200 transition-colors">
-        </div>
-
         <select [ngModel]="themes.activeTheme()" (ngModelChange)="themes.setTheme($event)" class="input !py-1.5 !w-40 text-xs">
           @for (t of themes.themes(); track t.theme_key) { <option [value]="t.theme_key">{{t.theme_name}}</option> }
         </select>

@@ -1,9 +1,15 @@
 import { Router } from "express";
 import { getPool, sql } from "../db/sql";
 import os from "os";
+import osUtils from "os-utils";
 
 const router = Router();
 
+function getCpuUsagePercent(): Promise<number> {
+  return new Promise(resolve => {
+    osUtils.cpuUsage(value => resolve(value * 100));
+  });
+}
 
 router.get("/summary", async (_req, res) => {
   try {
@@ -119,7 +125,9 @@ router.get("/summary", async (_req, res) => {
 
     const totalMem = os.totalmem();
     const freeMem = os.freemem();
+    const usedMem = totalMem - freeMem;
     const memoryUsed = ((totalMem - freeMem) / totalMem) * 100;
+    const cpuUsage = await getCpuUsagePercent();
 
     const settings = await pool.request()
     .input("environment_id", sql.Int, 3)
@@ -147,11 +155,14 @@ router.get("/summary", async (_req, res) => {
         maxConcurrentExecutions,
         schedulerStatus: "Activo",
         systemHealth: {
-        backend: true,
-        scheduler: true,
-        database: true,
-        memoryUsage: memoryUsed.toFixed(2),
-        cpuCount: os.cpus().length
+          backend: true,
+          scheduler: true,
+          database: true,
+          memoryUsage: Number(memoryUsed.toFixed(2)),
+          memoryUsedGb: Number((usedMem / 1024 / 1024 / 1024).toFixed(2)),
+          memoryTotalGb: Number((totalMem / 1024 / 1024 / 1024).toFixed(2)),
+          cpuUsage: Number(cpuUsage.toFixed(2)),
+          cpuCount: os.cpus().length
         },
       lastUpdate: new Date()
     });
