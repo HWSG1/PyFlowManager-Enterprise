@@ -91,20 +91,14 @@ PYFLOW_PARAMS = {
     "OUTPUT_FORMAT": {"type": "select", "label": "Formato salida", "required": True, "options": ["xlsx", "csv"], "default": "xlsx"},
 
     "ONLY_WITH_IVR": {"type": "select", "label": "Conservar solo conversaciones con IVR", "required": True, "options": ["true", "false"], "default": "true"},
-
+    "ENRICH_CLIENTS_FROM_HANA": {"type": "select", "label": "Enriquecer salidas con datos cliente desde HANA espejo", "required": True, "options": ["true", "false"], "default": "true"},
+    
     "TOKEN_QUALTRICTS": {
-        "type": "global",
-        "global_key": "TOKEN_QUALTRICTS",
-        "label": "Token Qualtrics",
-        "required": True,
-        "secret": True
-    },
-    "POST_AUTOSERVICIO_QUALTRICTS_QA": {
-        "type": "global",
-        "global_key": "POST_AUTOSERVICIO_QUALTRICTS_QA",
-        "label": "Endpoint Qualtrics",
-        "required": True
-    },
+    "type": "global",
+    "global_key": "TOKEN_QUALTRICTS",
+    "label": "Token Qualtrics",
+    "required": True,
+    "secret": True}
 }
 
 LOGGER_NAME = "gns_ivr_pyflow"
@@ -275,6 +269,8 @@ class Config:
     enrich_clients_from_hana: bool
     qualtrics_token: str
     qualtrics_endpoint: str
+    qualtrics_token: str
+    qualtrics_endpoint: str
     qualtrics_delay_seconds: int
 
 
@@ -316,6 +312,103 @@ def load_config() -> Config:
         max_conversations=env_int("MAX_CONVERSATIONS", 0),
         only_with_ivr=env_bool("ONLY_WITH_IVR", True),
         enrich_clients_from_hana=env_bool("ENRICH_CLIENTS_FROM_HANA", True),
+        qualtrics_token=env_str("TOKEN_QUALTRICTS", required=True),
+        qualtrics_endpoint=env_str("POST_AUTOSERVICIO_QUALTRICTS_QA", required=True),
+    )
+
+#Funcion para enviar encuesta
+def enviar_encuesta_qualtrics(config: Config,
+                              cliente: Dict[str, Any],
+                              logger: logging.Logger) -> bool:
+
+    correo = str(
+        cliente.get("CLIENTE_E_MAIL")
+        or cliente.get("E_MAIL")
+        or ""
+    ).strip()
+
+    if not correo:
+        logger.warning(
+            "Cliente sin correo. No se envía encuesta. DNI: %s",
+            cliente.get("ETIQUETA_EXTERNA")
+        )
+        return False
+
+    event_data = {}
+
+    for key, value in cliente.items():
+
+        if value is None:
+            event_data[key] = ""
+
+        elif isinstance(value, datetime):
+            event_data[key] = value.strftime("%Y-%m-%d %H:%M:%S")
+
+        elif isinstance(value, date):
+            event_data[key] = value.strftime("%Y-%m-%d")
+
+        else:
+            texto = str(value).strip()
+
+            if re.match(r"^\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}:\d{3}$", texto):
+                texto = texto[:-4]
+
+            elif re.match(r"^\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}\.\d{3,6}$", texto):
+                texto = texto.split(".")[0]
+
+            event_data[key] = texto
+
+    # Asegura campos importantes como en KNIME
+    event_data["E_MAIL"] = correo
+
+    payload = event_data
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-API-TOKEN": config.qualtrics_token
+    }
+
+    try:
+        logger.info(
+            "Payload Qualtrics enviado: %s",
+            json.dumps(payload, ensure_ascii=False)[:3000]
+        )
+
+        response = requests.post(
+            config.qualtrics_endpoint,
+            json=payload,
+            headers=headers,
+            timeout=30
+        )
+
+        logger.info(
+            "Respuesta Qualtrics | Status=%s | Body=%s",
+            response.status_code,
+            response.text[:1000]
+        )
+
+        if response.status_code in (200, 201, 202):
+            logger.info(
+                "Encuesta enviada | Correo=%s | DNI=%s",
+                correo,
+                cliente.get("ETIQUETA_EXTERNA")
+            )
+            return True
+
+        logger.error(
+            "Error Qualtrics %s | %s",
+            response.status_code,
+            response.text
+        )
+        return False
+
+    except Exception as exc:
+        logger.error(
+            "Error enviando encuesta: %s",
+            str(exc)
+        )
+        return False
+    
         qualtrics_token=env_str("TOKEN_QUALTRICTS", ""),
         qualtrics_endpoint=env_str("POST_AUTOSERVICIO_QUALTRICTS_QA", ""),
         qualtrics_delay_seconds=env_int("QUALTRICS_DELAY_SECONDS", 5),
@@ -1195,6 +1288,35 @@ def main() -> int:
                 pyflow_progress(78)
                 if need_auto:
                     autoservicio_rows = enrich_rows(autoservicio_rows, client_lookup)
+
+                    logger.info(
+                        "Enviando encuestas Qualtrics a clientes Full Autoservicio..."
+                    )
+
+                    enviadas = 0
+                    total_clientes = len(autoservicio_rows)
+
+                    for index, cliente in enumerate(autoservicio_rows, start=1):
+
+                        if enviar_encuesta_qualtrics(
+                            config,
+                            cliente,
+                            logger
+                        ):
+                            enviadas += 1
+
+                            if index < total_clientes:
+                                logger.info(
+                                    "Esperando 5 segundos antes del siguiente envío..."
+                                )
+                                time.sleep(5)
+
+                    logger.info(
+                        "Encuestas Qualtrics enviadas: %s",
+                        enviadas
+                    )  
+
+
                 if need_abandono:
                     abandono_rows = enrich_rows(abandono_rows, client_lookup)
             if need_auto:

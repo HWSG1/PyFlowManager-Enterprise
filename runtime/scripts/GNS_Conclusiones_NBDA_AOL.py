@@ -89,7 +89,8 @@ import base64
 import requests
 import pandas as pd
 
-
+print("PYTHON:", sys.executable)
+print("VERSION:", sys.version)
 # =========================================================
 # PYFLOW MANAGER PARAMS
 # =========================================================
