@@ -3,20 +3,41 @@ import { Injectable, computed, signal } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import { interval, Subscription } from 'rxjs';
 import { Script, Execution, Schedule, Toast, TabName, EnvParam } from '../models/models';
+import { environment } from '../../environments/environment';
 
 function formatDate(value: any): string {
   if (!value) return 'Nunca';
 
   const raw = String(value);
-  const iso = raw.includes('T') ? raw : raw.replace(' ', 'T');
-  const date = new Date(iso.endsWith('Z') ? iso : `${iso}Z`);
+  const match = raw.match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})/);
+
+  if (match) {
+    const [, year, month, day, hour, minute] = match;
+    const date = new Date(
+      Number(year),
+      Number(month) - 1,
+      Number(day),
+      Number(hour),
+      Number(minute)
+    );
+
+    return new Intl.DateTimeFormat('es-HN', {
+      day: '2-digit',
+      month: '2-digit',
+      year: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: true
+    }).format(date);
+  }
+
+  const date = new Date(raw);
 
   if (Number.isNaN(date.getTime())) {
     return raw;
   }
 
   return new Intl.DateTimeFormat('es-HN', {
-    timeZone: 'America/Tegucigalpa',
     day: '2-digit',
     month: '2-digit',
     year: 'numeric',
@@ -36,7 +57,18 @@ function formatDuration(seconds: any): string {
 
 @Injectable({ providedIn: 'root' })
 export class PyflowService {
-  private apiUrl = '/api';
+  private apiUrl = environment.apiUrl;
+  private updatingFromHistory = false;
+  private readonly tabs = new Set<TabName>([
+    'dashboard',
+    'scripts',
+    'script-detail',
+    'schedules',
+    'logs',
+    'settings',
+    'users'
+  ]);
+  private pendingScriptDetailId: number | null = null;
 
   activeTab = signal<TabName>('dashboard');
   selectedScript = signal<Script | null>(null);
@@ -62,6 +94,7 @@ export class PyflowService {
   errorScripts = computed(() => this.scripts().filter(s => s.lastStatus === 'Error').length);
 
   constructor(private http: HttpClient) {
+    this.setupBrowserHistory();
     this.refreshAll();
     this.startAutoRefresh();
   }
@@ -92,7 +125,10 @@ export class PyflowService {
 
   loadScripts() {
     this.http.get<any[]>(`${this.apiUrl}/scripts`).subscribe({
-      next: rows => this.scripts.set(rows.map(this.mapScript)),
+      next: rows => {
+        this.scripts.set(rows.map(this.mapScript));
+        this.resolvePendingScriptDetail();
+      },
       error: err => this.showToast(`Error cargando scripts: ${err?.error?.message || err.message}`, 'error')
     });
   }
@@ -182,11 +218,113 @@ export class PyflowService {
 
   switchTab(tab: TabName) {
     this.activeTab.set(tab);
+    this.selectedScript.set(tab === 'script-detail' ? this.selectedScript() : null);
+    this.pushBrowserState(tab);
   }
 
   openScriptDetail(script: Script) {
     this.selectedScript.set(script);
     this.activeTab.set('script-detail');
+    this.pushBrowserState('script-detail', script.id);
+  }
+
+  private setupBrowserHistory() {
+    if (typeof window === 'undefined') return;
+
+    const initial = this.getBrowserStateFromHash();
+    if (initial) {
+      this.applyBrowserState(initial.tab, initial.scriptId);
+    }
+
+    const currentTab = this.activeTab();
+    const currentScriptId = this.selectedScript()?.id;
+    window.history.replaceState(
+      { pyflow: true, tab: currentTab, scriptId: currentScriptId },
+      '',
+      this.browserUrl(currentTab, currentScriptId)
+    );
+    window.history.pushState(
+      { pyflow: true, tab: currentTab, scriptId: currentScriptId },
+      '',
+      this.browserUrl(currentTab, currentScriptId)
+    );
+
+    window.addEventListener('popstate', event => {
+      const state = event.state?.pyflow
+        ? event.state
+        : this.getBrowserStateFromHash();
+
+      if (!state?.tab) {
+        this.pushBrowserState(this.activeTab(), this.selectedScript()?.id, true);
+        return;
+      }
+
+      this.applyBrowserState(state.tab, state.scriptId);
+    });
+  }
+
+  private pushBrowserState(tab: TabName, scriptId?: number, replace = false) {
+    if (typeof window === 'undefined' || this.updatingFromHistory) return;
+
+    const state = { pyflow: true, tab, scriptId };
+    const url = this.browserUrl(tab, scriptId);
+
+    if (replace) {
+      window.history.replaceState(state, '', url);
+      return;
+    }
+
+    window.history.pushState(state, '', url);
+  }
+
+  private applyBrowserState(tab: TabName, scriptId?: number) {
+    if (!this.tabs.has(tab)) return;
+
+    this.updatingFromHistory = true;
+    this.activeTab.set(tab);
+
+    if (tab === 'script-detail' && scriptId) {
+      const script = this.scripts().find(item => item.id === Number(scriptId));
+      this.selectedScript.set(script || this.selectedScript());
+      this.pendingScriptDetailId = script ? null : Number(scriptId);
+    } else {
+      this.selectedScript.set(null);
+      this.pendingScriptDetailId = null;
+    }
+
+    this.updatingFromHistory = false;
+  }
+
+  private resolvePendingScriptDetail() {
+    if (!this.pendingScriptDetailId || this.activeTab() !== 'script-detail') return;
+
+    const script = this.scripts().find(item => item.id === this.pendingScriptDetailId);
+    if (!script) return;
+
+    this.selectedScript.set(script);
+    this.pendingScriptDetailId = null;
+  }
+
+  private browserUrl(tab: TabName, scriptId?: number) {
+    if (tab === 'script-detail' && scriptId) {
+      return `#/scripts/${scriptId}`;
+    }
+
+    return `#/${tab}`;
+  }
+
+  private getBrowserStateFromHash(): { tab: TabName; scriptId?: number } | null {
+    if (typeof window === 'undefined') return null;
+
+    const hash = window.location.hash.replace(/^#\/?/, '');
+    const [section, id] = hash.split('/');
+
+    if (section === 'scripts' && id) {
+      return { tab: 'script-detail', scriptId: Number(id) };
+    }
+
+    const tab = (section || 'dashboard') as TabName;
+    return this.tabs.has(tab) ? { tab } : null;
   }
 
   addScript(partial: Partial<Script>) {
@@ -427,7 +565,7 @@ export class PyflowService {
   }
   
   deleteScriptDefinitively(scriptId: number) {
-    return this.http.delete(`/api/scripts/${scriptId}/definitive`);
+    return this.http.delete(`${this.apiUrl}/scripts/${scriptId}/definitive`);
   }
 
   dashboard = signal<any | null>(null);

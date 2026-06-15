@@ -2,6 +2,7 @@ import { Component, OnInit, OnDestroy } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { PyflowService } from '../../services/pyflow.service';
+import { environment } from '../../../environments/environment';
 
 @Component({
   selector: 'app-script-detail',
@@ -410,7 +411,7 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
 
     this.svc.showToast(`Ejecutando ${this.script.name}`, 'info');
 
-    fetch(`/api/scripts/${this.script.id}/run`, {
+    fetch(`${environment.apiUrl}/scripts/${this.script.id}/run`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json'
@@ -488,7 +489,7 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
       this.svc.loadExecutions();
     }, 2000);
 
-    this.eventSource = new EventSource(`/api/executions/${executionId}/stream`);
+    this.eventSource = new EventSource(`${environment.apiUrl}/executions/${executionId}/stream`);
 
     this.eventSource.onmessage = event => {
       const payload = JSON.parse(event.data);

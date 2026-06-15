@@ -1,6 +1,7 @@
 import { Injectable, signal } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import { ThemeService } from './theme.service';
+import { environment } from '../../environments/environment';
 
 @Injectable({ providedIn: 'root' })
 export class AuthService {
@@ -18,7 +19,7 @@ export class AuthService {
 
   login(username: string, password: string, provider = 'local') {
     this.loading.set(true);
-    return this.http.post<any>('/api/auth/login', { username, password, provider });
+    return this.http.post<any>(`${environment.apiUrl}/auth/login`, { username, password, provider });
   }
 
   completeLogin(res: any) {
@@ -34,9 +35,15 @@ export class AuthService {
   logout() {
     localStorage.removeItem('pyflow_token');
     localStorage.removeItem('pyflow_user');
-    this.token.set(null); this.user.set(null);
+    this.token.set(null);
+    this.user.set(null);
   }
 
-  forgotPassword(email: string, channel = 'email') { return this.http.post<any>('/api/auth/forgot-password', { email, channel }); }
-  resetPassword(token: string, password: string) { return this.http.post<any>('/api/auth/reset-password', { token, password }); }
+  forgotPassword(email: string, channel = 'email') {
+    return this.http.post<any>(`${environment.apiUrl}/auth/forgot-password`, { email, channel });
+  }
+
+  resetPassword(token: string, password: string) {
+    return this.http.post<any>(`${environment.apiUrl}/auth/reset-password`, { token, password });
+  }
 }

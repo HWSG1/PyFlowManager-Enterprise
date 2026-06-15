@@ -464,9 +464,19 @@ export class DashboardComponent implements AfterViewInit, OnDestroy {
     if (!value) return '-';
 
     try {
-      const text = String(value).replace('Z', '');
+      const text = String(value);
+      const match = text.match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})/);
+      const date = match
+        ? new Date(
+            Number(match[1]),
+            Number(match[2]) - 1,
+            Number(match[3]),
+            Number(match[4]),
+            Number(match[5])
+          )
+        : new Date(text);
 
-      return new Date(text).toLocaleString('es-HN', {
+      return date.toLocaleString('es-HN', {
         day: '2-digit',
         month: '2-digit',
         year: 'numeric',

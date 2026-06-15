@@ -1,5 +1,6 @@
 import { Injectable, signal } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
+import { environment } from '../../environments/environment';
 
 export interface ThemeItem { theme_key: string; theme_name: string; is_dark: boolean; }
 
@@ -11,7 +12,7 @@ export class ThemeService {
   constructor(private http: HttpClient) { this.applyTheme(this.activeTheme()); this.loadThemes(); }
 
   loadThemes() {
-    this.http.get<ThemeItem[]>('/api/themes').subscribe({
+    this.http.get<ThemeItem[]>(`${environment.apiUrl}/themes`).subscribe({
       next: rows => this.themes.set(rows || []),
       error: () => this.themes.set(this.defaultThemes())
     });
@@ -22,7 +23,7 @@ export class ThemeService {
     this.applyTheme(themeKey);
     localStorage.setItem('pyflow_theme', themeKey);
     if (persist && localStorage.getItem('pyflow_token')) {
-      this.http.post('/api/themes/me', { theme_key: themeKey }, { headers: { Authorization: `Bearer ${localStorage.getItem('pyflow_token')}` } }).subscribe({ error: () => {} });
+      this.http.post(`${environment.apiUrl}/themes/me`, { theme_key: themeKey }, { headers: { Authorization: `Bearer ${localStorage.getItem('pyflow_token')}` } }).subscribe({ error: () => {} });
     }
   }
 

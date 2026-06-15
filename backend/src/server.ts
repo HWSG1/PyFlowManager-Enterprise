@@ -22,8 +22,10 @@ fs.mkdirSync(env.runtime.exportsDir, { recursive: true });
 const app = express();
 
 app.use(helmet());
+const allowedOrigins = process.env.CORS_ORIGINS?.split(',') || [];
+
 app.use(cors({
-  origin: ['http://localhost:4200', 'http://127.0.0.1:4200'],
+  origin: allowedOrigins,
   credentials: true
 }));
 app.use(express.json({ limit: '10mb' }));

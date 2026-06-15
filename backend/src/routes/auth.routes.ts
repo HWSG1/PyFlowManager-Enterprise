@@ -8,15 +8,17 @@ const router = Router();
 router.post('/login', async (req, res, next) => {
   try {
     const { username, password, provider = 'local' } = req.body || {};
-    if (!username) return res.status(400).json({ message: 'Usuario requerido.' });
+    const authProvider = String(provider || 'local').toLowerCase();
 
-    if (provider !== 'local') {
+    if (authProvider === 'entra') {
       return res.status(202).json({
         message: 'Proveedor externo configurado como preparado. Conecta MSAL/Entra ID en producción.',
-        provider,
+        provider: authProvider,
         redirectUrl: process.env.ENTRA_LOGIN_URL || null
       });
     }
+
+    if (!username) return res.status(400).json({ message: 'Usuario requerido.' });
 
     const pool = await getPool();
 
@@ -63,6 +65,10 @@ router.post('/login', async (req, res, next) => {
 
     if (!user) {
       return res.status(401).json({ message: 'Usuario no encontrado.' });
+    }
+
+    if (authProvider !== 'local') {
+      return res.status(400).json({ message: 'Proveedor de autenticación no soportado.' });
     }
 
     if (!isActive) {

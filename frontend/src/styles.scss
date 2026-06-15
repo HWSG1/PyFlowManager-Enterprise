@@ -1,11 +1,11 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Fira+Code:wght@400;500&display=swap');
+/* @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Fira+Code:wght@400;500&display=swap'); */
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
 * { box-sizing: border-box; }
-body { font-family: 'Inter', sans-serif; margin: 0; padding: 0; }
-.code-font { font-family: 'Fira Code', monospace; }
+body { font-family: Inter, Arial, sans-serif; margin: 0; padding: 0; }
+.code-font { font-family: 'Fira Code', Consolas, monospace; }
 
 :root, [data-theme='dark-blue'] { --bg:#0f172a; --panel:#020617; --panel-2:#0f172a; --text:#f8fafc; --muted:#94a3b8; --border:#1e293b; --accent:#2563eb; --accent-hover:#3b82f6; }
 [data-theme='light'] { --bg:#f8fafc; --panel:#ffffff; --panel-2:#f1f5f9; --text:#0f172a; --muted:#64748b; --border:#cbd5e1; --accent:#2563eb; --accent-hover:#1d4ed8; }
