@@ -189,6 +189,10 @@ def to_utc_z(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
+def local_day_start(d: date, tz: ZoneInfo) -> datetime:
+    return datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=tz)
+
+
 def parse_utc_z(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
@@ -445,17 +449,20 @@ def calculate_interval(args: argparse.Namespace, config: Config) -> Tuple[dateti
         mode = "UTC manual"
     elif args.date:
         d = parse_local_date(args.date)
-        start_dt = datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=tz)
+        start_dt = local_day_start(d, tz)
         end_dt = start_dt + timedelta(days=1)
-        mode = f"Día local {d.isoformat()}"
+        mode = f"Dia local {d.isoformat()} 00:00 {config.timezone_name} -> {to_utc_z(start_dt)} Genesys"
     elif args.start_date and args.end_date:
         d1 = parse_local_date(args.start_date)
         d2 = parse_local_date(args.end_date)
         if d2 < d1:
             raise ValueError("END_DATE no puede ser menor que START_DATE.")
-        start_dt = datetime(d1.year, d1.month, d1.day, 0, 0, 0, tzinfo=tz)
-        end_dt = datetime(d2.year, d2.month, d2.day, 0, 0, 0, tzinfo=tz) + timedelta(days=1)
-        mode = f"Rango local {d1.isoformat()} al {d2.isoformat()} inclusive"
+        start_dt = local_day_start(d1, tz)
+        end_dt = local_day_start(d2, tz) + timedelta(days=1)
+        mode = (
+            f"Rango local {d1.isoformat()} 00:00 al {d2.isoformat()} 23:59:59 "
+            f"{config.timezone_name}; Genesys UTC {to_utc_z(start_dt)} -> {to_utc_z(end_dt)}"
+        )
     else:
         if config.days_back <= 0:
             raise ValueError("DAYS_BACK debe ser mayor que cero.")
