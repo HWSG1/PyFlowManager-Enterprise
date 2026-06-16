@@ -362,9 +362,22 @@ def upsert_users_to_hana(
     WITH PRIMARY KEY
     """
 
-    logger.info("Conectando a SAP HANA...")
-    conn = hana_connect(config)
-    cursor = conn.cursor()
+    logger.info(
+        "Conectando a SAP HANA | host=%s | port=%s | user=%s | table=%s",
+        config.HPR_HOST,
+        config.HPR_PORT,
+        config.HPR_USER,
+        full_table,
+    )
+    try:
+        conn = hana_connect(config)
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM DUMMY")
+        cursor.fetchone()
+        logger.info("Conexión SAP HANA validada correctamente.")
+    except BaseException as exc:
+        logger.exception("Error conectando o validando SAP HANA: %s", exc)
+        raise
 
     loaded = 0
     failed = 0

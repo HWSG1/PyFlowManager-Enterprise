@@ -1,4 +1,4 @@
-import { spawn } from 'child_process';
+﻿import { spawn } from 'child_process';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
@@ -36,6 +36,16 @@ function parseProgressLine(line: string): number | null {
   if (!Number.isFinite(progress)) return null;
 
   return Math.max(0, Math.min(100, progress));
+}
+
+function rememberLine(buffer: string[], line: string): void {
+  const clean = String(line || '').trim();
+  if (!clean) return;
+
+  buffer.push(clean);
+  if (buffer.length > 20) {
+    buffer.shift();
+  }
 }
 
 export async function runScript(
@@ -263,6 +273,7 @@ if (!skipQueueCheck) {
 
   child.stdout.setEncoding('utf8');
   child.stderr.setEncoding('utf8');
+  const recentOutput: string[] = [];
 
   child.stdout.on('data', async (data: string) => {
     const lines = data.split(/\r?\n/).filter(Boolean);
@@ -277,6 +288,7 @@ if (!skipQueueCheck) {
         continue;
       }
 
+      rememberLine(recentOutput, line);
       await addExecutionLog(executionId, 'INFO', line);
       emitExecutionLog(executionId, {
         level: 'INFO',
@@ -290,6 +302,7 @@ if (!skipQueueCheck) {
     const lines = data.split(/\r?\n/).filter(Boolean);
 
     for (const line of lines) {
+      rememberLine(recentOutput, line);
       await addExecutionLog(executionId, 'ERROR', line);
       emitExecutionLog(executionId, {
         level: 'ERROR',
@@ -346,7 +359,10 @@ if (!skipQueueCheck) {
     const exitCode = normalizeExitCode(code);
 
     const status = exitCode === 0 ? 'Exitoso' : 'Error';
-    const msg = `Proceso finalizado con código ${exitCode}`;
+    const tail = recentOutput.length
+      ? ` | Últimas líneas: ${recentOutput.slice(-5).join(' || ')}`
+      : '';
+    const msg = `Proceso finalizado con código ${exitCode}${exitCode === 0 ? '' : tail}`;
 
     await addExecutionLog(
       executionId,
