@@ -21,12 +21,21 @@ import math
 import argparse
 import logging
 import traceback
+import csv
+import base64
+import mimetypes
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta
+from html import escape
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Tuple, Optional
 
 import requests
+
+try:
+    import pandas as pd
+except Exception:
+    pd = None
 
 try:
     from dotenv import load_dotenv
@@ -56,7 +65,6 @@ PYFLOW_PARAMS = {
     "HANA_QUEUES_TABLE": {"type": "text", "label": "Tabla colas Genesys", "required": True, "default": "GNS_API_COLAS"},
     "HANA_PERFORMANCE_TABLE": {"type": "text", "label": "Tabla destino performance", "required": True, "default": "GNS_API_PERFORMANCE"},
 
-    "DATE": {"type": "date", "label": "Fecha específica local", "required": False},
     "START_DATE": {"type": "date", "label": "Fecha inicial local", "required": False},
     "END_DATE": {"type": "date", "label": "Fecha final local", "required": False},
     "DAYS_BACK": {"type": "number", "label": "Días hacia atrás si no se indican fechas", "required": False, "default": "5"},
@@ -64,18 +72,20 @@ PYFLOW_PARAMS = {
     "GENESYS_TIMEZONE": {"type": "text", "label": "Zona horaria Genesys", "required": True, "default": "America/Tegucigalpa"},
     "GRANULARITY": {"type": "select", "label": "Granularidad", "required": True, "options": ["PT30M", "PT15M", "PT1H"], "default": "PT30M"},
 
-    "BATCH_SIZE_USERS": {"type": "number", "label": "Usuarios por consulta Genesys", "required": False, "default": "50"},
     "MAX_USERS": {"type": "number", "label": "Máximo usuarios para prueba; vacío = todos", "required": False},
     "EXCLUDE_DIVISIONS": {"type": "text", "label": "Divisiones excluidas separadas por coma", "required": False, "default": "TeleventasMP"},
 
-    "HANA_BATCH_SIZE": {"type": "number", "label": "Filas por lote HANA", "required": False, "default": "1000"},
-    "REQUEST_TIMEOUT": {"type": "number", "label": "Timeout HTTP segundos", "required": False, "default": "120"},
-    "API_SLEEP_SECONDS": {"type": "number", "label": "Pausa entre requests", "required": False, "default": "1"},
-    "MAX_RETRIES": {"type": "number", "label": "Reintentos HTTP", "required": False, "default": "5"},
-
     "DELETE_RANGE_BEFORE_LOAD": {"type": "select", "label": "Borrar rango antes de cargar", "required": True, "options": ["true", "false"], "default": "true"},
-    "DRY_RUN": {"type": "select", "label": "Modo prueba sin insertar", "required": True, "options": ["true", "false"], "default": "false"},
-    "OUTPUT_CSV": {"type": "text", "label": "Ruta CSV opcional", "required": False}
+    "REPORT_OUTPUT_FORMAT": {"type": "select", "label": "Generar archivo de reporte", "required": False, "options": ["csv", "xlsx"]},
+    "ATTACH_REPORT_FILE": {"type": "select", "label": "Adjuntar archivo al correo", "required": False, "options": ["false", "true"], "default": "false"},
+    "REPORT_OUTPUT_DIR": {"type": "text", "label": "Carpeta de salida del reporte", "required": False},
+    "GRAPH_TENANT_ID": {"type": "global", "global_key": "GRAPH_TENANT_ID", "label": "Microsoft Graph Tenant ID", "required": False},
+    "GRAPH_CLIENT_ID": {"type": "global", "global_key": "GRAPH_CLIENT_ID", "label": "Microsoft Graph Client ID", "required": False},
+    "GRAPH_CLIENT_SECRET": {"type": "global", "global_key": "GRAPH_CLIENT_SECRET", "label": "Microsoft Graph Client Secret", "required": False, "secret": True},
+    "GRAPH_SENDER_EMAIL": {"type": "global", "global_key": "GRAPH_SENDER_EMAIL", "label": "Correo remitente Graph", "required": False},
+    "PERFORMANCE_REPORT_EMAIL_TO": {"type": "tags", "label": "Destinatarios reporte performance", "required": False},
+    "PERFORMANCE_REPORT_EMAIL_CC": {"type": "tags", "label": "Copias reporte performance", "required": False},
+    "PERFORMANCE_REPORT_SUBJECT": {"type": "text", "label": "Asunto reporte performance", "required": False, "default": "Reporte de Performance Genesys"}
 }
 
 
@@ -121,6 +131,24 @@ def env_bool(name: str, default: bool = False) -> bool:
     return value in ("1", "true", "yes", "y", "si", "sí")
 
 
+def split_list_value(value: Any) -> List[str]:
+    text = "" if value is None else str(value)
+    text = text.replace("\r", "\n").replace(",", ";").replace("\n", ";")
+    result: List[str] = []
+
+    for item in text.split(";"):
+        cleaned = item.strip()
+        if cleaned and cleaned not in result:
+            result.append(cleaned)
+
+    return result
+
+
+def pyflow_progress(value: int) -> None:
+    value = max(0, min(100, int(value)))
+    print(f"PYFLOW_PROGRESS={value}", flush=True)
+
+
 def normalize_genesys_domain(value: str) -> str:
     value = str(value or "mypurecloud.com").strip()
     value = value.replace("https://", "").replace("http://", "").strip("/")
@@ -164,6 +192,16 @@ class Config:
     request_timeout: int
     api_sleep_seconds: float
     max_retries: int
+    report_output_format: str
+    attach_report_file: bool
+    report_output_dir: str
+    graph_tenant_id: str
+    graph_client_id: str
+    graph_client_secret: str
+    graph_sender_email: str
+    performance_report_email_to: List[str]
+    performance_report_email_cc: List[str]
+    performance_report_subject: str
 
 
 def load_config() -> Config:
@@ -198,6 +236,16 @@ def load_config() -> Config:
         request_timeout=env_int("REQUEST_TIMEOUT", 120),
         api_sleep_seconds=env_float("API_SLEEP_SECONDS", 1.0),
         max_retries=env_int("MAX_RETRIES", 5),
+        report_output_format=env_str("REPORT_OUTPUT_FORMAT", "").lower(),
+        attach_report_file=env_bool("ATTACH_REPORT_FILE", False),
+        report_output_dir=env_str("REPORT_OUTPUT_DIR", ""),
+        graph_tenant_id=env_str("GRAPH_TENANT_ID", ""),
+        graph_client_id=env_str("GRAPH_CLIENT_ID", ""),
+        graph_client_secret=env_str("GRAPH_CLIENT_SECRET", ""),
+        graph_sender_email=env_str("GRAPH_SENDER_EMAIL", ""),
+        performance_report_email_to=split_list_value(env_str("PERFORMANCE_REPORT_EMAIL_TO", "")),
+        performance_report_email_cc=split_list_value(env_str("PERFORMANCE_REPORT_EMAIL_CC", "")),
+        performance_report_subject=env_str("PERFORMANCE_REPORT_SUBJECT", "Reporte de Performance Genesys"),
     )
 
 
@@ -581,6 +629,8 @@ def fetch_performance_rows(config: Config, token: str, users: List[Dict[str, Any
     all_rows: List[Dict[str, Any]] = []
     errors = 0
     fecha_carga = datetime.now(ZoneInfo(config.timezone_name)).strftime("%Y-%m-%d %H:%M:%S")
+    completed_batches = 0
+    total_work = max(len(intervals) * max(total_batches, 1), 1)
 
     logger.info("Intervalos a procesar: %s | batches por intervalo: %s", len(intervals), total_batches)
 
@@ -598,6 +648,9 @@ def fetch_performance_rows(config: Config, token: str, users: List[Dict[str, Any
                 errors += 1
                 logger.exception("Error consultando intervalo/batch: %s", exc)
                 time.sleep(max(config.api_sleep_seconds, 5))
+            finally:
+                completed_batches += 1
+                pyflow_progress(25 + int((completed_batches / total_work) * 45))
 
     return all_rows, errors
 
@@ -708,26 +761,232 @@ def merge_rows_to_hana(config: Config, rows: List[Dict[str, Any]], logger: loggi
     return loaded, failed
 
 
-def write_csv(rows: List[Dict[str, Any]], output_csv: str, logger: logging.Logger) -> None:
-    if not output_csv:
-        return
+def write_report_file(config: Config, rows: List[Dict[str, Any]], logger: logging.Logger) -> Optional[str]:
+    report_format = (config.report_output_format or "").strip().lower()
+    if not report_format and config.attach_report_file:
+        report_format = "xlsx"
+    if not report_format:
+        return None
 
-    import csv
+    if report_format not in ("csv", "xlsx"):
+        logger.warning("REPORT_OUTPUT_FORMAT inválido: %s. No se generará archivo.", report_format)
+        return None
 
-    if os.path.isdir(output_csv) or output_csv.endswith("\\") or output_csv.endswith("/"):
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_csv = os.path.join(output_csv, f"GNS_Performance_{timestamp}.csv")
+    if not rows:
+        logger.warning("No hay filas para generar reporte de performance.")
+        return None
 
-    out_dir = os.path.dirname(output_csv)
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
+    output_dir = config.report_output_dir or os.getcwd()
+    os.makedirs(output_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(output_dir, f"GNS_Performance_{timestamp}.{report_format}")
 
-    with open(output_csv, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=PERFORMANCE_COLUMNS)
-        writer.writeheader()
-        writer.writerows(rows)
+    if report_format == "csv":
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=PERFORMANCE_COLUMNS, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+    else:
+        if pd is None:
+            raise RuntimeError("Para generar Excel instala pandas y openpyxl: pip install pandas openpyxl")
+        pd.DataFrame(rows, columns=PERFORMANCE_COLUMNS).to_excel(path, index=False)
 
-    logger.info("CSV generado: %s", output_csv)
+    logger.info("Archivo de reporte generado: %s | filas: %s", path, len(rows))
+    return path
+
+
+def build_file_attachment(path: str) -> Dict[str, str]:
+    content_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
+    with open(path, "rb") as f:
+        content = base64.b64encode(f.read()).decode("ascii")
+
+    return {
+        "@odata.type": "#microsoft.graph.fileAttachment",
+        "name": os.path.basename(path),
+        "contentType": content_type,
+        "contentBytes": content,
+    }
+
+
+def get_graph_access_token(config: Config, logger: logging.Logger) -> str:
+    if not config.graph_tenant_id or not config.graph_client_id or not config.graph_client_secret:
+        raise ValueError("Configura GRAPH_TENANT_ID, GRAPH_CLIENT_ID y GRAPH_CLIENT_SECRET para enviar el reporte por Microsoft Graph.")
+
+    url = f"https://login.microsoftonline.com/{config.graph_tenant_id}/oauth2/v2.0/token"
+    response = requests.post(
+        url,
+        data={
+            "client_id": config.graph_client_id,
+            "client_secret": config.graph_client_secret,
+            "scope": "https://graph.microsoft.com/.default",
+            "grant_type": "client_credentials",
+        },
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=30,
+    )
+
+    if response.status_code >= 400:
+        logger.error("Error obteniendo token Graph %s | %s", response.status_code, response.text[:1000])
+    response.raise_for_status()
+
+    token = response.json().get("access_token")
+    if not token:
+        raise RuntimeError("Microsoft Graph no devolvió access_token.")
+    return token
+
+
+def build_performance_report_html(
+    total_rows: int,
+    loaded: int,
+    failed: int,
+    query_errors: int,
+    date_mode: str,
+    duration_seconds: float
+) -> str:
+    now = datetime.now(ZoneInfo("America/Tegucigalpa"))
+    coverage = (loaded / total_rows * 100) if total_rows else 0
+    coverage = max(0, min(100, coverage))
+
+    return f"""<!doctype html>
+<html lang="es">
+<body style="margin:0;background:#f8fafc;font-family:'Segoe UI',Arial,sans-serif;color:#334155;">
+  <table width="100%" cellspacing="0" cellpadding="0" style="background:#f8fafc;padding:40px 10px;">
+    <tr>
+      <td align="center">
+        <table width="100%" cellspacing="0" cellpadding="0" style="max-width:650px;background:#ffffff;border:1px solid #e2e8f0;border-radius:8px;overflow:hidden;">
+          <tr>
+            <td style="background:#DA282D;padding:36px 40px;color:#ffffff;">
+              <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1.5px;color:#fecaca;">Sistema de monitoreo de procesos</div>
+              <h1 style="margin:8px 0 0;font-size:24px;line-height:1.2;">Reporte de Performance Genesys</h1>
+              <p style="margin:8px 0 0;font-size:13px;color:#fecaca;">Reporte automático generado por PyFlow Manager</p>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:36px 40px;">
+              <p style="margin:0 0 24px;font-size:14px;line-height:1.6;">Se ha completado la ejecución del proceso de performance de agentes. A continuación se presenta el resumen de carga para el periodo procesado.</p>
+              <table width="100%" cellspacing="0" cellpadding="0">
+                <tr>
+                  <td width="48%" style="background:#f1f5f9;border:1px solid #e2e8f0;border-radius:6px;padding:20px;">
+                    <div style="font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;">Filas transformadas</div>
+                    <div style="font-size:26px;font-weight:700;color:#1e293b;margin-top:8px;">{total_rows:,}</div>
+                    <div style="font-size:11px;color:#94a3b8;">Registros obtenidos</div>
+                  </td>
+                  <td width="4%">&nbsp;</td>
+                  <td width="48%" style="background:#f1f5f9;border:1px solid #e2e8f0;border-radius:6px;padding:20px;">
+                    <div style="font-size:11px;font-weight:700;color:#DA282D;text-transform:uppercase;">Filas cargadas</div>
+                    <div style="font-size:26px;font-weight:700;color:#DA282D;margin-top:8px;">{loaded:,}</div>
+                    <div style="font-size:11px;color:#94a3b8;">MERGE en HANA</div>
+                  </td>
+                </tr>
+                <tr><td colspan="3" height="16"></td></tr>
+                <tr>
+                  <td width="48%" style="background:#fdf2f2;border:1px solid #fee2e2;border-radius:6px;padding:20px;">
+                    <div style="font-size:11px;font-weight:700;color:#b91c1c;text-transform:uppercase;">Errores HANA</div>
+                    <div style="font-size:26px;font-weight:700;color:#b91c1c;margin-top:8px;">{failed:,}</div>
+                    <div style="font-size:11px;color:#f87171;">Filas fallidas</div>
+                  </td>
+                  <td width="4%">&nbsp;</td>
+                  <td width="48%" style="background:#fdf2f2;border:1px solid #fee2e2;border-radius:6px;padding:20px;">
+                    <div style="font-size:11px;font-weight:700;color:#b91c1c;text-transform:uppercase;">Errores Genesys</div>
+                    <div style="font-size:26px;font-weight:700;color:#b91c1c;margin-top:8px;">{query_errors:,}</div>
+                    <div style="font-size:11px;color:#f87171;">Consultas con error</div>
+                  </td>
+                </tr>
+              </table>
+              <div style="margin-top:24px;background:#fafafa;border:1px solid #f1f5f9;border-radius:6px;padding:22px;">
+                <table width="100%" cellspacing="0" cellpadding="0">
+                  <tr>
+                    <td style="font-size:12px;font-weight:700;color:#475569;text-transform:uppercase;">Indicador de carga</td>
+                    <td align="right" style="font-size:13px;font-weight:700;color:#1e293b;">{coverage:.1f}%</td>
+                  </tr>
+                  <tr>
+                    <td colspan="2" style="padding-top:10px;">
+                      <table width="100%" cellspacing="0" cellpadding="0" style="background:#e2e8f0;height:8px;border-radius:4px;overflow:hidden;">
+                        <tr>
+                          <td width="{coverage:.1f}%" style="background:#DA282D;height:8px;"></td>
+                          <td style="background:#e2e8f0;height:8px;"></td>
+                        </tr>
+                      </table>
+                    </td>
+                  </tr>
+                </table>
+              </div>
+              <div style="margin-top:24px;border-left:3px solid #DA282D;padding-left:16px;font-size:13px;line-height:1.5;color:#64748b;">
+                <strong>Periodo:</strong> {escape(date_mode)}<br />
+                <strong>Duración:</strong> {duration_seconds:.2f} segundos
+              </div>
+              <div style="margin-top:28px;border-top:1px solid #f1f5f9;padding-top:22px;font-size:12px;color:#64748b;">
+                Fecha de ejecución: <strong>{escape(now.strftime("%d/%m/%Y"))}</strong><br />
+                Hora de ejecución: <strong>{escape(now.strftime("%I:%M %p"))}</strong>
+              </div>
+            </td>
+          </tr>
+          <tr>
+            <td align="center" style="background:#f1f5f9;padding:20px;border-top:1px solid #e2e8f0;font-size:11px;color:#94a3b8;">Este es un correo automático generado por PyFlow Manager.</td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>"""
+
+
+def enviar_reporte_performance(
+    config: Config,
+    total_rows: int,
+    loaded: int,
+    failed: int,
+    query_errors: int,
+    date_mode: str,
+    duration_seconds: float,
+    report_file: Optional[str],
+    logger: logging.Logger
+) -> bool:
+    recipients = config.performance_report_email_to
+    cc = config.performance_report_email_cc
+
+    if not recipients:
+        logger.info("Reporte por correo no enviado: no hay destinatarios en PERFORMANCE_REPORT_EMAIL_TO.")
+        return False
+    if not config.graph_sender_email:
+        logger.warning("Reporte por correo no enviado: configura GRAPH_SENDER_EMAIL.")
+        return False
+
+    html = build_performance_report_html(total_rows, loaded, failed, query_errors, date_mode, duration_seconds)
+    payload = {
+        "message": {
+            "subject": config.performance_report_subject,
+            "body": {"contentType": "HTML", "content": html},
+            "toRecipients": [{"emailAddress": {"address": email}} for email in recipients],
+            "ccRecipients": [{"emailAddress": {"address": email}} for email in cc],
+        },
+        "saveToSentItems": "true",
+    }
+
+    if config.attach_report_file and report_file:
+        payload["message"]["attachments"] = [build_file_attachment(report_file)]
+    elif config.attach_report_file and not report_file:
+        logger.warning("Se solicitÃ³ adjuntar archivo, pero no se generÃ³ ningÃºn reporte para adjuntar.")
+
+    try:
+        token = get_graph_access_token(config, logger)
+        url = f"https://graph.microsoft.com/v1.0/users/{config.graph_sender_email}/sendMail"
+        response = requests.post(
+            url,
+            json=payload,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            timeout=30,
+        )
+
+        if response.status_code >= 400:
+            logger.error("Error enviando reporte Graph %s | %s", response.status_code, response.text[:1000])
+        response.raise_for_status()
+        logger.info("Reporte performance enviado a: %s", ", ".join(recipients + cc))
+        return True
+    except Exception as exc:
+        logger.error("No se pudo enviar reporte performance: %s", exc)
+        return False
 
 
 def main() -> int:
@@ -748,10 +1007,15 @@ def main() -> int:
     failed = 0
     query_errors = 0
     general_errors: List[str] = []
+    report_file: Optional[str] = None
+    config: Optional[Config] = None
+    date_mode = ""
 
     try:
+        pyflow_progress(2)
         config = load_config()
         start_dt, end_dt, date_mode = parse_dates(args, config.timezone_name)
+        pyflow_progress(5)
 
         logger.info("=" * 80)
         logger.info("INICIO PROCESO GNS PERFORMANCE")
@@ -765,8 +1029,11 @@ def main() -> int:
         logger.info("=" * 80)
 
         token = get_access_token(config, logger)
+        pyflow_progress(10)
         users = fetch_users_from_hana(config, logger)
+        pyflow_progress(15)
         queues = fetch_queues_from_hana(config, logger)
+        pyflow_progress(20)
 
         if not users:
             raise RuntimeError("No se encontraron usuarios en HANA para consultar performance.")
@@ -777,17 +1044,20 @@ def main() -> int:
         total_rows = len(rows)
 
         logger.info("Extracción finalizada. Filas transformadas: %s | errores consulta: %s", total_rows, query_errors)
+        pyflow_progress(72)
 
-        output_csv = env_str("OUTPUT_CSV", "")
-        if output_csv:
-            write_csv(rows, output_csv, logger)
+        report_file = write_report_file(config, rows, logger)
+        if report_file:
+            pyflow_progress(76)
 
         if args.dry_run:
             logger.warning("DRY_RUN=true. No se cargará información a HANA.")
         else:
             if env_bool("DELETE_RANGE_BEFORE_LOAD", True):
                 delete_existing_range(config, start_dt, end_dt, logger)
+            pyflow_progress(80)
             loaded, failed = merge_rows_to_hana(config, rows, logger)
+            pyflow_progress(90)
 
     except Exception as exc:
         general_errors.append(str(exc))
@@ -801,11 +1071,28 @@ def main() -> int:
     logger.info("Filas cargadas/actualizadas: %s", loaded)
     logger.info("Filas fallidas: %s", failed)
     logger.info("Errores consulta Genesys: %s", query_errors)
+    if report_file:
+        logger.info("Archivo generado: %s", report_file)
     logger.info("Errores generales: %s", len(general_errors))
     for err in general_errors[:20]:
         logger.error("Detalle error: %s", err)
     logger.info("Duración total: %.2f segundos", duration)
     logger.info("=" * 80)
+
+    if config:
+        enviar_reporte_performance(
+            config,
+            total_rows,
+            loaded,
+            failed,
+            query_errors,
+            date_mode,
+            duration,
+            report_file,
+            logger
+        )
+
+    pyflow_progress(100)
 
     return 0 if not general_errors and failed == 0 and query_errors == 0 else 1
 

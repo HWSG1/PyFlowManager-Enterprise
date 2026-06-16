@@ -275,12 +275,67 @@ router.get('/:id/parameters', async (req, res, next) => {
               'DRY_RUN'
             )
           )
+          AND (
+            s.name <> 'GNS_Colas_y_Volumenes.py'
+            OR sp.param_key NOT IN (
+              'DATE',
+              'START_LOCAL',
+              'END_LOCAL',
+              'QUEUE_PAGE_SIZE',
+              'HANA_BATCH_SIZE',
+              'REQUEST_TIMEOUT',
+              'API_SLEEP_SECONDS',
+              'MAX_RETRIES',
+              'DRY_RUN'
+            )
+          )
+          AND (
+            s.name <> 'GNS_Performance.py'
+            OR sp.param_key NOT IN (
+              'DATE',
+              'BATCH_SIZE_USERS',
+              'HANA_BATCH_SIZE',
+              'REQUEST_TIMEOUT',
+              'API_SLEEP_SECONDS',
+              'MAX_RETRIES',
+              'DRY_RUN',
+              'OUTPUT_CSV'
+            )
+          )
+          AND (
+            s.name <> 'GNS_Adherencia.py'
+            OR sp.param_key NOT IN (
+              'DATE',
+              'START_UTC',
+              'END_UTC',
+              'HANA_BATCH_SIZE',
+              'REQUEST_TIMEOUT',
+              'POLL_SECONDS',
+              'MAX_POLL_ATTEMPTS',
+              'MAX_API_RETRIES',
+              'FAIL_ON_MU_ERROR',
+              'DRY_RUN'
+            )
+          )
+          AND (
+            s.name <> 'GNS_Estados_Agentes.py'
+            OR sp.param_key NOT IN (
+              'BATCH_SIZE_USERS',
+              'DRY_RUN',
+              'OUTPUT_CSV',
+              'REQUEST_TIMEOUT_SECONDS'
+            )
+          )
         ORDER BY sp.id
       `);
 
     const rows = result.recordset;
     const isGnsIvr = rows.some((row: any) => row.script_name === 'GNS_IVR.py');
     const isTranscriptionExtractor = rows.some((row: any) => row.script_name === 'GNS_Extractor_Transcripciones.py');
+    const isGnsColasVolumenes = rows.some((row: any) => row.script_name === 'GNS_Colas_y_Volumenes.py');
+    const isGnsPerformance = rows.some((row: any) => row.script_name === 'GNS_Performance.py');
+    const isGnsAdherencia = rows.some((row: any) => row.script_name === 'GNS_Adherencia.py');
+    const isGnsEstadosAgentes = rows.some((row: any) => row.script_name === 'GNS_Estados_Agentes.py');
 
     if (isTranscriptionExtractor) {
       const tagParams = new Set([
@@ -319,6 +374,326 @@ router.get('/:id/parameters', async (req, res, next) => {
           script_name: 'GNS_Extractor_Transcripciones.py'
         });
       }
+    }
+
+    if (isGnsColasVolumenes) {
+      const hasParam = (key: string) => rows.some((row: any) => row.param_key === key);
+      let syntheticId = rows.length ? Math.max(...rows.map((row: any) => Number(row.id) || 0)) + 1 : 1;
+
+      const forceGlobalParam = (key: string, label: string) => {
+        const param = rows.find((row: any) => row.param_key === key);
+        if (!param) return;
+
+        param.param_type = 'global';
+        param.control_type = 'global';
+        param.global_key = key;
+        param.label = label;
+      };
+
+      const addGlobalIfMissing = (key: string, label: string, secret = false) => {
+        forceGlobalParam(key, label);
+        if (hasParam(key)) return;
+
+        rows.push({
+          id: syntheticId++,
+          script_id: scriptId,
+          param_key: key,
+          param_value: '',
+          param_type: 'global',
+          control_type: 'global',
+          label,
+          options_json: null,
+          is_required: false,
+          is_secret: secret,
+          global_key: key,
+          script_name: 'GNS_Colas_y_Volumenes.py'
+        });
+      };
+
+      const addInputIfMissing = (
+        key: string,
+        label: string,
+        controlType = 'text',
+        defaultValue = '',
+        options: string[] | null = null
+      ) => {
+        const existing = rows.find((row: any) => row.param_key === key);
+        if (existing) {
+          existing.control_type = controlType;
+          existing.label = label;
+          existing.param_type = 'env';
+          existing.global_key = null;
+          if (options) {
+            existing.options_json = JSON.stringify(options);
+          }
+          return;
+        }
+
+        rows.push({
+          id: syntheticId++,
+          script_id: scriptId,
+          param_key: key,
+          param_value: defaultValue,
+          param_type: 'env',
+          control_type: controlType,
+          label,
+          options_json: options ? JSON.stringify(options) : null,
+          is_required: false,
+          global_key: null,
+          script_name: 'GNS_Colas_y_Volumenes.py'
+        });
+      };
+
+      addGlobalIfMissing('GRAPH_TENANT_ID', 'Microsoft Graph Tenant ID');
+      addGlobalIfMissing('GRAPH_CLIENT_ID', 'Microsoft Graph Client ID');
+      addGlobalIfMissing('GRAPH_CLIENT_SECRET', 'Microsoft Graph Client Secret', true);
+      addGlobalIfMissing('GRAPH_SENDER_EMAIL', 'Correo remitente Graph');
+      addInputIfMissing('REPORT_OUTPUT_FORMAT', 'Generar archivo de reporte', 'select', '', ['csv', 'xlsx']);
+      addInputIfMissing('ATTACH_REPORT_FILE', 'Adjuntar archivo al correo', 'select', 'false', ['false', 'true']);
+      addInputIfMissing('REPORT_OUTPUT_DIR', 'Carpeta de salida del reporte');
+      addInputIfMissing('QUEUE_VOLUME_REPORT_EMAIL_TO', 'Destinatarios reporte colas/volúmenes', 'tags');
+      addInputIfMissing('QUEUE_VOLUME_REPORT_EMAIL_CC', 'Copias reporte colas/volúmenes', 'tags');
+      addInputIfMissing('QUEUE_VOLUME_REPORT_SUBJECT', 'Asunto reporte colas/volúmenes', 'text', 'Reporte de Colas y Volúmenes');
+    }
+
+    if (isGnsPerformance) {
+      const hasParam = (key: string) => rows.some((row: any) => row.param_key === key);
+      let syntheticId = rows.length ? Math.max(...rows.map((row: any) => Number(row.id) || 0)) + 1 : 1;
+
+      const forceGlobalParam = (key: string, label: string) => {
+        const param = rows.find((row: any) => row.param_key === key);
+        if (!param) return;
+
+        param.param_type = 'global';
+        param.control_type = 'global';
+        param.global_key = key;
+        param.label = label;
+      };
+
+      const addGlobalIfMissing = (key: string, label: string, secret = false) => {
+        forceGlobalParam(key, label);
+        if (hasParam(key)) return;
+
+        rows.push({
+          id: syntheticId++,
+          script_id: scriptId,
+          param_key: key,
+          param_value: '',
+          param_type: 'global',
+          control_type: 'global',
+          label,
+          options_json: null,
+          is_required: false,
+          is_secret: secret,
+          global_key: key,
+          script_name: 'GNS_Performance.py'
+        });
+      };
+
+      const addInputIfMissing = (
+        key: string,
+        label: string,
+        controlType = 'text',
+        defaultValue = '',
+        options: string[] | null = null
+      ) => {
+        const existing = rows.find((row: any) => row.param_key === key);
+        if (existing) {
+          existing.control_type = controlType;
+          existing.label = label;
+          existing.param_type = 'env';
+          existing.global_key = null;
+          if (options) {
+            existing.options_json = JSON.stringify(options);
+          }
+          return;
+        }
+
+        rows.push({
+          id: syntheticId++,
+          script_id: scriptId,
+          param_key: key,
+          param_value: defaultValue,
+          param_type: 'env',
+          control_type: controlType,
+          label,
+          options_json: options ? JSON.stringify(options) : null,
+          is_required: false,
+          global_key: null,
+          script_name: 'GNS_Performance.py'
+        });
+      };
+
+      addGlobalIfMissing('GRAPH_TENANT_ID', 'Microsoft Graph Tenant ID');
+      addGlobalIfMissing('GRAPH_CLIENT_ID', 'Microsoft Graph Client ID');
+      addGlobalIfMissing('GRAPH_CLIENT_SECRET', 'Microsoft Graph Client Secret', true);
+      addGlobalIfMissing('GRAPH_SENDER_EMAIL', 'Correo remitente Graph');
+      addInputIfMissing('REPORT_OUTPUT_FORMAT', 'Generar archivo de reporte', 'select', '', ['csv', 'xlsx']);
+      addInputIfMissing('ATTACH_REPORT_FILE', 'Adjuntar archivo al correo', 'select', 'false', ['false', 'true']);
+      addInputIfMissing('REPORT_OUTPUT_DIR', 'Carpeta de salida del reporte');
+      addInputIfMissing('PERFORMANCE_REPORT_EMAIL_TO', 'Destinatarios reporte performance', 'tags');
+      addInputIfMissing('PERFORMANCE_REPORT_EMAIL_CC', 'Copias reporte performance', 'tags');
+      addInputIfMissing('PERFORMANCE_REPORT_SUBJECT', 'Asunto reporte performance', 'text', 'Reporte de Performance Genesys');
+    }
+
+    if (isGnsAdherencia) {
+      const hasParam = (key: string) => rows.some((row: any) => row.param_key === key);
+      let syntheticId = rows.length ? Math.max(...rows.map((row: any) => Number(row.id) || 0)) + 1 : 1;
+
+      const forceGlobalParam = (key: string, label: string) => {
+        const param = rows.find((row: any) => row.param_key === key);
+        if (!param) return;
+
+        param.param_type = 'global';
+        param.control_type = 'global';
+        param.global_key = key;
+        param.label = label;
+      };
+
+      const addGlobalIfMissing = (key: string, label: string, secret = false) => {
+        forceGlobalParam(key, label);
+        if (hasParam(key)) return;
+
+        rows.push({
+          id: syntheticId++,
+          script_id: scriptId,
+          param_key: key,
+          param_value: '',
+          param_type: 'global',
+          control_type: 'global',
+          label,
+          options_json: null,
+          is_required: false,
+          is_secret: secret,
+          global_key: key,
+          script_name: 'GNS_Adherencia.py'
+        });
+      };
+
+      const addInputIfMissing = (
+        key: string,
+        label: string,
+        controlType = 'text',
+        defaultValue = '',
+        options: string[] | null = null
+      ) => {
+        const existing = rows.find((row: any) => row.param_key === key);
+        if (existing) {
+          existing.control_type = controlType;
+          existing.label = label;
+          existing.param_type = 'env';
+          existing.global_key = null;
+          if (options) {
+            existing.options_json = JSON.stringify(options);
+          }
+          return;
+        }
+
+        rows.push({
+          id: syntheticId++,
+          script_id: scriptId,
+          param_key: key,
+          param_value: defaultValue,
+          param_type: 'env',
+          control_type: controlType,
+          label,
+          options_json: options ? JSON.stringify(options) : null,
+          is_required: false,
+          global_key: null,
+          script_name: 'GNS_Adherencia.py'
+        });
+      };
+
+      addGlobalIfMissing('GRAPH_TENANT_ID', 'Microsoft Graph Tenant ID');
+      addGlobalIfMissing('GRAPH_CLIENT_ID', 'Microsoft Graph Client ID');
+      addGlobalIfMissing('GRAPH_CLIENT_SECRET', 'Microsoft Graph Client Secret', true);
+      addGlobalIfMissing('GRAPH_SENDER_EMAIL', 'Correo remitente Graph');
+      addInputIfMissing('REPORT_OUTPUT_FORMAT', 'Generar archivo de reporte', 'select', '', ['csv', 'xlsx']);
+      addInputIfMissing('ATTACH_REPORT_FILE', 'Adjuntar archivo al correo', 'select', 'false', ['false', 'true']);
+      addInputIfMissing('REPORT_OUTPUT_DIR', 'Carpeta de salida del reporte');
+      addInputIfMissing('ADHERENCIA_REPORT_EMAIL_TO', 'Destinatarios reporte adherencia', 'tags');
+      addInputIfMissing('ADHERENCIA_REPORT_EMAIL_CC', 'Copias reporte adherencia', 'tags');
+      addInputIfMissing('ADHERENCIA_REPORT_SUBJECT', 'Asunto reporte adherencia', 'text', 'Reporte de Adherencia Genesys');
+    }
+
+    if (isGnsEstadosAgentes) {
+      const hasParam = (key: string) => rows.some((row: any) => row.param_key === key);
+      let syntheticId = rows.length ? Math.max(...rows.map((row: any) => Number(row.id) || 0)) + 1 : 1;
+
+      const forceGlobalParam = (key: string, label: string) => {
+        const param = rows.find((row: any) => row.param_key === key);
+        if (!param) return;
+
+        param.param_type = 'global';
+        param.control_type = 'global';
+        param.global_key = key;
+        param.label = label;
+      };
+
+      const addGlobalIfMissing = (key: string, label: string, secret = false) => {
+        forceGlobalParam(key, label);
+        if (hasParam(key)) return;
+
+        rows.push({
+          id: syntheticId++,
+          script_id: scriptId,
+          param_key: key,
+          param_value: '',
+          param_type: 'global',
+          control_type: 'global',
+          label,
+          options_json: null,
+          is_required: false,
+          is_secret: secret,
+          global_key: key,
+          script_name: 'GNS_Estados_Agentes.py'
+        });
+      };
+
+      const addInputIfMissing = (
+        key: string,
+        label: string,
+        controlType = 'text',
+        defaultValue = '',
+        options: string[] | null = null
+      ) => {
+        const existing = rows.find((row: any) => row.param_key === key);
+        if (existing) {
+          existing.control_type = controlType;
+          existing.label = label;
+          existing.param_type = 'env';
+          existing.global_key = null;
+          if (options) {
+            existing.options_json = JSON.stringify(options);
+          }
+          return;
+        }
+
+        rows.push({
+          id: syntheticId++,
+          script_id: scriptId,
+          param_key: key,
+          param_value: defaultValue,
+          param_type: 'env',
+          control_type: controlType,
+          label,
+          options_json: options ? JSON.stringify(options) : null,
+          is_required: false,
+          global_key: null,
+          script_name: 'GNS_Estados_Agentes.py'
+        });
+      };
+
+      addGlobalIfMissing('GRAPH_TENANT_ID', 'Microsoft Graph Tenant ID');
+      addGlobalIfMissing('GRAPH_CLIENT_ID', 'Microsoft Graph Client ID');
+      addGlobalIfMissing('GRAPH_CLIENT_SECRET', 'Microsoft Graph Client Secret', true);
+      addGlobalIfMissing('GRAPH_SENDER_EMAIL', 'Correo remitente Graph');
+      addInputIfMissing('REPORT_OUTPUT_FORMAT', 'Generar archivo de reporte', 'select', '', ['csv', 'xlsx']);
+      addInputIfMissing('ATTACH_REPORT_FILE', 'Adjuntar archivo al correo', 'select', 'false', ['false', 'true']);
+      addInputIfMissing('REPORT_OUTPUT_DIR', 'Carpeta de salida del reporte');
+      addInputIfMissing('AGENT_STATUS_REPORT_EMAIL_TO', 'Destinatarios reporte estados', 'tags');
+      addInputIfMissing('AGENT_STATUS_REPORT_EMAIL_CC', 'Copias reporte estados', 'tags');
+      addInputIfMissing('AGENT_STATUS_REPORT_SUBJECT', 'Asunto reporte estados', 'text', 'Reporte de Estados de Agentes Genesys');
     }
 
     if (isGnsIvr) {
