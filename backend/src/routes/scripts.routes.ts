@@ -351,12 +351,10 @@ router.get('/:id/parameters', async (req, res, next) => {
       forceGlobalParam('TOKEN_QUALTRICTS', 'Token Qualtrics');
       forceGlobalParam('POST_AUTOSERVICIO_QUALTRICTS_QA', 'Endpoint Qualtrics');
       forceGlobalParam('POST_AUTOSERVICIO_QUALTRICTS_IVR', 'Endpoint Qualtrics');
-      forceGlobalParam('SMTP_HOST', 'SMTP Host');
-      forceGlobalParam('SMTP_PORT', 'SMTP Port');
-      forceGlobalParam('SMTP_USER', 'SMTP Usuario');
-      forceGlobalParam('SMTP_PASSWORD', 'SMTP Password');
-      forceGlobalParam('SMTP_FROM', 'SMTP Remitente');
-      forceGlobalParam('SMTP_USE_TLS', 'SMTP Usar TLS');
+      forceGlobalParam('GRAPH_TENANT_ID', 'Microsoft Graph Tenant ID');
+      forceGlobalParam('GRAPH_CLIENT_ID', 'Microsoft Graph Client ID');
+      forceGlobalParam('GRAPH_CLIENT_SECRET', 'Microsoft Graph Client Secret');
+      forceGlobalParam('GRAPH_SENDER_EMAIL', 'Correo remitente Graph');
 
       const addGlobalIfMissing = (key: string, label: string, required = false, secret = false) => {
         if (hasParam(key)) return;
@@ -441,12 +439,10 @@ router.get('/:id/parameters', async (req, res, next) => {
         });
       }
 
-      addGlobalIfMissing('SMTP_HOST', 'SMTP Host');
-      addGlobalIfMissing('SMTP_PORT', 'SMTP Port');
-      addGlobalIfMissing('SMTP_USER', 'SMTP Usuario');
-      addGlobalIfMissing('SMTP_PASSWORD', 'SMTP Password', false, true);
-      addGlobalIfMissing('SMTP_FROM', 'SMTP Remitente');
-      addGlobalIfMissing('SMTP_USE_TLS', 'SMTP Usar TLS');
+      addGlobalIfMissing('GRAPH_TENANT_ID', 'Microsoft Graph Tenant ID');
+      addGlobalIfMissing('GRAPH_CLIENT_ID', 'Microsoft Graph Client ID');
+      addGlobalIfMissing('GRAPH_CLIENT_SECRET', 'Microsoft Graph Client Secret', false, true);
+      addGlobalIfMissing('GRAPH_SENDER_EMAIL', 'Correo remitente Graph');
       addInputIfMissing('SURVEY_REPORT_EMAIL_TO', 'Destinatarios reporte encuestas', 'tags');
       addInputIfMissing('SURVEY_REPORT_EMAIL_CC', 'Copias reporte encuestas', 'tags');
       addInputIfMissing('SURVEY_REPORT_SUBJECT', 'Asunto reporte encuestas', 'text', 'Reporte de Encuesta de Satisfacción - Autoservicio');

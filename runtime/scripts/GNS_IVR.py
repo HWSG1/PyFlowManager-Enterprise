@@ -27,10 +27,8 @@ import logging
 import traceback
 import re
 import calendar
-import smtplib
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta, timezone
-from email.message import EmailMessage
 from html import escape
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Tuple, Optional, Iterable
@@ -91,12 +89,10 @@ PYFLOW_PARAMS = {
     "OUTPUT_FORMAT": {"type": "select", "label": "Formato salida", "required": True, "options": ["xlsx", "csv"], "default": "xlsx"},
     "TOKEN_QUALTRICTS": {"type": "global", "global_key": "TOKEN_QUALTRICTS", "label": "Token Qualtrics", "required": True, "secret": True},
     "POST_AUTOSERVICIO_QUALTRICTS_IVR": {"type": "global", "global_key": "POST_AUTOSERVICIO_QUALTRICTS_IVR", "label": "Endpoint Qualtrics", "required": True},
-    "SMTP_HOST": {"type": "global", "global_key": "SMTP_HOST", "label": "SMTP Host", "required": False},
-    "SMTP_PORT": {"type": "global", "global_key": "SMTP_PORT", "label": "SMTP Port", "required": False},
-    "SMTP_USER": {"type": "global", "global_key": "SMTP_USER", "label": "SMTP Usuario", "required": False},
-    "SMTP_PASSWORD": {"type": "global", "global_key": "SMTP_PASSWORD", "label": "SMTP Password", "required": False, "secret": True},
-    "SMTP_FROM": {"type": "global", "global_key": "SMTP_FROM", "label": "SMTP Remitente", "required": False},
-    "SMTP_USE_TLS": {"type": "global", "global_key": "SMTP_USE_TLS", "label": "SMTP Usar TLS", "required": False},
+    "GRAPH_TENANT_ID": {"type": "global", "global_key": "GRAPH_TENANT_ID", "label": "Microsoft Graph Tenant ID", "required": False},
+    "GRAPH_CLIENT_ID": {"type": "global", "global_key": "GRAPH_CLIENT_ID", "label": "Microsoft Graph Client ID", "required": False},
+    "GRAPH_CLIENT_SECRET": {"type": "global", "global_key": "GRAPH_CLIENT_SECRET", "label": "Microsoft Graph Client Secret", "required": False, "secret": True},
+    "GRAPH_SENDER_EMAIL": {"type": "global", "global_key": "GRAPH_SENDER_EMAIL", "label": "Correo remitente Graph", "required": False},
     "SURVEY_REPORT_EMAIL_TO": {"type": "tags", "label": "Destinatarios reporte encuestas", "required": False},
     "SURVEY_REPORT_EMAIL_CC": {"type": "tags", "label": "Copias reporte encuestas", "required": False},
     "SURVEY_REPORT_SUBJECT": {"type": "text", "label": "Asunto reporte encuestas", "required": False, "default": "Reporte de Encuesta de Satisfacción - Autoservicio"}
@@ -285,12 +281,10 @@ class Config:
     qualtrics_token: str
     qualtrics_endpoint: str
     qualtrics_delay_seconds: int
-    smtp_host: str
-    smtp_port: int
-    smtp_user: str
-    smtp_password: str
-    smtp_from: str
-    smtp_use_tls: bool
+    graph_tenant_id: str
+    graph_client_id: str
+    graph_client_secret: str
+    graph_sender_email: str
     survey_report_email_to: List[str]
     survey_report_email_cc: List[str]
     survey_report_subject: str
@@ -337,12 +331,10 @@ def load_config() -> Config:
         qualtrics_token=env_str("TOKEN_QUALTRICTS", ""),
         qualtrics_endpoint=env_str("POST_AUTOSERVICIO_QUALTRICTS_IVR", ""),
         qualtrics_delay_seconds=env_int("QUALTRICS_DELAY_SECONDS", 5),
-        smtp_host=env_str("SMTP_HOST", ""),
-        smtp_port=env_int("SMTP_PORT", 587),
-        smtp_user=env_str("SMTP_USER", ""),
-        smtp_password=env_str("SMTP_PASSWORD", ""),
-        smtp_from=env_str("SMTP_FROM", env_str("SMTP_USER", "")),
-        smtp_use_tls=env_bool("SMTP_USE_TLS", True),
+        graph_tenant_id=env_str("GRAPH_TENANT_ID", ""),
+        graph_client_id=env_str("GRAPH_CLIENT_ID", ""),
+        graph_client_secret=env_str("GRAPH_CLIENT_SECRET", ""),
+        graph_sender_email=env_str("GRAPH_SENDER_EMAIL", ""),
         survey_report_email_to=split_list_value(env_str("SURVEY_REPORT_EMAIL_TO", "")),
         survey_report_email_cc=split_list_value(env_str("SURVEY_REPORT_EMAIL_CC", "")),
         survey_report_subject=env_str("SURVEY_REPORT_SUBJECT", "Reporte de Encuesta de Satisfacción - Autoservicio"),
@@ -531,6 +523,33 @@ def build_survey_report_html(total_autoservicio: int, enviadas: int, sin_correo:
 </html>"""
 
 
+def get_graph_access_token(config: Config, logger: logging.Logger) -> str:
+    if not config.graph_tenant_id or not config.graph_client_id or not config.graph_client_secret:
+        raise ValueError("Configura GRAPH_TENANT_ID, GRAPH_CLIENT_ID y GRAPH_CLIENT_SECRET para enviar el reporte por Microsoft Graph.")
+
+    url = f"https://login.microsoftonline.com/{config.graph_tenant_id}/oauth2/v2.0/token"
+    response = requests.post(
+        url,
+        data={
+            "client_id": config.graph_client_id,
+            "client_secret": config.graph_client_secret,
+            "scope": "https://graph.microsoft.com/.default",
+            "grant_type": "client_credentials",
+        },
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=30,
+    )
+
+    if response.status_code >= 400:
+        logger.error("Error obteniendo token Graph %s | %s", response.status_code, response.text[:1000])
+    response.raise_for_status()
+
+    token = response.json().get("access_token")
+    if not token:
+        raise RuntimeError("Microsoft Graph no devolvió access_token.")
+    return token
+
+
 def enviar_reporte_encuestas(config: Config, total_autoservicio: int, enviadas: int, sin_correo: int, date_mode: str, logger: logging.Logger) -> bool:
     recipients = config.survey_report_email_to
     cc = config.survey_report_email_cc
@@ -538,35 +557,46 @@ def enviar_reporte_encuestas(config: Config, total_autoservicio: int, enviadas: 
     if not recipients:
         logger.info("Reporte de encuestas no enviado: no hay destinatarios configurados en SURVEY_REPORT_EMAIL_TO.")
         return False
-    if not config.smtp_host or not config.smtp_from:
-        logger.warning("Reporte de encuestas no enviado: configura SMTP_HOST y SMTP_FROM/SMTP_USER.")
+    if not config.graph_sender_email:
+        logger.warning("Reporte de encuestas no enviado: configura GRAPH_SENDER_EMAIL.")
         return False
 
     html = build_survey_report_html(total_autoservicio, enviadas, sin_correo, date_mode)
-    text = (
-        f"Reporte de Encuesta de Satisfacción - Autoservicio\n\n"
-        f"Clientes autoservicio: {total_autoservicio}\n"
-        f"Envíos realizados: {enviadas}\n"
-        f"Sin correo registrado: {sin_correo}\n"
-        f"Periodo procesado: {date_mode}\n"
-    )
-
-    message = EmailMessage()
-    message["Subject"] = config.survey_report_subject
-    message["From"] = config.smtp_from
-    message["To"] = ", ".join(recipients)
-    if cc:
-        message["Cc"] = ", ".join(cc)
-    message.set_content(text)
-    message.add_alternative(html, subtype="html")
+    payload = {
+        "message": {
+            "subject": config.survey_report_subject,
+            "body": {
+                "contentType": "HTML",
+                "content": html,
+            },
+            "toRecipients": [
+                {"emailAddress": {"address": email}}
+                for email in recipients
+            ],
+            "ccRecipients": [
+                {"emailAddress": {"address": email}}
+                for email in cc
+            ],
+        },
+        "saveToSentItems": "true",
+    }
 
     try:
-        with smtplib.SMTP(config.smtp_host, config.smtp_port, timeout=30) as smtp:
-            if config.smtp_use_tls:
-                smtp.starttls()
-            if config.smtp_user:
-                smtp.login(config.smtp_user, config.smtp_password)
-            smtp.send_message(message, to_addrs=recipients + cc)
+        token = get_graph_access_token(config, logger)
+        url = f"https://graph.microsoft.com/v1.0/users/{config.graph_sender_email}/sendMail"
+        response = requests.post(
+            url,
+            json=payload,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            timeout=30,
+        )
+
+        if response.status_code >= 400:
+            logger.error("Error enviando reporte Graph %s | %s", response.status_code, response.text[:1000])
+        response.raise_for_status()
 
         logger.info("Reporte de encuestas enviado a: %s", ", ".join(recipients + cc))
         return True
