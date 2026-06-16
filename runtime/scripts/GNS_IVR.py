@@ -915,6 +915,20 @@ def has_ivr(conversation: Dict[str, Any]) -> bool:
     for _p, purpose, session in iter_sessions(conversation):
         if purpose == "ivr" or session.get("flow"):
             return True
+
+    attrs = collect_attributes(conversation)
+    ivr_attr_names = (
+        "SPD_IVR_TrazaOpciones",
+        "SPD_IVR",
+        "IVR",
+        "IVR_OPCIONES",
+        "OPCIONES_NAVEGACION",
+    )
+    for key, value in attrs.items():
+        key_upper = str(key or "").upper()
+        if value and any(name.upper() in key_upper for name in ivr_attr_names):
+            return True
+
     return False
 
 
@@ -1038,12 +1052,28 @@ def transform_conversation(conversation: Dict[str, Any], config: Config, divisio
     return row
 
 
-def transform_conversations(conversations: List[Dict[str, Any]], config: Config, divisions_lookup: Dict[str, str]) -> List[Dict[str, Any]]:
+def transform_conversations(
+    conversations: List[Dict[str, Any]],
+    config: Config,
+    divisions_lookup: Dict[str, str],
+    logger: Optional[logging.Logger] = None,
+) -> List[Dict[str, Any]]:
     rows = []
+    skipped_no_ivr = 0
     for conv in conversations:
         row = transform_conversation(conv, config, divisions_lookup)
         if row:
             rows.append(row)
+        elif config.only_with_ivr:
+            skipped_no_ivr += 1
+
+    if logger:
+        logger.info(
+            "Transformación IVR | conversaciones recibidas: %s | filas generadas: %s | descartadas sin evidencia IVR: %s",
+            len(conversations),
+            len(rows),
+            skipped_no_ivr,
+        )
     return rows
 
 
@@ -1417,6 +1447,8 @@ def main() -> int:
             "ONLY_WITH_IVR", "ENRICH_CLIENTS_FROM_HANA", "TOKEN_QUALTRICTS", "POST_AUTOSERVICIO_QUALTRICTS_IVR"
         ])
         logger.info("Modo fecha: %s", date_mode)
+        logger.info("Inicio local calculado: %s", start_dt.astimezone(ZoneInfo(config.timezone_name)).strftime("%Y-%m-%d %H:%M:%S %Z"))
+        logger.info("Fin local calculado: %s", end_dt.astimezone(ZoneInfo(config.timezone_name)).strftime("%Y-%m-%d %H:%M:%S %Z"))
         logger.info("Inicio UTC: %s", to_utc_z(start_dt))
         logger.info("Fin UTC: %s", to_utc_z(end_dt))
         logger.info("Ventanas a procesar: %s", len(windows))
@@ -1431,7 +1463,7 @@ def main() -> int:
             logger.info("Procesando ventana %s/%s | %s -> %s", idx, len(windows), to_utc_z(w_start), to_utc_z(w_end))
             conversations = fetch_conversation_details(config, token, w_start, w_end, logger)
             total_conversations += len(conversations)
-            rows = transform_conversations(conversations, config, divisions_lookup)
+            rows = transform_conversations(conversations, config, divisions_lookup, logger)
             all_rows.extend(rows)
             logger.info("Ventana procesada | conversaciones: %s | filas IVR: %s | acumulado filas IVR: %s", len(conversations), len(rows), len(all_rows))
             pyflow_progress(15 + int((idx / max(len(windows), 1)) * 35))
