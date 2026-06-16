@@ -27,8 +27,11 @@ import logging
 import traceback
 import re
 import calendar
+import smtplib
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta, timezone
+from email.message import EmailMessage
+from html import escape
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Tuple, Optional, Iterable
 
@@ -87,7 +90,16 @@ PYFLOW_PARAMS = {
     "OUTPUT_DIR": {"type": "text", "label": "Carpeta de salida para Excel/CSV", "required": False},
     "OUTPUT_FORMAT": {"type": "select", "label": "Formato salida", "required": True, "options": ["xlsx", "csv"], "default": "xlsx"},
     "TOKEN_QUALTRICTS": {"type": "global", "global_key": "TOKEN_QUALTRICTS", "label": "Token Qualtrics", "required": True, "secret": True},
-    "POST_AUTOSERVICIO_QUALTRICTS_IVR": {"type": "global", "global_key": "POST_AUTOSERVICIO_QUALTRICTS_IVR", "label": "Endpoint Qualtrics", "required": True}
+    "POST_AUTOSERVICIO_QUALTRICTS_IVR": {"type": "global", "global_key": "POST_AUTOSERVICIO_QUALTRICTS_IVR", "label": "Endpoint Qualtrics", "required": True},
+    "SMTP_HOST": {"type": "global", "global_key": "SMTP_HOST", "label": "SMTP Host", "required": False},
+    "SMTP_PORT": {"type": "global", "global_key": "SMTP_PORT", "label": "SMTP Port", "required": False},
+    "SMTP_USER": {"type": "global", "global_key": "SMTP_USER", "label": "SMTP Usuario", "required": False},
+    "SMTP_PASSWORD": {"type": "global", "global_key": "SMTP_PASSWORD", "label": "SMTP Password", "required": False, "secret": True},
+    "SMTP_FROM": {"type": "global", "global_key": "SMTP_FROM", "label": "SMTP Remitente", "required": False},
+    "SMTP_USE_TLS": {"type": "global", "global_key": "SMTP_USE_TLS", "label": "SMTP Usar TLS", "required": False},
+    "SURVEY_REPORT_EMAIL_TO": {"type": "tags", "label": "Destinatarios reporte encuestas", "required": False},
+    "SURVEY_REPORT_EMAIL_CC": {"type": "tags", "label": "Copias reporte encuestas", "required": False},
+    "SURVEY_REPORT_SUBJECT": {"type": "text", "label": "Asunto reporte encuestas", "required": False, "default": "Reporte de Encuesta de Satisfacción - Autoservicio"}
 }
 LOGGER_NAME = "gns_ivr_pyflow"
 
@@ -228,6 +240,17 @@ def join_unique(values: Iterable[Any], sep: str = "|") -> str:
     return sep.join(seen)
 
 
+def split_list_value(value: Any) -> List[str]:
+    text = "" if value is None else str(value)
+    text = text.replace("\r", "\n").replace(",", ";").replace("\n", ";")
+    result: List[str] = []
+    for item in text.split(";"):
+        cleaned = item.strip()
+        if cleaned and cleaned not in result:
+            result.append(cleaned)
+    return result
+
+
 @dataclass
 class Config:
     genesys_client_id: str
@@ -262,6 +285,15 @@ class Config:
     qualtrics_token: str
     qualtrics_endpoint: str
     qualtrics_delay_seconds: int
+    smtp_host: str
+    smtp_port: int
+    smtp_user: str
+    smtp_password: str
+    smtp_from: str
+    smtp_use_tls: bool
+    survey_report_email_to: List[str]
+    survey_report_email_cc: List[str]
+    survey_report_subject: str
 
 
 def load_config() -> Config:
@@ -305,6 +337,15 @@ def load_config() -> Config:
         qualtrics_token=env_str("TOKEN_QUALTRICTS", ""),
         qualtrics_endpoint=env_str("POST_AUTOSERVICIO_QUALTRICTS_IVR", ""),
         qualtrics_delay_seconds=env_int("QUALTRICS_DELAY_SECONDS", 5),
+        smtp_host=env_str("SMTP_HOST", ""),
+        smtp_port=env_int("SMTP_PORT", 587),
+        smtp_user=env_str("SMTP_USER", ""),
+        smtp_password=env_str("SMTP_PASSWORD", ""),
+        smtp_from=env_str("SMTP_FROM", env_str("SMTP_USER", "")),
+        smtp_use_tls=env_bool("SMTP_USE_TLS", True),
+        survey_report_email_to=split_list_value(env_str("SURVEY_REPORT_EMAIL_TO", "")),
+        survey_report_email_cc=split_list_value(env_str("SURVEY_REPORT_EMAIL_CC", "")),
+        survey_report_subject=env_str("SURVEY_REPORT_SUBJECT", "Reporte de Encuesta de Satisfacción - Autoservicio"),
     )
 
 def pyflow_progress(value: int) -> None:
@@ -421,6 +462,117 @@ def enviar_encuestas_qualtrics(config: Config, rows: List[Dict[str, Any]], logge
         total_clientes
     )
     return enviadas, sin_correo
+
+
+def build_survey_report_html(total_autoservicio: int, enviadas: int, sin_correo: int, date_mode: str) -> str:
+    porcentaje_envio = (enviadas / total_autoservicio * 100) if total_autoservicio else 0
+    porcentaje_sin_correo = (sin_correo / total_autoservicio * 100) if total_autoservicio else 0
+    enviados_width = max(0, min(100, porcentaje_envio))
+    sin_correo_width = max(0, min(100, porcentaje_sin_correo))
+
+    return f"""<!doctype html>
+<html>
+  <body style="margin:0;background:#eef2f7;font-family:Inter,Arial,sans-serif;color:#17324d;">
+    <div style="max-width:640px;margin:0 auto;background:#ffffff;border-radius:10px;overflow:hidden;border:1px solid #dbe3ef;">
+      <div style="background:#4f46e5;color:#ffffff;padding:30px;">
+        <div style="font-size:12px;letter-spacing:4px;font-weight:700;text-transform:uppercase;">Reporte de cobertura y envío</div>
+        <h1 style="margin:12px 0 0;font-size:24px;line-height:1.2;">Encuesta de Satisfacción - Autoservicio</h1>
+        <p style="margin:12px 0 0;font-size:14px;color:#e0e7ff;">Resumen ejecutivo de clientes identificados y envíos realizados.</p>
+      </div>
+
+      <div style="padding:30px;">
+        <p style="font-size:15px;line-height:1.7;margin:0 0 18px;">Estimado equipo,</p>
+        <p style="font-size:15px;line-height:1.7;margin:0 0 24px;">
+          Les compartimos el reporte consolidado de los clientes identificados tras la última campaña de encuestas
+          para el canal de <b>Autoservicio</b>. Las encuestas fueron enviadas exclusivamente a clientes con correo
+          electrónico válido registrado.
+        </p>
+
+        <div style="display:flex;gap:18px;margin-bottom:24px;">
+          <div style="flex:1;border:1px solid #dbe3ef;background:#f8fafc;border-radius:10px;padding:22px;text-align:center;">
+            <div style="font-size:12px;letter-spacing:1.5px;text-transform:uppercase;font-weight:700;color:#475569;">Clientes autoservicio</div>
+            <div style="font-size:34px;font-weight:800;margin-top:10px;color:#17324d;">{total_autoservicio:,}</div>
+            <div style="font-size:12px;color:#64748b;margin-top:4px;">Identificados en total</div>
+          </div>
+          <div style="flex:1;border:1px solid #bbf7d0;background:#f0fdf4;border-radius:10px;padding:22px;text-align:center;">
+            <div style="font-size:12px;letter-spacing:1.5px;text-transform:uppercase;font-weight:700;color:#047857;">Envíos realizados</div>
+            <div style="font-size:34px;font-weight:800;margin-top:10px;color:#047857;">{enviadas:,}</div>
+            <div style="font-size:12px;color:#047857;margin-top:4px;">{porcentaje_envio:.1f}% con correo válido</div>
+          </div>
+        </div>
+
+        <div style="border:1px solid #e2e8f0;background:#fafafa;border-radius:10px;padding:22px;">
+          <h2 style="font-size:15px;margin:0 0 20px;letter-spacing:.5px;text-transform:uppercase;">Distribución de contacto</h2>
+          <div style="font-size:14px;margin-bottom:10px;">
+            <b style="color:#047857;">✓ Con correo registrado:</b>
+            <span style="color:#475569;"> Encuestas enviadas</span>
+            <b style="float:right;color:#17324d;">{enviadas:,} <span style="font-weight:400;color:#64748b;">({porcentaje_envio:.1f}%)</span></b>
+          </div>
+          <div style="height:8px;background:#fee2e2;border-radius:999px;overflow:hidden;margin-bottom:18px;">
+            <div style="height:8px;width:{enviados_width:.1f}%;background:#22c55e;"></div>
+          </div>
+          <div style="font-size:14px;margin-bottom:10px;">
+            <b style="color:#b91c1c;">✕ Sin correo registrado:</b>
+            <span style="color:#475569;"> Excluidos de este canal digital</span>
+            <b style="float:right;color:#17324d;">{sin_correo:,} <span style="font-weight:400;color:#64748b;">({porcentaje_sin_correo:.1f}%)</span></b>
+          </div>
+          <div style="height:8px;background:#e2e8f0;border-radius:999px;overflow:hidden;">
+            <div style="height:8px;width:{sin_correo_width:.1f}%;background:#ef4444;"></div>
+          </div>
+        </div>
+
+        <div style="margin-top:24px;border-left:4px solid #4f46e5;padding-left:14px;color:#475569;font-size:13px;line-height:1.6;">
+          <b>Nota del envío:</b> los clientes identificados sin correo electrónico quedan mapeados para ser contactados
+          mediante canales alternativos. Periodo procesado: {escape(date_mode)}.
+        </div>
+      </div>
+    </div>
+  </body>
+</html>"""
+
+
+def enviar_reporte_encuestas(config: Config, total_autoservicio: int, enviadas: int, sin_correo: int, date_mode: str, logger: logging.Logger) -> bool:
+    recipients = config.survey_report_email_to
+    cc = config.survey_report_email_cc
+
+    if not recipients:
+        logger.info("Reporte de encuestas no enviado: no hay destinatarios configurados en SURVEY_REPORT_EMAIL_TO.")
+        return False
+    if not config.smtp_host or not config.smtp_from:
+        logger.warning("Reporte de encuestas no enviado: configura SMTP_HOST y SMTP_FROM/SMTP_USER.")
+        return False
+
+    html = build_survey_report_html(total_autoservicio, enviadas, sin_correo, date_mode)
+    text = (
+        f"Reporte de Encuesta de Satisfacción - Autoservicio\n\n"
+        f"Clientes autoservicio: {total_autoservicio}\n"
+        f"Envíos realizados: {enviadas}\n"
+        f"Sin correo registrado: {sin_correo}\n"
+        f"Periodo procesado: {date_mode}\n"
+    )
+
+    message = EmailMessage()
+    message["Subject"] = config.survey_report_subject
+    message["From"] = config.smtp_from
+    message["To"] = ", ".join(recipients)
+    if cc:
+        message["Cc"] = ", ".join(cc)
+    message.set_content(text)
+    message.add_alternative(html, subtype="html")
+
+    try:
+        with smtplib.SMTP(config.smtp_host, config.smtp_port, timeout=30) as smtp:
+            if config.smtp_use_tls:
+                smtp.starttls()
+            if config.smtp_user:
+                smtp.login(config.smtp_user, config.smtp_password)
+            smtp.send_message(message, to_addrs=recipients + cc)
+
+        logger.info("Reporte de encuestas enviado a: %s", ", ".join(recipients + cc))
+        return True
+    except Exception as exc:
+        logger.error("No se pudo enviar reporte de encuestas: %s", exc)
+        return False
 
 
 def normalize_run_mode(value: str) -> str:
@@ -1210,6 +1362,14 @@ def main() -> int:
             if need_auto:
                 if send_surveys:
                     surveys_sent, surveys_without_email = enviar_encuestas_qualtrics(config, autoservicio_rows, logger)
+                    enviar_reporte_encuestas(
+                        config,
+                        total_autoservicio=len(autoservicio_rows),
+                        enviadas=surveys_sent,
+                        sin_correo=surveys_without_email,
+                        date_mode=date_mode,
+                        logger=logger,
+                    )
                 if write_autoservicio:
                     path = write_output(autoservicio_rows, config.output_dir, "GNS_IVR_Full_Autoservicio", config.output_format, logger)
                     if path:

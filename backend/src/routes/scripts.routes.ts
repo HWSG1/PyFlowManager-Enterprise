@@ -337,6 +337,7 @@ router.get('/:id/parameters', async (req, res, next) => {
 
       const hasParam = (key: string) => rows.some((row: any) => row.param_key === key);
       const baseId = rows.length ? Math.max(...rows.map((row: any) => Number(row.id) || 0)) + 1 : 1;
+      let syntheticId = baseId;
       const forceGlobalParam = (key: string, label: string) => {
         const param = rows.find((row: any) => row.param_key === key);
         if (!param) return;
@@ -350,10 +351,67 @@ router.get('/:id/parameters', async (req, res, next) => {
       forceGlobalParam('TOKEN_QUALTRICTS', 'Token Qualtrics');
       forceGlobalParam('POST_AUTOSERVICIO_QUALTRICTS_QA', 'Endpoint Qualtrics');
       forceGlobalParam('POST_AUTOSERVICIO_QUALTRICTS_IVR', 'Endpoint Qualtrics');
+      forceGlobalParam('SMTP_HOST', 'SMTP Host');
+      forceGlobalParam('SMTP_PORT', 'SMTP Port');
+      forceGlobalParam('SMTP_USER', 'SMTP Usuario');
+      forceGlobalParam('SMTP_PASSWORD', 'SMTP Password');
+      forceGlobalParam('SMTP_FROM', 'SMTP Remitente');
+      forceGlobalParam('SMTP_USE_TLS', 'SMTP Usar TLS');
+
+      const addGlobalIfMissing = (key: string, label: string, required = false, secret = false) => {
+        if (hasParam(key)) return;
+
+        rows.push({
+          id: syntheticId++,
+          script_id: scriptId,
+          param_key: key,
+          param_value: '',
+          param_type: 'global',
+          control_type: 'global',
+          label,
+          options_json: null,
+          is_required: required,
+          is_secret: secret,
+          global_key: key,
+          script_name: 'GNS_IVR.py'
+        });
+      };
+
+      const addInputIfMissing = (
+        key: string,
+        label: string,
+        controlType = 'text',
+        defaultValue = '',
+        options: string[] | null = null
+      ) => {
+        const existing = rows.find((row: any) => row.param_key === key);
+        if (existing) {
+          existing.control_type = controlType;
+          existing.label = label;
+          if (options) {
+            existing.options_json = JSON.stringify(options);
+          }
+          return;
+        }
+
+        rows.push({
+          id: syntheticId++,
+          script_id: scriptId,
+          param_key: key,
+          param_value: defaultValue,
+          param_type: 'env',
+          control_type: controlType,
+          label,
+          options_json: options ? JSON.stringify(options) : null,
+          is_required: false,
+          global_key: null,
+          script_name: 'GNS_IVR.py'
+        });
+      };
 
       if (!hasParam('TOKEN_QUALTRICTS')) {
         rows.push({
-          id: baseId,
+          id: syntheticId++,
           script_id: scriptId,
           param_key: 'TOKEN_QUALTRICTS',
           param_value: '',
@@ -369,7 +427,7 @@ router.get('/:id/parameters', async (req, res, next) => {
 
       if (!hasParam('POST_AUTOSERVICIO_QUALTRICTS_IVR')) {
         rows.push({
-          id: baseId + 1,
+          id: syntheticId++,
           script_id: scriptId,
           param_key: 'POST_AUTOSERVICIO_QUALTRICTS_IVR',
           param_value: '',
@@ -382,6 +440,16 @@ router.get('/:id/parameters', async (req, res, next) => {
           script_name: 'GNS_IVR.py'
         });
       }
+
+      addGlobalIfMissing('SMTP_HOST', 'SMTP Host');
+      addGlobalIfMissing('SMTP_PORT', 'SMTP Port');
+      addGlobalIfMissing('SMTP_USER', 'SMTP Usuario');
+      addGlobalIfMissing('SMTP_PASSWORD', 'SMTP Password', false, true);
+      addGlobalIfMissing('SMTP_FROM', 'SMTP Remitente');
+      addGlobalIfMissing('SMTP_USE_TLS', 'SMTP Usar TLS');
+      addInputIfMissing('SURVEY_REPORT_EMAIL_TO', 'Destinatarios reporte encuestas', 'tags');
+      addInputIfMissing('SURVEY_REPORT_EMAIL_CC', 'Copias reporte encuestas', 'tags');
+      addInputIfMissing('SURVEY_REPORT_SUBJECT', 'Asunto reporte encuestas', 'text', 'Reporte de Encuesta de Satisfacción - Autoservicio');
     }
 
     res.json(rows);
