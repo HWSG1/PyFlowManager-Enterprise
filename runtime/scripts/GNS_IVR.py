@@ -824,7 +824,13 @@ def create_details_job(config: Config, token: str, start_dt: datetime, end_dt: d
         "orderBy": "conversationStart",
         "paging": {"pageSize": config.job_page_size},
         "segmentFilters": [
-            {"type": "or", "predicates": [{"dimension": "mediaType", "value": "voice"}]}
+            {
+                "type": "and",
+                "predicates": [
+                    {"dimension": "mediaType", "operator": "matches", "value": "voice"},
+                    {"dimension": "segmentType", "operator": "matches", "value": "ivr"},
+                ],
+            }
         ],
     }
     logger.info("Creando job conversations details | %s", body["interval"])
@@ -849,27 +855,53 @@ def fetch_conversation_details(config: Config, token: str, start_dt: datetime, e
     job_id = create_details_job(config, token, start_dt, end_dt, logger)
     all_conversations: List[Dict[str, Any]] = []
     cursor = ""
-    for attempt in range(1, config.max_poll_attempts + 1):
+    empty_attempts = 0
+    page_number = 0
+
+    while True:
         data = get_job_results_page(config, token, job_id, cursor, logger)
         conversations = data.get("conversations") or []
-        next_cursor = data.get("cursor") or ""
+        next_cursor = str(data.get("cursor") or "").strip()
+
         if conversations:
+            page_number += 1
+            empty_attempts = 0
             all_conversations.extend(conversations)
-            logger.info("Página job recibida | conversaciones: %s | acumulado: %s", len(conversations), len(all_conversations))
+            logger.info(
+                "Pagina job %s recibida | conversaciones: %s | acumulado: %s | cursor siguiente: %s",
+                page_number,
+                len(conversations),
+                len(all_conversations),
+                "si" if next_cursor else "no",
+            )
         else:
-            logger.info("Job sin conversaciones todavía | intento %s/%s", attempt, config.max_poll_attempts)
+            empty_attempts += 1
+            logger.info("Job sin conversaciones todavia | intento espera %s/%s", empty_attempts, config.max_poll_attempts)
+
         if config.max_conversations and len(all_conversations) >= config.max_conversations:
-            logger.warning("Se alcanzó MAX_CONVERSATIONS=%s. Se corta extracción.", config.max_conversations)
+            logger.warning("Se alcanzo MAX_CONVERSATIONS=%s. Se corta extraccion.", config.max_conversations)
             return all_conversations[:config.max_conversations]
+
         if next_cursor:
             cursor = next_cursor
             time.sleep(config.api_sleep_seconds)
             continue
-        if conversations or all_conversations:
-            break
-        time.sleep(config.poll_seconds)
-    return all_conversations
 
+        if all_conversations:
+            logger.info(
+                "Lectura de job completada | paginas: %s | conversaciones acumuladas: %s",
+                page_number,
+                len(all_conversations),
+            )
+            break
+
+        if empty_attempts >= config.max_poll_attempts:
+            logger.warning("Job sin conversaciones tras %s intentos de espera.", config.max_poll_attempts)
+            break
+
+        time.sleep(config.poll_seconds)
+
+    return all_conversations
 
 def fetch_divisions_lookup(config: Config, token: str, logger: logging.Logger) -> Dict[str, str]:
     url = f"{config.genesys_api_base}/api/v2/authorization/divisions?pageSize=500"
