@@ -36,10 +36,13 @@ import os
 import traceback
 import sys
 import time
+import faulthandler
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
+
+faulthandler.enable(all_threads=True)
 
 
 # =========================================================
@@ -335,6 +338,10 @@ def hana_connect(config: Config):
         raise RuntimeError(
             "No estÃ¡ instalado hdbcli. Ejecuta: pip install hdbcli"
         )
+    module_file = getattr(dbapi, "__file__", "<desconocido>")
+    print(f"[DIAG] Python executable: {sys.executable}", flush=True)
+    print(f"[DIAG] Python version: {sys.version}", flush=True)
+    print(f"[DIAG] hdbcli dbapi: {module_file}", flush=True)
     return dbapi.connect(
         address=config.HPR_HOST,
         port=config.HPR_PORT,

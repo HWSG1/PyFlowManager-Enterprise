@@ -332,7 +332,7 @@ if (!skipQueueCheck) {
     });
   });
 
-  child.on('close', async (code) => {
+  child.on('close', async (code, signal) => {
     const current = await pool.request()
       .input('execution_id', sql.Int, executionId)
       .query(`
@@ -359,10 +359,11 @@ if (!skipQueueCheck) {
     const exitCode = normalizeExitCode(code);
 
     const status = exitCode === 0 ? 'Exitoso' : 'Error';
+    const signalText = signal ? ` | señal ${signal}` : '';
     const tail = recentOutput.length
       ? ` | Últimas líneas: ${recentOutput.slice(-5).join(' || ')}`
       : '';
-    const msg = `Proceso finalizado con código ${exitCode}${exitCode === 0 ? '' : tail}`;
+    const msg = `Proceso finalizado con código ${exitCode}${exitCode === 0 ? '' : `${signalText}${tail}`}`;
 
     await addExecutionLog(
       executionId,
