@@ -458,69 +458,151 @@ def enviar_encuestas_qualtrics(config: Config, rows: List[Dict[str, Any]], logge
 
 def build_survey_report_html(total_autoservicio: int, enviadas: int, sin_correo: int, date_mode: str) -> str:
     porcentaje_envio = (enviadas / total_autoservicio * 100) if total_autoservicio else 0
-    porcentaje_sin_correo = (sin_correo / total_autoservicio * 100) if total_autoservicio else 0
-    enviados_width = max(0, min(100, porcentaje_envio))
-    sin_correo_width = max(0, min(100, porcentaje_sin_correo))
+    porcentaje_cobertura = max(0, min(100, porcentaje_envio))
+    now = datetime.now(ZoneInfo("America/Tegucigalpa"))
 
-    return f"""<!doctype html>
-<html>
-  <body style="margin:0;background:#eef2f7;font-family:Inter,Arial,sans-serif;color:#17324d;">
-    <div style="max-width:640px;margin:0 auto;background:#ffffff;border-radius:10px;overflow:hidden;border:1px solid #dbe3ef;">
-      <div style="background:#4f46e5;color:#ffffff;padding:30px;">
-        <div style="font-size:12px;letter-spacing:4px;font-weight:700;text-transform:uppercase;">Reporte de cobertura y envío</div>
-        <h1 style="margin:12px 0 0;font-size:24px;line-height:1.2;">Encuesta de Satisfacción - Autoservicio</h1>
-        <p style="margin:12px 0 0;font-size:14px;color:#e0e7ff;">Resumen ejecutivo de clientes identificados y envíos realizados.</p>
-      </div>
-
-      <div style="padding:30px;">
-        <p style="font-size:15px;line-height:1.7;margin:0 0 18px;">Estimado equipo,</p>
-        <p style="font-size:15px;line-height:1.7;margin:0 0 24px;">
-          Les compartimos el reporte consolidado de los clientes identificados tras la última campaña de encuestas
-          para el canal de <b>Autoservicio</b>. Las encuestas fueron enviadas exclusivamente a clientes con correo
-          electrónico válido registrado.
-        </p>
-
-        <div style="display:flex;gap:18px;margin-bottom:24px;">
-          <div style="flex:1;border:1px solid #dbe3ef;background:#f8fafc;border-radius:10px;padding:22px;text-align:center;">
-            <div style="font-size:12px;letter-spacing:1.5px;text-transform:uppercase;font-weight:700;color:#475569;">Clientes autoservicio</div>
-            <div style="font-size:34px;font-weight:800;margin-top:10px;color:#17324d;">{total_autoservicio:,}</div>
-            <div style="font-size:12px;color:#64748b;margin-top:4px;">Identificados en total</div>
-          </div>
-          <div style="flex:1;border:1px solid #bbf7d0;background:#f0fdf4;border-radius:10px;padding:22px;text-align:center;">
-            <div style="font-size:12px;letter-spacing:1.5px;text-transform:uppercase;font-weight:700;color:#047857;">Envíos realizados</div>
-            <div style="font-size:34px;font-weight:800;margin-top:10px;color:#047857;">{enviadas:,}</div>
-            <div style="font-size:12px;color:#047857;margin-top:4px;">{porcentaje_envio:.1f}% con correo válido</div>
-          </div>
-        </div>
-
-        <div style="border:1px solid #e2e8f0;background:#fafafa;border-radius:10px;padding:22px;">
-          <h2 style="font-size:15px;margin:0 0 20px;letter-spacing:.5px;text-transform:uppercase;">Distribución de contacto</h2>
-          <div style="font-size:14px;margin-bottom:10px;">
-            <b style="color:#047857;">✓ Con correo registrado:</b>
-            <span style="color:#475569;"> Encuestas enviadas</span>
-            <b style="float:right;color:#17324d;">{enviadas:,} <span style="font-weight:400;color:#64748b;">({porcentaje_envio:.1f}%)</span></b>
-          </div>
-          <div style="height:8px;background:#fee2e2;border-radius:999px;overflow:hidden;margin-bottom:18px;">
-            <div style="height:8px;width:{enviados_width:.1f}%;background:#22c55e;"></div>
-          </div>
-          <div style="font-size:14px;margin-bottom:10px;">
-            <b style="color:#b91c1c;">✕ Sin correo registrado:</b>
-            <span style="color:#475569;"> Excluidos de este canal digital</span>
-            <b style="float:right;color:#17324d;">{sin_correo:,} <span style="font-weight:400;color:#64748b;">({porcentaje_sin_correo:.1f}%)</span></b>
-          </div>
-          <div style="height:8px;background:#e2e8f0;border-radius:999px;overflow:hidden;">
-            <div style="height:8px;width:{sin_correo_width:.1f}%;background:#ef4444;"></div>
-          </div>
-        </div>
-
-        <div style="margin-top:24px;border-left:4px solid #4f46e5;padding-left:14px;color:#475569;font-size:13px;line-height:1.6;">
-          <b>Nota del envío:</b> los clientes identificados sin correo electrónico quedan mapeados para ser contactados
-          mediante canales alternativos. Periodo procesado: {escape(date_mode)}.
-        </div>
-      </div>
-    </div>
-  </body>
+    template = """<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" lang="es">
+<head>
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Resumen de Encuestas Enviadas</title>
+</head>
+<body style="margin: 0; padding: 0; width: 100% !important; -webkit-text-size-adjust: 100%; -ms-text-size-adjust: 100%; background-color: #f8fafc; font-family: 'NeoSans STD', 'Segoe UI', Arial, sans-serif;">
+  <table width="100%" border="0" cellspacing="0" cellpadding="0" style="background-color: #f8fafc; padding: 40px 10px;">
+    <tr>
+      <td align="center" valign="top">
+        <table width="100%" max-width="650" border="0" cellspacing="0" cellpadding="0" style="max-width: 650px; width: 100%; background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05); border: 1px solid #e2e8f0;">
+          <tr>
+            <td align="left" valign="top" style="background-color: #DA282D; padding: 40px 40px 35px 40px;">
+              <table width="100%" border="0" cellspacing="0" cellpadding="0">
+                <tr>
+                  <td valign="middle">
+                    <span style="font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 1.5px; color: #fecaca; display: block; margin-bottom: 6px;">SISTEMA DE MONITOREO DE PROCESOS</span>
+                    <h1 style="margin: 0; font-size: 24px; font-weight: 700; line-height: 1.2; color: #ffffff; letter-spacing: -0.5px;">Resumen de Encuestas Enviadas</h1>
+                    <p style="margin: 8px 0 0 0; font-size: 13px; color: #fecaca; opacity: 0.95;">Reporte automático generado por PyFlow Manager</p>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding: 40px;">
+              <table width="100%" border="0" cellspacing="0" cellpadding="0">
+                <tr>
+                  <td style="font-size: 14px; line-height: 1.6; color: #334155; padding-bottom: 30px;">
+                    <p style="margin: 0 0 10px 0;">Estimado equipo de operaciones,</p>
+                    <p style="margin: 0;">Se ha completado con éxito la ejecución programada para el envío de encuestas de satisfacción. A continuación, se presenta el consolidado de las estadísticas de cobertura obtenidas en este ciclo:</p>
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding-bottom: 30px;">
+                    <table width="100%" border="0" cellspacing="0" cellpadding="0">
+                      <tr>
+                        <td width="48%" valign="top" style="background-color: #f1f5f9; border-radius: 6px; padding: 20px; border: 1px solid #e2e8f0; text-align: left;">
+                          <span style="font-size: 11px; font-weight: 700; color: #64748b; text-transform: uppercase; letter-spacing: 0.5px; display: block; margin-bottom: 8px;">Clientes Identificados</span>
+                          <span style="font-size: 26px; font-weight: 700; color: #1e293b; display: block;">{{TOTAL_CLIENTES}}</span>
+                          <span style="font-size: 11px; color: #94a3b8; display: block; margin-top: 4px;">Población objetivo</span>
+                        </td>
+                        <td width="4%">&nbsp;</td>
+                        <td width="48%" valign="top" style="background-color: #f1f5f9; border-radius: 6px; padding: 20px; border: 1px solid #e2e8f0; text-align: left;">
+                          <span style="font-size: 11px; font-weight: 700; color: #DA282D; text-transform: uppercase; letter-spacing: 0.5px; display: block; margin-bottom: 8px;">Encuestas Enviadas</span>
+                          <span style="font-size: 26px; font-weight: 700; color: #DA282D; display: block;">{{ENCUESTAS_ENVIADAS}}</span>
+                          <span style="font-size: 11px; color: #94a3b8; display: block; margin-top: 4px;">Envíos efectivos</span>
+                        </td>
+                      </tr>
+                      <tr><td colspan="3" height="16"></td></tr>
+                      <tr>
+                        <td width="48%" valign="top" style="background-color: #f1f5f9; border-radius: 6px; padding: 20px; border: 1px solid #e2e8f0; text-align: left;">
+                          <span style="font-size: 11px; font-weight: 700; color: #64748b; text-transform: uppercase; letter-spacing: 0.5px; display: block; margin-bottom: 8px;">Sin Correo Válido</span>
+                          <span style="font-size: 26px; font-weight: 700; color: #475569; display: block;">{{SIN_CORREO}}</span>
+                          <span style="font-size: 11px; color: #94a3b8; display: block; margin-top: 4px;">Registros no procesados</span>
+                        </td>
+                        <td width="4%">&nbsp;</td>
+                        <td width="48%" valign="top" style="background-color: #fdf2f2; border-radius: 6px; padding: 20px; border: 1px solid #fee2e2; text-align: left;">
+                          <span style="font-size: 11px; font-weight: 700; color: #b91c1c; text-transform: uppercase; letter-spacing: 0.5px; display: block; margin-bottom: 8px;">Tasa de Cobertura</span>
+                          <span style="font-size: 26px; font-weight: 700; color: #b91c1c; display: block;">{{PORCENTAJE_COBERTURA}}%</span>
+                          <span style="font-size: 11px; color: #f87171; display: block; margin-top: 4px;">Porcentaje del total</span>
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+                <tr>
+                  <td style="background-color: #fafafa; border-radius: 6px; padding: 24px; border: 1px solid #f1f5f9; padding-bottom: 24px; margin-bottom: 30px;">
+                    <table width="100%" border="0" cellspacing="0" cellpadding="0">
+                      <tr>
+                        <td style="font-size: 12px; font-weight: 700; color: #475569; text-transform: uppercase; letter-spacing: 0.5px; padding-bottom: 8px;">Indicador Visual de Cobertura</td>
+                        <td align="right" style="font-size: 13px; font-weight: 700; color: #1e293b; padding-bottom: 8px;">{{PORCENTAJE_COBERTURA}}% Completado</td>
+                      </tr>
+                      <tr>
+                        <td colspan="2" style="padding-top: 4px;">
+                          <table width="100%" border="0" cellspacing="0" cellpadding="0" style="background-color: #e2e8f0; border-radius: 4px; overflow: hidden; height: 8px;">
+                            <tr>
+                              <td width="{{PORCENTAJE_COBERTURA}}%" style="background-color: #DA282D; height: 8px; border-radius: 4px 0 0 4px;"></td>
+                              <td style="background-color: #e2e8f0; height: 8px;"></td>
+                            </tr>
+                          </table>
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+                <tr><td height="25"></td></tr>
+                <tr>
+                  <td>
+                    <table width="100%" border="0" cellspacing="0" cellpadding="0" style="border-left: 3px solid #DA282D; padding-left: 16px;">
+                      <tr>
+                        <td style="font-size: 13px; line-height: 1.5; color: #64748b; font-style: italic;">
+                          <strong>Nota de exclusión técnica:</strong> Los registros identificados sin una cuenta de correo electrónico válida asociada han sido automáticamente excluidos del envío a través de este canal para salvaguardar la reputación del dominio emisor y evitar rebotes innecesarios.
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+                <tr><td height="35"></td></tr>
+                <tr>
+                  <td style="border-top: 1px solid #f1f5f9; padding-top: 25px; font-size: 12px; color: #64748b; line-height: 1.6;">
+                    <table width="100%" border="0" cellspacing="0" cellpadding="0">
+                      <tr>
+                        <td valign="top" style="color: #64748b;">
+                          Fecha de ejecución: <strong>{{FECHA_EJECUCION}}</strong><br />
+                          Hora de ejecución: <strong>{{HORA_EJECUCION}}</strong>
+                        </td>
+                        <td align="right" valign="top" style="color: #475569;">
+                          Generado por:<br />
+                          <strong style="color: #1e293b;">PyFlow Manager</strong><br />
+                          <span style="font-size: 11px; color: #94a3b8;">Automatización de Reportes y Procesos</span>
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td align="center" style="background-color: #f1f5f9; padding: 20px; border-top: 1px solid #e2e8f0; font-size: 11px; color: #94a3b8; line-height: 1.4;">
+              Este es un correo automático generado por el módulo de reportería integrado en PyFlow Manager.<br />
+              Por favor, no respondas a este mensaje de manera directa.
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
 </html>"""
+
+    return (
+        template
+        .replace("{{TOTAL_CLIENTES}}", escape(f"{total_autoservicio:,}"))
+        .replace("{{ENCUESTAS_ENVIADAS}}", escape(f"{enviadas:,}"))
+        .replace("{{SIN_CORREO}}", escape(f"{sin_correo:,}"))
+        .replace("{{PORCENTAJE_COBERTURA}}", escape(f"{porcentaje_cobertura:.1f}"))
+        .replace("{{FECHA_EJECUCION}}", escape(now.strftime("%d/%m/%Y")))
+        .replace("{{HORA_EJECUCION}}", escape(now.strftime("%I:%M %p")))
+    )
 
 
 def get_graph_access_token(config: Config, logger: logging.Logger) -> str:
