@@ -57,7 +57,6 @@ PYFLOW_PARAMS = {
 
     "START_DATE": {"type": "date", "label": "Fecha inicial local", "required": False},
     "END_DATE": {"type": "date", "label": "Fecha final local", "required": False},
-    "DATE": {"type": "date", "label": "Fecha específica local", "required": False},
     "GENESYS_TIMEZONE": {"type": "text", "label": "Zona horaria Genesys", "required": True, "default": "America/Tegucigalpa"},
 
     "OUTPUT_MODE": {
@@ -67,27 +66,19 @@ PYFLOW_PARAMS = {
         "options": ["solo_transcript", "transcript_campania"],
         "default": "solo_transcript"
     },
-    "CONVERSATION_ID": {"type": "text", "label": "Conversation ID específico", "required": False},
-    "USER_ID": {"type": "text", "label": "User ID del agente", "required": False},
-    "USER_NAME": {"type": "text", "label": "Nombre/correo del agente", "required": False},
-    "QUEUE_ID": {"type": "text", "label": "Queue ID", "required": False},
-    "QUEUE_NAME": {"type": "text", "label": "Nombre de cola", "required": False},
-    "CAMPAIGN_ID": {"type": "text", "label": "Campaign ID", "required": False},
-    "CAMPAIGN_NAME": {"type": "text", "label": "Nombre de campaña", "required": False},
-    "CONTACT_LIST_ID": {"type": "text", "label": "Contact List ID", "required": False},
-    "CONTACT_LIST_NAME": {"type": "text", "label": "Nombre lista de contacto", "required": False},
-    "WRAPUP_CODE_ID": {"type": "text", "label": "WrapUpCode ID opcional", "required": False},
+    "CONVERSATION_ID": {"type": "tags", "label": "Conversation ID específico", "required": False},
+    "USER_ID": {"type": "tags", "label": "User ID del agente", "required": False},
+    "USER_NAME": {"type": "tags", "label": "Nombre/correo del agente", "required": False},
+    "QUEUE_ID": {"type": "tags", "label": "Queue ID", "required": False},
+    "QUEUE_NAME": {"type": "tags", "label": "Nombre de cola", "required": False},
+    "CAMPAIGN_ID": {"type": "tags", "label": "Campaign ID", "required": False},
+    "CAMPAIGN_NAME": {"type": "tags", "label": "Nombre de campaña", "required": False},
+    "CONTACT_LIST_ID": {"type": "tags", "label": "Contact List ID", "required": False},
+    "CONTACT_LIST_NAME": {"type": "tags", "label": "Nombre lista de contacto", "required": False},
+    "WRAPUP_CODE_ID": {"type": "tags", "label": "WrapUpCode ID opcional", "required": False},
     "MAX_CONVERSATIONS": {"type": "number", "label": "Máximo conversaciones; vacío = todas", "required": False},
-    "PAGE_SIZE": {"type": "number", "label": "Tamaño página resultados Genesys", "required": False, "default": "500"},
-    "REQUEST_TIMEOUT": {"type": "number", "label": "Timeout HTTP segundos", "required": False, "default": "120"},
-    "MAX_RETRIES": {"type": "number", "label": "Reintentos HTTP", "required": False, "default": "5"},
-    "API_SLEEP_SECONDS": {"type": "number", "label": "Pausa entre requests", "required": False, "default": "1"},
-    "JOB_POLL_SECONDS": {"type": "number", "label": "Segundos entre consulta del job", "required": False, "default": "5"},
-    "JOB_MAX_POLLS": {"type": "number", "label": "Máximo intentos de espera del job", "required": False, "default": "120"},
     "OUTPUT_CSV": {"type": "text", "label": "Ruta CSV de salida", "required": False},
-    "SAVE_TRANSCRIPT_JSON": {"type": "select", "label": "Guardar JSON crudo de transcript", "required": True, "options": ["true", "false"], "default": "false"},
-    "JSON_OUTPUT_DIR": {"type": "text", "label": "Carpeta JSON opcional", "required": False},
-    "DRY_RUN": {"type": "select", "label": "Modo prueba sin CSV", "required": True, "options": ["true", "false"], "default": "false"}
+    "JSON_OUTPUT_DIR": {"type": "text", "label": "Carpeta JSON opcional", "required": False}
 }
 
 LOGGER_NAME = "gns_extractor_transcripciones_pyflow"
@@ -135,6 +126,33 @@ def env_bool(name: str, default: bool = False) -> bool:
     if not value:
         return default
     return value in ("1", "true", "yes", "y", "si", "sí")
+
+
+def split_filter_values(value: Any) -> List[str]:
+    """Acepta valores separados por ;, coma o salto de linea y elimina duplicados."""
+    if value is None:
+        return []
+
+    raw = str(value).replace("\r", "\n").replace(",", ";").replace("\n", ";")
+    result: List[str] = []
+
+    for item in raw.split(";"):
+        text = item.strip()
+        if text and text not in result:
+            result.append(text)
+
+    return result
+
+
+def join_filter_values(values: List[str]) -> str:
+    return ";".join([str(value).strip() for value in values if str(value).strip()])
+
+
+def filter_contains(value: str, allowed_values: str) -> bool:
+    items = split_filter_values(allowed_values)
+    if not items:
+        return True
+    return str(value or "") in items
 
 
 def normalize_genesys_domain(value: str) -> str:
@@ -417,61 +435,88 @@ def paged_get_entities(config: Config, token: str, logger: logging.Logger, path:
 
 def resolve_queue_id(config: Config, token: str, logger: logging.Logger) -> str:
     if config.queue_id:
-        return config.queue_id
+        return join_filter_values(split_filter_values(config.queue_id))
     if not config.queue_name:
         return ""
-    logger.info("Resolviendo Queue por nombre: %s", config.queue_name)
+
+    names = split_filter_values(config.queue_name)
+    logger.info("Resolviendo Queue por nombre: %s", ", ".join(names))
     queues = paged_get_entities(config, token, logger, "/api/v2/routing/queues")
-    found = find_first_by_name(queues, config.queue_name)
-    if not found:
-        raise ValueError(f"No se encontró cola con nombre: {config.queue_name}")
-    logger.info("Queue resuelta: %s -> %s", found.get("name"), found.get("id"))
-    return str(found.get("id") or "")
+    resolved: List[str] = []
+
+    for name in names:
+        found = find_first_by_name(queues, name)
+        if not found:
+            raise ValueError(f"No se encontró cola con nombre: {name}")
+        logger.info("Queue resuelta: %s -> %s", found.get("name"), found.get("id"))
+        resolved.append(str(found.get("id") or ""))
+
+    return join_filter_values(resolved)
 
 
 def resolve_user_id(config: Config, token: str, logger: logging.Logger) -> str:
     if config.user_id:
-        return config.user_id
+        return join_filter_values(split_filter_values(config.user_id))
     if not config.user_name:
         return ""
-    logger.info("Resolviendo usuario por nombre/correo: %s", config.user_name)
-    # La búsqueda de usuarios soporta q por nombre/correo en Genesys.
-    users = paged_get_entities(config, token, logger, "/api/v2/users", extra_query=f"q={requests.utils.quote(config.user_name)}")
-    found = find_first_by_name(users, config.user_name, ("name", "email", "username"))
-    if not found and users:
-        found = users[0]
-    if not found:
-        raise ValueError(f"No se encontró usuario con: {config.user_name}")
-    logger.info("Usuario resuelto: %s -> %s", found.get("name") or found.get("email"), found.get("id"))
-    return str(found.get("id") or "")
+
+    resolved: List[str] = []
+
+    for name in split_filter_values(config.user_name):
+        logger.info("Resolviendo usuario por nombre/correo: %s", name)
+        # La búsqueda de usuarios soporta q por nombre/correo en Genesys.
+        users = paged_get_entities(config, token, logger, "/api/v2/users", extra_query=f"q={requests.utils.quote(name)}")
+        found = find_first_by_name(users, name, ("name", "email", "username"))
+        if not found and users:
+            found = users[0]
+        if not found:
+            raise ValueError(f"No se encontró usuario con: {name}")
+        logger.info("Usuario resuelto: %s -> %s", found.get("name") or found.get("email"), found.get("id"))
+        resolved.append(str(found.get("id") or ""))
+
+    return join_filter_values(resolved)
 
 
 def resolve_campaign_id(config: Config, token: str, logger: logging.Logger) -> str:
     if config.campaign_id:
-        return config.campaign_id
+        return join_filter_values(split_filter_values(config.campaign_id))
     if not config.campaign_name:
         return ""
-    logger.info("Resolviendo campaña por nombre: %s", config.campaign_name)
+
+    names = split_filter_values(config.campaign_name)
+    logger.info("Resolviendo campaña por nombre: %s", ", ".join(names))
     campaigns = paged_get_entities(config, token, logger, "/api/v2/outbound/campaigns")
-    found = find_first_by_name(campaigns, config.campaign_name)
-    if not found:
-        raise ValueError(f"No se encontró campaña con nombre: {config.campaign_name}")
-    logger.info("Campaña resuelta: %s -> %s", found.get("name"), found.get("id"))
-    return str(found.get("id") or "")
+    resolved: List[str] = []
+
+    for name in names:
+        found = find_first_by_name(campaigns, name)
+        if not found:
+            raise ValueError(f"No se encontró campaña con nombre: {name}")
+        logger.info("Campaña resuelta: %s -> %s", found.get("name"), found.get("id"))
+        resolved.append(str(found.get("id") or ""))
+
+    return join_filter_values(resolved)
 
 
 def resolve_contact_list_id(config: Config, token: str, logger: logging.Logger) -> str:
     if config.contact_list_id:
-        return config.contact_list_id
+        return join_filter_values(split_filter_values(config.contact_list_id))
     if not config.contact_list_name:
         return ""
-    logger.info("Resolviendo lista de contacto por nombre: %s", config.contact_list_name)
+
+    names = split_filter_values(config.contact_list_name)
+    logger.info("Resolviendo lista de contacto por nombre: %s", ", ".join(names))
     lists = paged_get_entities(config, token, logger, "/api/v2/outbound/contactlists")
-    found = find_first_by_name(lists, config.contact_list_name)
-    if not found:
-        raise ValueError(f"No se encontró lista de contacto con nombre: {config.contact_list_name}")
-    logger.info("Lista de contacto resuelta: %s -> %s", found.get("name"), found.get("id"))
-    return str(found.get("id") or "")
+    resolved: List[str] = []
+
+    for name in names:
+        found = find_first_by_name(lists, name)
+        if not found:
+            raise ValueError(f"No se encontró lista de contacto con nombre: {name}")
+        logger.info("Lista de contacto resuelta: %s -> %s", found.get("name"), found.get("id"))
+        resolved.append(str(found.get("id") or ""))
+
+    return join_filter_values(resolved)
 
 
 def apply_resolved_filters(config: Config, token: str, logger: logging.Logger) -> Config:
@@ -507,6 +552,17 @@ def build_predicate(dimension: str, value: str, operator: str = "matches") -> Di
     return pred
 
 
+def build_dimension_filter(dimension: str, values: str, operator: str = "matches") -> Optional[Dict[str, Any]]:
+    items = split_filter_values(values)
+    if not items:
+        return None
+
+    return {
+        "type": "or" if len(items) > 1 else "and",
+        "predicates": [build_predicate(dimension, item, operator) for item in items],
+    }
+
+
 def build_details_job_body(start_utc: str, end_utc: str, config: Config) -> Dict[str, Any]:
     """Construye el job de Analytics Details con filtros seguros.
 
@@ -514,32 +570,29 @@ def build_details_job_body(start_utc: str, end_utc: str, config: Config) -> Dict
     Además del filtro en el job, se hace una validación posterior por atributos
     para campaña/lista cuando esos datos vienen en participantes Dialer.
     """
-    predicates = [build_predicate("mediaType", "voice", "matches")]
+    segment_filters: List[Dict[str, Any]] = [
+        {
+            "type": "and",
+            "predicates": [build_predicate("mediaType", "voice", "matches")],
+        }
+    ]
 
-    if config.wrapup_code_id:
-        predicates.append(build_predicate("wrapUpCode", config.wrapup_code_id, "matches"))
-    if config.queue_id:
-        predicates.append(build_predicate("queueId", config.queue_id, "matches"))
-    if config.user_id:
-        predicates.append(build_predicate("userId", config.user_id, "matches"))
-    if config.campaign_id:
-        predicates.append(build_predicate("outboundCampaignId", config.campaign_id, "matches"))
-    if config.contact_list_id:
-        # Este filtro debe viajar en el job para no traer todas las conversaciones
-        # del rango. Si Genesys no lo soporta en el tenant/región, la API devolverá
-        # error y se debe ajustar la dimensión según la respuesta.
-        predicates.append(build_predicate("outboundContactListId", config.contact_list_id, "matches"))
+    for dimension, values in (
+        ("wrapUpCode", config.wrapup_code_id),
+        ("queueId", config.queue_id),
+        ("userId", config.user_id),
+        ("outboundCampaignId", config.campaign_id),
+        ("outboundContactListId", config.contact_list_id),
+    ):
+        dimension_filter = build_dimension_filter(dimension, values)
+        if dimension_filter:
+            segment_filters.append(dimension_filter)
 
     return {
         "order": "asc",
         "orderBy": "conversationStart",
         "interval": f"{start_utc}/{end_utc}",
-        "segmentFilters": [
-            {
-                "type": "and",
-                "predicates": predicates,
-            }
-        ],
+        "segmentFilters": segment_filters,
     }
 
 
@@ -547,13 +600,13 @@ def conversation_matches_post_filters(conversation: Dict[str, Any], config: Conf
     """Filtro posterior para datos que pueden venir como atributos Dialer."""
     if config.conversation_id:
         cid = conversation.get("conversationId") or conversation.get("id")
-        if str(cid or "") != config.conversation_id:
+        if not filter_contains(str(cid or ""), config.conversation_id):
             return False
 
     dialer = extract_dialer_attributes(conversation)
-    if config.campaign_id and dialer.get("CampaignId") != config.campaign_id:
+    if config.campaign_id and not filter_contains(dialer.get("CampaignId", ""), config.campaign_id):
         return False
-    if config.contact_list_id and dialer.get("ContactListId") != config.contact_list_id:
+    if config.contact_list_id and not filter_contains(dialer.get("ContactListId", ""), config.contact_list_id):
         return False
 
     return True
@@ -798,9 +851,9 @@ def main() -> int:
         logger.info("INICIO EXTRACTOR DE TRANSCRIPCIONES")
         log_params(logger, [
             "GENESYS_CLIENT_ID", "GENESYS_CLIENT_SECRET", "GENESYS_REGION", "START_DATE", "END_DATE",
-            "DATE", "OUTPUT_MODE", "CONVERSATION_ID", "USER_ID", "USER_NAME",
+            "OUTPUT_MODE", "CONVERSATION_ID", "USER_ID", "USER_NAME",
             "QUEUE_ID", "QUEUE_NAME", "CAMPAIGN_ID", "CAMPAIGN_NAME", "CONTACT_LIST_ID", "CONTACT_LIST_NAME",
-            "WRAPUP_CODE_ID", "MAX_CONVERSATIONS", "OUTPUT_CSV", "DRY_RUN"
+            "WRAPUP_CODE_ID", "MAX_CONVERSATIONS", "OUTPUT_CSV"
         ])
         logger.info("Modo fecha: %s", date_mode)
         logger.info("Intervalo Genesys: %s/%s", start_utc, end_utc)
@@ -811,8 +864,12 @@ def main() -> int:
         config = apply_resolved_filters(config, token, logger)
         validate_filter_safety(config, logger)
 
-        if config.conversation_id:
-            conversations = [fetch_conversation_details_by_id(config, token, config.conversation_id, logger)]
+        conversation_ids = split_filter_values(config.conversation_id)
+        if conversation_ids:
+            conversations = [
+                fetch_conversation_details_by_id(config, token, conversation_id, logger)
+                for conversation_id in conversation_ids
+            ]
         else:
             job_id = create_conversation_details_job(config, token, start_utc, end_utc, logger)
             wait_details_job(config, token, job_id, logger)
@@ -836,7 +893,7 @@ def main() -> int:
             contact_flat: Dict[str, Any] = {}
             if config.output_mode == "transcript_campania":
                 try:
-                    contact_list_for_lookup = dialer_attrs.get("ContactListId", "") or config.contact_list_id
+                    contact_list_for_lookup = dialer_attrs.get("ContactListId", "") or (split_filter_values(config.contact_list_id)[:1] or [""])[0]
                     contact = fetch_contact_from_genesys(config, token, contact_list_for_lookup, dialer_attrs.get("ContactId", ""), logger)
                     contact_flat = flatten_contact_data(contact)
                 except Exception as exc:

@@ -261,11 +261,47 @@ router.get('/:id/parameters', async (req, res, next) => {
               'QUALTRICS_DELAY_SECONDS'
             )
           )
+          AND (
+            s.name <> 'GNS_Extractor_Transcripciones.py'
+            OR sp.param_key NOT IN (
+              'DATE',
+              'PAGE_SIZE',
+              'REQUEST_TIMEOUT',
+              'MAX_RETRIES',
+              'API_SLEEP_SECONDS',
+              'JOB_POLL_SECONDS',
+              'JOB_MAX_POLLS',
+              'SAVE_TRANSCRIPT_JSON',
+              'DRY_RUN'
+            )
+          )
         ORDER BY sp.id
       `);
 
     const rows = result.recordset;
     const isGnsIvr = rows.some((row: any) => row.script_name === 'GNS_IVR.py');
+    const isTranscriptionExtractor = rows.some((row: any) => row.script_name === 'GNS_Extractor_Transcripciones.py');
+
+    if (isTranscriptionExtractor) {
+      const tagParams = new Set([
+        'CONVERSATION_ID',
+        'USER_ID',
+        'USER_NAME',
+        'QUEUE_ID',
+        'QUEUE_NAME',
+        'CAMPAIGN_ID',
+        'CAMPAIGN_NAME',
+        'CONTACT_LIST_ID',
+        'CONTACT_LIST_NAME',
+        'WRAPUP_CODE_ID'
+      ]);
+
+      for (const row of rows) {
+        if (tagParams.has(row.param_key)) {
+          row.control_type = 'tags';
+        }
+      }
+    }
 
     if (isGnsIvr) {
       const runMode = rows.find((row: any) => row.param_key === 'RUN_MODE');
