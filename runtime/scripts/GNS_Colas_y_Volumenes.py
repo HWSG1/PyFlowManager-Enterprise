@@ -58,14 +58,24 @@ import time
 import argparse
 import logging
 import traceback
+import csv
+import json
+import base64
+import mimetypes
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta
+from html import escape
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Tuple, Optional
 
 import requests
 from dotenv import load_dotenv
 from hdbcli import dbapi
+
+try:
+    import pandas as pd
+except Exception:
+    pd = None
 
 
 # =========================================================
@@ -88,19 +98,20 @@ PYFLOW_PARAMS = {
     "HANA_COLAS_TABLE": {"type": "text", "label": "Tabla catálogo colas", "required": True, "default": "GNS_API_COLAS"},
     "HANA_VOLUMEN_TABLE": {"type": "text", "label": "Tabla volumen colas", "required": True, "default": "GNS_API_VOLUMEN"},
     "RUN_MODE": {"type": "select", "label": "Modo ejecución", "required": True, "options": ["colas_y_volumenes", "solo_colas", "solo_volumenes"], "default": "colas_y_volumenes"},
-    "DATE": {"type": "date", "label": "Fecha específica local", "required": False},
     "START_DATE": {"type": "date", "label": "Fecha inicial local", "required": False},
     "END_DATE": {"type": "date", "label": "Fecha final local", "required": False},
-    "START_LOCAL": {"type": "text", "label": "Inicio local exacto", "required": False},
-    "END_LOCAL": {"type": "text", "label": "Fin local exacto", "required": False},
     "DAYS_BACK": {"type": "number", "label": "Días hacia atrás si no se indican fechas", "required": False, "default": "5"},
     "GENESYS_TIMEZONE": {"type": "text", "label": "Zona horaria Genesys", "required": True, "default": "America/Tegucigalpa"},
-    "QUEUE_PAGE_SIZE": {"type": "number", "label": "Tamaño página colas", "required": False, "default": "100"},
-    "HANA_BATCH_SIZE": {"type": "number", "label": "Filas por lote HANA", "required": False, "default": "1000"},
-    "REQUEST_TIMEOUT": {"type": "number", "label": "Timeout HTTP segundos", "required": False, "default": "120"},
-    "API_SLEEP_SECONDS": {"type": "number", "label": "Pausa entre requests", "required": False, "default": "2"},
-    "MAX_RETRIES": {"type": "number", "label": "Reintentos HTTP", "required": False, "default": "5"},
-    "DRY_RUN": {"type": "select", "label": "Modo prueba sin insertar", "required": True, "options": ["true", "false"], "default": "false"}
+    "REPORT_OUTPUT_FORMAT": {"type": "select", "label": "Generar archivo de reporte", "required": False, "options": ["csv", "xlsx"]},
+    "ATTACH_REPORT_FILE": {"type": "select", "label": "Adjuntar archivo al correo", "required": False, "options": ["false", "true"], "default": "false"},
+    "REPORT_OUTPUT_DIR": {"type": "text", "label": "Carpeta de salida del reporte", "required": False},
+    "GRAPH_TENANT_ID": {"type": "global", "global_key": "GRAPH_TENANT_ID", "label": "Microsoft Graph Tenant ID", "required": False},
+    "GRAPH_CLIENT_ID": {"type": "global", "global_key": "GRAPH_CLIENT_ID", "label": "Microsoft Graph Client ID", "required": False},
+    "GRAPH_CLIENT_SECRET": {"type": "global", "global_key": "GRAPH_CLIENT_SECRET", "label": "Microsoft Graph Client Secret", "required": False, "secret": True},
+    "GRAPH_SENDER_EMAIL": {"type": "global", "global_key": "GRAPH_SENDER_EMAIL", "label": "Correo remitente Graph", "required": False},
+    "QUEUE_VOLUME_REPORT_EMAIL_TO": {"type": "tags", "label": "Destinatarios reporte colas/volúmenes", "required": False},
+    "QUEUE_VOLUME_REPORT_EMAIL_CC": {"type": "tags", "label": "Copias reporte colas/volúmenes", "required": False},
+    "QUEUE_VOLUME_REPORT_SUBJECT": {"type": "text", "label": "Asunto reporte colas/volúmenes", "required": False, "default": "Reporte de Colas y Volúmenes"}
 }
 
 LOGGER_NAME = "gns_colas_volumenes_pyflow"
@@ -144,6 +155,24 @@ def env_bool(name: str, default: bool = False) -> bool:
     if not value:
         return default
     return value in ("1", "true", "yes", "y", "si", "sí")
+
+
+def split_list_value(value: Any) -> List[str]:
+    text = "" if value is None else str(value)
+    text = text.replace("\r", "\n").replace(",", ";").replace("\n", ";")
+    result: List[str] = []
+
+    for item in text.split(";"):
+        cleaned = item.strip()
+        if cleaned and cleaned not in result:
+            result.append(cleaned)
+
+    return result
+
+
+def pyflow_progress(value: int) -> None:
+    value = max(0, min(100, int(value)))
+    print(f"PYFLOW_PROGRESS={value}", flush=True)
 
 
 def normalize_genesys_domain(value: str) -> str:
@@ -196,6 +225,16 @@ class Config:
     request_timeout: int
     api_sleep_seconds: float
     max_retries: int
+    report_output_format: str
+    attach_report_file: bool
+    report_output_dir: str
+    graph_tenant_id: str
+    graph_client_id: str
+    graph_client_secret: str
+    graph_sender_email: str
+    queue_volume_report_email_to: List[str]
+    queue_volume_report_email_cc: List[str]
+    queue_volume_report_subject: str
 
 
 def setup_logger() -> logging.Logger:
@@ -274,6 +313,16 @@ def load_config() -> Config:
         request_timeout=env_int("REQUEST_TIMEOUT", 120),
         api_sleep_seconds=env_float("API_SLEEP_SECONDS", 2.0),
         max_retries=env_int("MAX_RETRIES", 5),
+        report_output_format=env_str("REPORT_OUTPUT_FORMAT", "").lower(),
+        attach_report_file=env_bool("ATTACH_REPORT_FILE", False),
+        report_output_dir=env_str("REPORT_OUTPUT_DIR", ""),
+        graph_tenant_id=env_str("GRAPH_TENANT_ID", ""),
+        graph_client_id=env_str("GRAPH_CLIENT_ID", ""),
+        graph_client_secret=env_str("GRAPH_CLIENT_SECRET", ""),
+        graph_sender_email=env_str("GRAPH_SENDER_EMAIL", ""),
+        queue_volume_report_email_to=split_list_value(env_str("QUEUE_VOLUME_REPORT_EMAIL_TO", "")),
+        queue_volume_report_email_cc=split_list_value(env_str("QUEUE_VOLUME_REPORT_EMAIL_CC", "")),
+        queue_volume_report_subject=env_str("QUEUE_VOLUME_REPORT_SUBJECT", "Reporte de Colas y Volúmenes"),
     )
 
 
@@ -762,6 +811,21 @@ def fetch_queues(config: Config, token: str, logger: logging.Logger) -> List[Dic
     return rows
 
 
+QUEUE_COLUMNS = [
+    "ID",
+    "QUEUE_NAME",
+    "DIVISION_ID",
+    "DIVISION_NAME",
+    "DATECREATED",
+    "CREATEDBY",
+    "CALL_SERVICELEVEL_DURATION",
+    "CHAT_SERVICELEVEL_DURATION",
+    "EMAIL_SERVICELEVEL_DURATION",
+    "MESAGGE_SERVICELEVEL_DURATION",
+    "FECHA_CARGA",
+]
+
+
 def run_colas(
     config: Config,
     token: str,
@@ -778,27 +842,13 @@ def run_colas(
         logger.warning("DRY RUN activo. No se cargará tabla de colas.")
         return rows, loaded, failed
 
-    columns = [
-        "ID",
-        "QUEUE_NAME",
-        "DIVISION_ID",
-        "DIVISION_NAME",
-        "DATECREATED",
-        "CREATEDBY",
-        "CALL_SERVICELEVEL_DURATION",
-        "CHAT_SERVICELEVEL_DURATION",
-        "EMAIL_SERVICELEVEL_DURATION",
-        "MESAGGE_SERVICELEVEL_DURATION",
-        "FECHA_CARGA",
-    ]
-
     # Para catálogo de colas conviene recargar completo.
     hana_delete_all(config, config.hana_colas_table, logger)
 
     loaded, failed = hana_insert_rows(
         config,
         config.hana_colas_table,
-        columns,
+        QUEUE_COLUMNS,
         rows,
         logger
     )
@@ -1139,12 +1189,14 @@ def run_volumenes(
     start_dt: datetime,
     end_dt: datetime,
     logger: logging.Logger,
-    dry_run: bool
-) -> Tuple[int, int, int, int]:
+    dry_run: bool,
+    progress_start: int = 45,
+    progress_end: int = 78
+) -> Tuple[int, int, int, int, List[Dict[str, Any]]]:
 
     if not queues:
         logger.warning("No hay colas disponibles para cruzar con volúmenes.")
-        return 0, 0, 0, 0
+        return 0, 0, 0, 0, []
 
     queue_lookup = build_queue_lookup(queues)
     intervals = build_12h_intervals(start_dt, end_dt)
@@ -1183,9 +1235,12 @@ def run_volumenes(
             logger.exception("Error procesando intervalo %s -> %s: %s", fmt_local(ini), fmt_local(fin), exc)
             time.sleep(max(config.api_sleep_seconds, 10))
 
+        progress = progress_start + int((idx / max(len(intervals), 1)) * (progress_end - progress_start))
+        pyflow_progress(progress)
+
     if dry_run:
         logger.warning("DRY RUN activo. No se cargará tabla de volúmenes.")
-        return len(all_rows), 0, 0, intervals_error
+        return len(all_rows), 0, 0, intervals_error, all_rows
 
     hana_delete_volume_range(
         config,
@@ -1202,7 +1257,266 @@ def run_volumenes(
         logger
     )
 
-    return len(all_rows), loaded, failed, intervals_error
+    return len(all_rows), loaded, failed, intervals_error, all_rows
+
+
+def output_directory(config: Config) -> str:
+    path = config.report_output_dir or os.getcwd()
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def write_report_file(
+    config: Config,
+    rows: List[Dict[str, Any]],
+    columns: List[str],
+    name: str,
+    logger: logging.Logger
+) -> Optional[str]:
+    report_format = (config.report_output_format or "").strip().lower()
+    if not report_format and config.attach_report_file:
+        report_format = "xlsx"
+    if not report_format:
+        return None
+
+    if report_format not in ("csv", "xlsx"):
+        logger.warning("REPORT_OUTPUT_FORMAT inválido: %s. No se generará archivo.", report_format)
+        return None
+
+    if not rows:
+        logger.warning("No hay filas para generar archivo %s.", name)
+        return None
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(output_directory(config), f"{name}_{ts}.{report_format}")
+
+    if report_format == "csv":
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=columns, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+    else:
+        if pd is None:
+            raise RuntimeError("Para generar Excel instala pandas y openpyxl: pip install pandas openpyxl")
+        pd.DataFrame(rows, columns=columns).to_excel(path, index=False)
+
+    logger.info("Archivo de reporte generado: %s | filas: %s", path, len(rows))
+    return path
+
+
+def build_file_attachment(path: str) -> Dict[str, str]:
+    content_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
+    with open(path, "rb") as f:
+        content = base64.b64encode(f.read()).decode("ascii")
+
+    return {
+        "@odata.type": "#microsoft.graph.fileAttachment",
+        "name": os.path.basename(path),
+        "contentType": content_type,
+        "contentBytes": content,
+    }
+
+
+def get_graph_access_token(config: Config, logger: logging.Logger) -> str:
+    if not config.graph_tenant_id or not config.graph_client_id or not config.graph_client_secret:
+        raise ValueError("Configura GRAPH_TENANT_ID, GRAPH_CLIENT_ID y GRAPH_CLIENT_SECRET para enviar el reporte por Microsoft Graph.")
+
+    url = f"https://login.microsoftonline.com/{config.graph_tenant_id}/oauth2/v2.0/token"
+    response = requests.post(
+        url,
+        data={
+            "client_id": config.graph_client_id,
+            "client_secret": config.graph_client_secret,
+            "scope": "https://graph.microsoft.com/.default",
+            "grant_type": "client_credentials",
+        },
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=30,
+    )
+
+    if response.status_code >= 400:
+        logger.error("Error obteniendo token Graph %s | %s", response.status_code, response.text[:1000])
+    response.raise_for_status()
+
+    token = response.json().get("access_token")
+    if not token:
+        raise RuntimeError("Microsoft Graph no devolvió access_token.")
+    return token
+
+
+def build_queue_volume_report_html(
+    total_queues: int,
+    queues_loaded: int,
+    queues_failed: int,
+    volume_rows: int,
+    volume_loaded: int,
+    volume_failed: int,
+    volume_interval_errors: int,
+    date_mode: str,
+    duration_seconds: float
+) -> str:
+    now = datetime.now(ZoneInfo("America/Tegucigalpa"))
+    coverage = (volume_loaded / volume_rows * 100) if volume_rows else 0
+    coverage = max(0, min(100, coverage))
+
+    return f"""<!doctype html>
+<html lang="es">
+<body style="margin:0;background:#f8fafc;font-family:'Segoe UI',Arial,sans-serif;color:#334155;">
+  <table width="100%" cellspacing="0" cellpadding="0" style="background:#f8fafc;padding:40px 10px;">
+    <tr>
+      <td align="center">
+        <table width="100%" cellspacing="0" cellpadding="0" style="max-width:650px;background:#ffffff;border:1px solid #e2e8f0;border-radius:8px;overflow:hidden;">
+          <tr>
+            <td style="background:#DA282D;padding:36px 40px;color:#ffffff;">
+              <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1.5px;color:#fecaca;">Sistema de monitoreo de procesos</div>
+              <h1 style="margin:8px 0 0;font-size:24px;line-height:1.2;">Reporte de Colas y Volúmenes</h1>
+              <p style="margin:8px 0 0;font-size:13px;color:#fecaca;">Reporte automático generado por PyFlow Manager</p>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:36px 40px;">
+              <p style="margin:0 0 24px;font-size:14px;line-height:1.6;">
+                Se ha completado la ejecución del proceso de colas y volúmenes. A continuación se presenta el resumen de carga para el periodo procesado.
+              </p>
+              <table width="100%" cellspacing="0" cellpadding="0">
+                <tr>
+                  <td width="48%" style="background:#f1f5f9;border:1px solid #e2e8f0;border-radius:6px;padding:20px;">
+                    <div style="font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;">Colas obtenidas</div>
+                    <div style="font-size:26px;font-weight:700;color:#1e293b;margin-top:8px;">{total_queues:,}</div>
+                    <div style="font-size:11px;color:#94a3b8;">Catálogo consultado</div>
+                  </td>
+                  <td width="4%">&nbsp;</td>
+                  <td width="48%" style="background:#f1f5f9;border:1px solid #e2e8f0;border-radius:6px;padding:20px;">
+                    <div style="font-size:11px;font-weight:700;color:#DA282D;text-transform:uppercase;">Filas volumen</div>
+                    <div style="font-size:26px;font-weight:700;color:#DA282D;margin-top:8px;">{volume_rows:,}</div>
+                    <div style="font-size:11px;color:#94a3b8;">Registros transformados</div>
+                  </td>
+                </tr>
+                <tr><td colspan="3" height="16"></td></tr>
+                <tr>
+                  <td width="48%" style="background:#f1f5f9;border:1px solid #e2e8f0;border-radius:6px;padding:20px;">
+                    <div style="font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;">Cargas HANA</div>
+                    <div style="font-size:22px;font-weight:700;color:#1e293b;margin-top:8px;">Colas {queues_loaded:,} / Volumen {volume_loaded:,}</div>
+                    <div style="font-size:11px;color:#94a3b8;">Registros cargados</div>
+                  </td>
+                  <td width="4%">&nbsp;</td>
+                  <td width="48%" style="background:#fdf2f2;border:1px solid #fee2e2;border-radius:6px;padding:20px;">
+                    <div style="font-size:11px;font-weight:700;color:#b91c1c;text-transform:uppercase;">Errores</div>
+                    <div style="font-size:22px;font-weight:700;color:#b91c1c;margin-top:8px;">{queues_failed + volume_failed + volume_interval_errors:,}</div>
+                    <div style="font-size:11px;color:#f87171;">Filas o intervalos con error</div>
+                  </td>
+                </tr>
+              </table>
+              <div style="margin-top:24px;background:#fafafa;border:1px solid #f1f5f9;border-radius:6px;padding:22px;">
+                <table width="100%" cellspacing="0" cellpadding="0">
+                  <tr>
+                    <td style="font-size:12px;font-weight:700;color:#475569;text-transform:uppercase;">Indicador de carga de volumen</td>
+                    <td align="right" style="font-size:13px;font-weight:700;color:#1e293b;">{coverage:.1f}%</td>
+                  </tr>
+                  <tr>
+                    <td colspan="2" style="padding-top:10px;">
+                      <table width="100%" cellspacing="0" cellpadding="0" style="background:#e2e8f0;height:8px;border-radius:4px;overflow:hidden;">
+                        <tr>
+                          <td width="{coverage:.1f}%" style="background:#DA282D;height:8px;"></td>
+                          <td style="background:#e2e8f0;height:8px;"></td>
+                        </tr>
+                      </table>
+                    </td>
+                  </tr>
+                </table>
+              </div>
+              <div style="margin-top:24px;border-left:3px solid #DA282D;padding-left:16px;font-size:13px;line-height:1.5;color:#64748b;">
+                <strong>Periodo:</strong> {escape(date_mode)}<br />
+                <strong>Duración:</strong> {duration_seconds:.2f} segundos
+              </div>
+              <div style="margin-top:28px;border-top:1px solid #f1f5f9;padding-top:22px;font-size:12px;color:#64748b;">
+                Fecha de ejecución: <strong>{escape(now.strftime("%d/%m/%Y"))}</strong><br />
+                Hora de ejecución: <strong>{escape(now.strftime("%I:%M %p"))}</strong>
+              </div>
+            </td>
+          </tr>
+          <tr>
+            <td align="center" style="background:#f1f5f9;padding:20px;border-top:1px solid #e2e8f0;font-size:11px;color:#94a3b8;">
+              Este es un correo automático generado por PyFlow Manager.
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>"""
+
+
+def enviar_reporte_colas_volumenes(
+    config: Config,
+    total_queues: int,
+    queues_loaded: int,
+    queues_failed: int,
+    volume_rows: int,
+    volume_loaded: int,
+    volume_failed: int,
+    volume_interval_errors: int,
+    date_mode: str,
+    duration_seconds: float,
+    report_files: List[str],
+    logger: logging.Logger
+) -> bool:
+    recipients = config.queue_volume_report_email_to
+    cc = config.queue_volume_report_email_cc
+
+    if not recipients:
+        logger.info("Reporte por correo no enviado: no hay destinatarios en QUEUE_VOLUME_REPORT_EMAIL_TO.")
+        return False
+    if not config.graph_sender_email:
+        logger.warning("Reporte por correo no enviado: configura GRAPH_SENDER_EMAIL.")
+        return False
+
+    html = build_queue_volume_report_html(
+        total_queues,
+        queues_loaded,
+        queues_failed,
+        volume_rows,
+        volume_loaded,
+        volume_failed,
+        volume_interval_errors,
+        date_mode,
+        duration_seconds
+    )
+
+    payload = {
+        "message": {
+            "subject": config.queue_volume_report_subject,
+            "body": {"contentType": "HTML", "content": html},
+            "toRecipients": [{"emailAddress": {"address": email}} for email in recipients],
+            "ccRecipients": [{"emailAddress": {"address": email}} for email in cc],
+        },
+        "saveToSentItems": "true",
+    }
+
+    if config.attach_report_file and report_files:
+        payload["message"]["attachments"] = [build_file_attachment(path) for path in report_files]
+    elif config.attach_report_file and not report_files:
+        logger.warning("Se solicitÃ³ adjuntar archivo, pero no se generÃ³ ningÃºn reporte para adjuntar.")
+
+    try:
+        token = get_graph_access_token(config, logger)
+        url = f"https://graph.microsoft.com/v1.0/users/{config.graph_sender_email}/sendMail"
+        response = requests.post(
+            url,
+            json=payload,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            timeout=30,
+        )
+
+        if response.status_code >= 400:
+            logger.error("Error enviando reporte Graph %s | %s", response.status_code, response.text[:1000])
+        response.raise_for_status()
+        logger.info("Reporte de colas/volúmenes enviado a: %s", ", ".join(recipients + cc))
+        return True
+    except Exception as exc:
+        logger.error("No se pudo enviar reporte de colas/volúmenes: %s", exc)
+        return False
 
 
 # =========================================================
@@ -1239,19 +1553,26 @@ def main() -> int:
     start_time = time.time()
 
     total_errors: List[str] = []
+    output_files: List[str] = []
+    date_mode = ""
+    config: Optional[Config] = None
 
     total_queues = 0
     queues_loaded = 0
     queues_failed = 0
+    queue_rows: List[Dict[str, Any]] = []
 
     volume_rows = 0
     volume_loaded = 0
     volume_failed = 0
     volume_interval_errors = 0
+    volume_report_rows: List[Dict[str, Any]] = []
 
     try:
+        pyflow_progress(2)
         config = load_config()
         start_dt, end_dt, date_mode = parse_dates(args, config.timezone_name)
+        pyflow_progress(5)
 
         logger.info("=" * 80)
         logger.info("INICIO PROCESO GNS COLAS Y VOLUMENES")
@@ -1267,6 +1588,7 @@ def main() -> int:
         logger.info("=" * 80)
 
         token = get_access_token(config, logger)
+        pyflow_progress(10)
 
         queues: List[Dict[str, Any]] = []
 
@@ -1283,25 +1605,43 @@ def main() -> int:
             )
 
             total_queues = len(queues)
+            queue_rows = queues
+            pyflow_progress(35)
 
         if args.solo_volumenes:
             queues = read_queues_from_hana(config, logger)
             total_queues = len(queues)
+            queue_rows = queues
+            pyflow_progress(35)
 
         if not args.solo_colas:
             logger.info("=" * 80)
             logger.info("PASO 2/2: CARGA DE VOLUMENES DE COLAS")
             logger.info("=" * 80)
 
-            volume_rows, volume_loaded, volume_failed, volume_interval_errors = run_volumenes(
+            volume_rows, volume_loaded, volume_failed, volume_interval_errors, volume_report_rows = run_volumenes(
                 config,
                 token,
                 queues,
                 start_dt,
                 end_dt,
                 logger,
-                args.dry_run
+                args.dry_run,
+                45,
+                78
             )
+        else:
+            pyflow_progress(78)
+
+        if config.report_output_format or config.attach_report_file:
+            queue_file = write_report_file(config, queue_rows, QUEUE_COLUMNS, "GNS_Colas", logger)
+            if queue_file:
+                output_files.append(queue_file)
+
+            volume_file = write_report_file(config, volume_report_rows, VOLUME_COLUMNS, "GNS_Volumen_Colas", logger)
+            if volume_file:
+                output_files.append(volume_file)
+        pyflow_progress(90)
 
     except Exception as exc:
         total_errors.append(str(exc))
@@ -1319,6 +1659,9 @@ def main() -> int:
     logger.info("Filas volumen cargadas: %s", volume_loaded)
     logger.info("Filas volumen fallidas: %s", volume_failed)
     logger.info("Intervalos volumen con error: %s", volume_interval_errors)
+    logger.info("Archivos generados: %s", len(output_files))
+    for path in output_files:
+        logger.info("Archivo: %s", path)
     logger.info("Errores generales: %s", len(total_errors))
 
     for err in total_errors[:20]:
@@ -1326,6 +1669,24 @@ def main() -> int:
 
     logger.info("Duración total: %.2f segundos", duration)
     logger.info("=" * 80)
+
+    if config:
+        enviar_reporte_colas_volumenes(
+            config,
+            total_queues,
+            queues_loaded,
+            queues_failed,
+            volume_rows,
+            volume_loaded,
+            volume_failed,
+            volume_interval_errors,
+            date_mode,
+            duration,
+            output_files,
+            logger
+        )
+
+    pyflow_progress(100)
 
     if total_errors or queues_failed or volume_failed or volume_interval_errors:
         return 1

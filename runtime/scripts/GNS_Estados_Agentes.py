@@ -45,6 +45,8 @@ Notas importantes
 """
 
 import csv
+import base64
+import mimetypes
 import math
 import os
 import sys
@@ -52,10 +54,16 @@ import time
 import traceback
 import re
 from datetime import datetime, date, time as dt_time, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Tuple
+from html import escape
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import requests
+
+try:
+    import pandas as pd
+except Exception:
+    pd = None
 
 
 PYFLOW_PARAMS = {
@@ -156,36 +164,39 @@ PYFLOW_PARAMS = {
         "options": ["PT30M", "PT15M", "PT1H"],
         "default": "PT30M"
     },
-    "BATCH_SIZE_USERS": {
-        "type": "number",
-        "label": "Usuarios por consulta Genesys",
-        "required": False,
-        "default": "50"
-    },
     "MAX_USERS": {
         "type": "number",
         "label": "Máximo usuarios para prueba; vacío = todos",
         "required": False
     },
-    "DRY_RUN": {
+    "REPORT_OUTPUT_FORMAT": {
         "type": "select",
-        "label": "Modo prueba sin insertar en HANA",
-        "required": True,
-        "options": ["true", "false"],
-        "default": "true"
+        "label": "Generar archivo de reporte",
+        "required": False,
+        "options": ["csv", "xlsx"]
     },
-    "OUTPUT_CSV": {
+    "ATTACH_REPORT_FILE": {
+        "type": "select",
+        "label": "Adjuntar archivo al correo",
+        "required": False,
+        "options": ["false", "true"],
+        "default": "false"
+    },
+    "REPORT_OUTPUT_DIR": {
         "type": "text",
-        "label": "Ruta CSV opcional para salida",
+        "label": "Carpeta de salida del reporte",
         "required": False
     },
-    "REQUEST_TIMEOUT_SECONDS": {
-        "type": "number",
-        "label": "Timeout HTTP segundos",
-        "required": False,
-        "default": "60"
-    }
+    "GRAPH_TENANT_ID": {"type": "global", "global_key": "GRAPH_TENANT_ID", "label": "Microsoft Graph Tenant ID", "required": False},
+    "GRAPH_CLIENT_ID": {"type": "global", "global_key": "GRAPH_CLIENT_ID", "label": "Microsoft Graph Client ID", "required": False},
+    "GRAPH_CLIENT_SECRET": {"type": "global", "global_key": "GRAPH_CLIENT_SECRET", "label": "Microsoft Graph Client Secret", "required": False, "secret": True},
+    "GRAPH_SENDER_EMAIL": {"type": "global", "global_key": "GRAPH_SENDER_EMAIL", "label": "Correo remitente Graph", "required": False},
+    "AGENT_STATUS_REPORT_EMAIL_TO": {"type": "tags", "label": "Destinatarios reporte estados", "required": False},
+    "AGENT_STATUS_REPORT_EMAIL_CC": {"type": "tags", "label": "Copias reporte estados", "required": False},
+    "AGENT_STATUS_REPORT_SUBJECT": {"type": "text", "label": "Asunto reporte estados", "required": False, "default": "Reporte de Estados de Agentes Genesys"}
 }
+
+STATUS_COLUMNS = ["CONCAT", "USERID", "STARTTIME", "INTERVAL", "METRIC", "QUALIFIER", "SUM", "ID", "TYPE", "LANGUAGELABELS", "SYSTEMPRESENCE", "DIVISIONID", "FECHA", "HORA", "FECHA_CARGA"]
 
 
 def log(msg: str) -> None:
@@ -222,6 +233,22 @@ def env_bool(name: str, default: bool = False) -> bool:
     if not value:
         return default
     return value.lower() in ("1", "true", "yes", "si", "sí", "y")
+
+
+def split_list_value(value: Any) -> List[str]:
+    text = "" if value is None else str(value)
+    text = text.replace("\r", "\n").replace(",", ";").replace("\n", ";")
+    result: List[str] = []
+    for item in text.split(";"):
+        cleaned = item.strip()
+        if cleaned and cleaned not in result:
+            result.append(cleaned)
+    return result
+
+
+def pyflow_progress(value: int) -> None:
+    value = max(0, min(100, int(value)))
+    print(f"PYFLOW_PROGRESS={value}", flush=True)
 
 
 def require_env(name: str) -> str:
@@ -510,7 +537,17 @@ def flatten_analytics_response(payload: Dict[str, Any], presence_map: Dict[str, 
     return rows
 
 
-def fetch_agent_status_rows(api_base_url: str, headers: Dict[str, str], user_ids: List[str], presence_map: Dict[str, Dict[str, str]], start_iso: str, end_iso: str, timeout: int) -> List[Dict[str, Any]]:
+def fetch_agent_status_rows(
+    api_base_url: str,
+    headers: Dict[str, str],
+    user_ids: List[str],
+    presence_map: Dict[str, Dict[str, str]],
+    start_iso: str,
+    end_iso: str,
+    timeout: int,
+    progress_start: int = 25,
+    progress_end: int = 75
+) -> List[Dict[str, Any]]:
     url = f"{api_base_url}/api/v2/analytics/users/aggregates/query"
     batch_size = env_int("BATCH_SIZE_USERS", 50)
     fecha_carga = datetime.now(ZoneInfo(env_str("TIMEZONE", "America/Tegucigalpa"))).date().isoformat()
@@ -523,6 +560,8 @@ def fetch_agent_status_rows(api_base_url: str, headers: Dict[str, str], user_ids
         rows = flatten_analytics_response(payload, presence_map, fecha_carga)
         all_rows.extend(rows)
         log(f"[INFO] Filas obtenidas batch {idx}: {len(rows)}")
+        progress = progress_start + int((idx / max(total_batches, 1)) * (progress_end - progress_start))
+        pyflow_progress(progress)
     return all_rows
 
 
@@ -540,12 +579,60 @@ def write_csv(rows: List[Dict[str, Any]], output_csv: str) -> None:
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
-    columns = ["CONCAT", "USERID", "STARTTIME", "INTERVAL", "METRIC", "QUALIFIER", "SUM", "ID", "TYPE", "LANGUAGELABELS", "SYSTEMPRESENCE", "DIVISIONID", "FECHA", "HORA", "FECHA_CARGA"]
+    columns = STATUS_COLUMNS
     with open(output_csv, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=columns)
         writer.writeheader()
         writer.writerows(rows)
     log(f"[INFO] CSV generado: {output_csv}")
+
+
+def output_directory() -> str:
+    path = env_str("REPORT_OUTPUT_DIR", "") or os.getcwd()
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def write_report_file(rows: List[Dict[str, Any]]) -> Optional[str]:
+    report_format = env_str("REPORT_OUTPUT_FORMAT", "").lower()
+    if not report_format and env_bool("ATTACH_REPORT_FILE", False):
+        report_format = "xlsx"
+    if not report_format:
+        return None
+    if report_format not in ("csv", "xlsx"):
+        log(f"[WARN] REPORT_OUTPUT_FORMAT invÃ¡lido: {report_format}. No se generarÃ¡ archivo.")
+        return None
+    if not rows:
+        log("[WARN] No hay filas para generar reporte de estados de agentes.")
+        return None
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(output_directory(), f"GNS_Estados_Agentes_{timestamp}.{report_format}")
+
+    if report_format == "csv":
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=STATUS_COLUMNS, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+    else:
+        if pd is None:
+            raise RuntimeError("Para generar Excel instala pandas y openpyxl: pip install pandas openpyxl")
+        pd.DataFrame(rows, columns=STATUS_COLUMNS).to_excel(path, index=False)
+
+    log(f"[INFO] Archivo de reporte generado: {path} | filas: {len(rows)}")
+    return path
+
+
+def build_file_attachment(path: str) -> Dict[str, str]:
+    content_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
+    with open(path, "rb") as f:
+        content = base64.b64encode(f.read()).decode("ascii")
+    return {
+        "@odata.type": "#microsoft.graph.fileAttachment",
+        "name": os.path.basename(path),
+        "contentType": content_type,
+        "contentBytes": content,
+    }
 
 
 def merge_rows_hana(conn, rows: List[Dict[str, Any]]) -> None:
@@ -556,7 +643,7 @@ def merge_rows_hana(conn, rows: List[Dict[str, Any]]) -> None:
     target_table = env_str("TARGET_TABLE", "GNS_API_USER_STATUS")
     validate_identifier(schema)
     validate_identifier(target_table)
-    columns = ["CONCAT", "USERID", "STARTTIME", "INTERVAL", "METRIC", "QUALIFIER", "SUM", "ID", "TYPE", "LANGUAGELABELS", "SYSTEMPRESENCE", "DIVISIONID", "FECHA", "HORA", "FECHA_CARGA"]
+    columns = STATUS_COLUMNS
     select_cols = ", ".join([f'? AS "{c}"' for c in columns])
     update_cols = ", ".join([f'T."{c}" = S."{c}"' for c in columns if c != "CONCAT"])
     insert_cols = ", ".join([f'"{c}"' for c in columns])
@@ -588,29 +675,172 @@ def merge_rows_hana(conn, rows: List[Dict[str, Any]]) -> None:
         cur.close()
 
 
+def get_graph_access_token(timeout: int) -> str:
+    tenant_id = env_str("GRAPH_TENANT_ID", "")
+    client_id = env_str("GRAPH_CLIENT_ID", "")
+    client_secret = env_str("GRAPH_CLIENT_SECRET", "")
+
+    if not tenant_id or not client_id or not client_secret:
+        raise RuntimeError("Configura GRAPH_TENANT_ID, GRAPH_CLIENT_ID y GRAPH_CLIENT_SECRET para enviar el reporte por Microsoft Graph.")
+
+    url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+    response = requests.post(
+        url,
+        data={
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "scope": "https://graph.microsoft.com/.default",
+            "grant_type": "client_credentials",
+        },
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=timeout,
+    )
+    if response.status_code >= 400:
+        log(f"[ERROR] Error obteniendo token Graph {response.status_code} | {response.text[:1000]}")
+    response.raise_for_status()
+    token = response.json().get("access_token")
+    if not token:
+        raise RuntimeError("Microsoft Graph no devolviÃ³ access_token.")
+    return token
+
+
+def build_agent_status_report_html(total_users: int, total_rows: int, loaded: bool, date_range: str, duration_seconds: float) -> str:
+    now = datetime.now(ZoneInfo(env_str("TIMEZONE", "America/Tegucigalpa")))
+    return f"""<!doctype html>
+<html lang="es">
+<body style="margin:0;background:#f8fafc;font-family:'Segoe UI',Arial,sans-serif;color:#334155;">
+  <table width="100%" cellspacing="0" cellpadding="0" style="background:#f8fafc;padding:40px 10px;">
+    <tr>
+      <td align="center">
+        <table width="100%" cellspacing="0" cellpadding="0" style="max-width:650px;background:#ffffff;border:1px solid #e2e8f0;border-radius:8px;overflow:hidden;">
+          <tr>
+            <td style="background:#DA282D;padding:36px 40px;color:#ffffff;">
+              <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1.5px;color:#fecaca;">Sistema de monitoreo de procesos</div>
+              <h1 style="margin:8px 0 0;font-size:24px;line-height:1.2;">Reporte de Estados de Agentes</h1>
+              <p style="margin:8px 0 0;font-size:13px;color:#fecaca;">Reporte automÃ¡tico generado por PyFlow Manager</p>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:36px 40px;">
+              <p style="margin:0 0 24px;font-size:14px;line-height:1.6;">Se ha completado la ejecuciÃ³n del proceso de estados de agentes. A continuaciÃ³n se presenta el resumen del periodo procesado.</p>
+              <table width="100%" cellspacing="0" cellpadding="0">
+                <tr>
+                  <td width="48%" style="background:#f1f5f9;border:1px solid #e2e8f0;border-radius:6px;padding:20px;">
+                    <div style="font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;">Usuarios consultados</div>
+                    <div style="font-size:26px;font-weight:700;color:#1e293b;margin-top:8px;">{total_users:,}</div>
+                    <div style="font-size:11px;color:#94a3b8;">Desde HANA espejo</div>
+                  </td>
+                  <td width="4%">&nbsp;</td>
+                  <td width="48%" style="background:#f1f5f9;border:1px solid #e2e8f0;border-radius:6px;padding:20px;">
+                    <div style="font-size:11px;font-weight:700;color:#DA282D;text-transform:uppercase;">Filas transformadas</div>
+                    <div style="font-size:26px;font-weight:700;color:#DA282D;margin-top:8px;">{total_rows:,}</div>
+                    <div style="font-size:11px;color:#94a3b8;">Registros obtenidos</div>
+                  </td>
+                </tr>
+              </table>
+              <div style="margin-top:24px;border-left:3px solid #DA282D;padding-left:16px;font-size:13px;line-height:1.5;color:#64748b;">
+                <strong>Periodo:</strong> {escape(date_range)}<br />
+                <strong>Carga HANA:</strong> {"Completada" if loaded else "No ejecutada"}<br />
+                <strong>DuraciÃ³n:</strong> {duration_seconds:.2f} segundos
+              </div>
+              <div style="margin-top:28px;border-top:1px solid #f1f5f9;padding-top:22px;font-size:12px;color:#64748b;">
+                Fecha de ejecuciÃ³n: <strong>{escape(now.strftime("%d/%m/%Y"))}</strong><br />
+                Hora de ejecuciÃ³n: <strong>{escape(now.strftime("%I:%M %p"))}</strong>
+              </div>
+            </td>
+          </tr>
+          <tr>
+            <td align="center" style="background:#f1f5f9;padding:20px;border-top:1px solid #e2e8f0;font-size:11px;color:#94a3b8;">Este es un correo automÃ¡tico generado por PyFlow Manager.</td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>"""
+
+
+def enviar_reporte_estados(total_users: int, total_rows: int, loaded: bool, date_range: str, duration_seconds: float, report_file: Optional[str], timeout: int) -> bool:
+    recipients = split_list_value(env_str("AGENT_STATUS_REPORT_EMAIL_TO", ""))
+    cc = split_list_value(env_str("AGENT_STATUS_REPORT_EMAIL_CC", ""))
+    sender = env_str("GRAPH_SENDER_EMAIL", "")
+
+    if not recipients:
+        log("[INFO] Reporte por correo no enviado: no hay destinatarios en AGENT_STATUS_REPORT_EMAIL_TO.")
+        return False
+    if not sender:
+        log("[WARN] Reporte por correo no enviado: configura GRAPH_SENDER_EMAIL.")
+        return False
+
+    payload = {
+        "message": {
+            "subject": env_str("AGENT_STATUS_REPORT_SUBJECT", "Reporte de Estados de Agentes Genesys"),
+            "body": {"contentType": "HTML", "content": build_agent_status_report_html(total_users, total_rows, loaded, date_range, duration_seconds)},
+            "toRecipients": [{"emailAddress": {"address": email}} for email in recipients],
+            "ccRecipients": [{"emailAddress": {"address": email}} for email in cc],
+        },
+        "saveToSentItems": "true",
+    }
+
+    if env_bool("ATTACH_REPORT_FILE", False) and report_file:
+        payload["message"]["attachments"] = [build_file_attachment(report_file)]
+    elif env_bool("ATTACH_REPORT_FILE", False) and not report_file:
+        log("[WARN] Se solicitÃ³ adjuntar archivo, pero no se generÃ³ ningÃºn reporte para adjuntar.")
+
+    try:
+        token = get_graph_access_token(timeout)
+        url = f"https://graph.microsoft.com/v1.0/users/{sender}/sendMail"
+        response = requests.post(
+            url,
+            json=payload,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            timeout=timeout,
+        )
+        if response.status_code >= 400:
+            log(f"[ERROR] Error enviando reporte Graph {response.status_code} | {response.text[:1000]}")
+        response.raise_for_status()
+        log(f"[INFO] Reporte de estados enviado a: {', '.join(recipients + cc)}")
+        return True
+    except Exception as exc:
+        log(f"[ERROR] No se pudo enviar reporte de estados: {exc}")
+        return False
+
+
 def main() -> int:
-    log("[INFO] Iniciando migración KNIME -> Python: GNS Estados de agentes")
+    start_time = time.time()
+    total_users = 0
+    total_rows = 0
+    hana_loaded = False
+    report_file: Optional[str] = None
+    date_range = ""
+
+    log("[INFO] Iniciando migracion KNIME -> Python: GNS Estados de agentes")
+    pyflow_progress(2)
     client_id = require_env("GENESYS_CLIENT_ID")
     client_secret = require_env("GENESYS_CLIENT_SECRET")
     region = require_env("GENESYS_REGION")
     timeout = env_int("REQUEST_TIMEOUT_SECONDS", 60)
     start_iso, end_iso, start_local, end_local = calculate_interval()
+    date_range = f"{start_local} -> {end_local}"
     log(f"[INFO] Intervalo local: {start_local} -> {end_local}")
     log(f"[INFO] Intervalo UTC Genesys: {start_iso}/{end_iso}")
     login_base_url, api_base_url = build_genesys_urls(region)
-    dry_run = env_bool("DRY_RUN", True)
-    output_csv = env_str("OUTPUT_CSV", "")
+    dry_run = False
     conn_read = None
     conn_write = None
+
     try:
+        pyflow_progress(5)
         token = get_genesys_token(login_base_url, client_id, client_secret, timeout)
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
         log("[INFO] Token Genesys obtenido correctamente.")
+        pyflow_progress(10)
 
-        # Toda lectura/SELECT a HANA se realiza contra el servidor espejo.
         conn_read = get_hana_connection_read()
         user_ids = fetch_user_ids(conn_read)
-        log(f"[INFO] Usuarios leídos desde HANA espejo: {len(user_ids)}")
+        total_users = len(user_ids)
+        log(f"[INFO] Usuarios leidos desde HANA espejo: {len(user_ids)}")
+        pyflow_progress(15)
         try:
             conn_read.close()
             conn_read = None
@@ -619,21 +849,24 @@ def main() -> int:
 
         if not user_ids:
             log("[WARN] No se encontraron usuarios en HANA espejo. Finalizando.")
+            pyflow_progress(100)
             return 0
+
         presence_map = fetch_presence_definitions(api_base_url, headers, timeout)
         log(f"[INFO] Definiciones de presencia obtenidas: {len(presence_map)}")
-        # Importante:
-        # Consultamos Genesys día por día, igual que el flujo KNIME.
-        # Esto evita variaciones cuando se solicita un rango de varios días en una sola llamada.
-        all_rows: List[Dict[str, Any]] = []
+        pyflow_progress(20)
 
+        all_rows: List[Dict[str, Any]] = []
         tz = ZoneInfo(env_str("TIMEZONE", "America/Tegucigalpa"))
         start_date_obj = datetime.strptime(start_local, "%Y-%m-%d").date()
         end_date_obj = datetime.strptime(end_local, "%Y-%m-%d").date()
+        windows = list(build_daily_windows(start_date_obj, end_date_obj, tz))
 
-        for day_start, day_end, day_start_iso, day_end_iso in build_daily_windows(start_date_obj, end_date_obj, tz):
-            log(f"[INFO] Procesando día local: {day_start} -> {day_end}")
-            log(f"[INFO] Intervalo UTC Genesys día: {day_start_iso}/{day_end_iso}")
+        for day_index, (day_start, day_end, day_start_iso, day_end_iso) in enumerate(windows, start=1):
+            log(f"[INFO] Procesando dia local: {day_start} -> {day_end}")
+            log(f"[INFO] Intervalo UTC Genesys dia: {day_start_iso}/{day_end_iso}")
+            segment_start = 20 + int(((day_index - 1) / max(len(windows), 1)) * 55)
+            segment_end = 20 + int((day_index / max(len(windows), 1)) * 55)
 
             day_rows = fetch_agent_status_rows(
                 api_base_url,
@@ -642,27 +875,34 @@ def main() -> int:
                 presence_map,
                 day_start_iso,
                 day_end_iso,
-                timeout
+                timeout,
+                segment_start,
+                segment_end,
             )
 
-            log(f"[INFO] Filas transformadas día {day_start}: {len(day_rows)}")
+            log(f"[INFO] Filas transformadas dia {day_start}: {len(day_rows)}")
             all_rows.extend(day_rows)
-
-            # Pausa corta para reducir variaciones por throttling/rate limit de Genesys.
             time.sleep(2)
 
         rows = all_rows
-
+        total_rows = len(rows)
         log(f"[INFO] Total filas transformadas: {len(rows)}")
-        if output_csv:
-            write_csv(rows, output_csv)
+
+        report_file = write_report_file(rows)
+        pyflow_progress(80)
+
         if dry_run:
-            log("[INFO] DRY_RUN=true. No se insertará información en HANA.")
+            log("[INFO] DRY_RUN=true. No se insertara informacion en HANA.")
             return 0
 
-        # Toda escritura/MERGE se realiza contra el servidor principal.
         conn_write = get_hana_connection_write()
         merge_rows_hana(conn_write, rows)
+        hana_loaded = True
+        pyflow_progress(92)
+
+        duration = time.time() - start_time
+        enviar_reporte_estados(total_users, total_rows, hana_loaded, date_range, duration, report_file, timeout)
+        pyflow_progress(100)
         log("[INFO] Proceso finalizado exitosamente.")
         return 0
     except Exception as exc:
@@ -676,7 +916,6 @@ def main() -> int:
                     conn.close()
                 except Exception:
                     pass
-
 
 if __name__ == "__main__":
     sys.exit(main())

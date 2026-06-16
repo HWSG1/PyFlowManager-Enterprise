@@ -26,8 +26,10 @@ import argparse
 import logging
 import traceback
 import re
+import calendar
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta, timezone
+from html import escape
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Tuple, Optional, Iterable
 
@@ -69,38 +71,32 @@ PYFLOW_PARAMS = {
         "label": "Modo de ejecucion",
         "required": True,
         "options": [
-            "cargar_hana",
-            "cargar_y_autoservicio",
-            "cargar_y_abandono",
-            "solo_autoservicio",
-            "solo_abandono",
-            "cargar_y_ambos",
-            "enviar_encuesta",
-            "cargar_hana_y_enviar_encuesta",
-            "todo"
+            "Cargar a SAP HANA",
+            "Análisis Autoservicio",
+            "Enviar de Encuestas Autoservicio",
+            "Análisis Abandono",
+            "HANA + Análisis Autoservicio",
+            "HANA + Envío de encuestas"
         ],
-        "default": "cargar_hana"
+        "default": "Cargar a SAP HANA"
     },
+    "START_DATE": {"type": "date", "label": "Fecha inicio", "required": False},
+    "END_DATE": {"type": "date", "label": "Fecha fin", "required": False},
     "DAYS_BACK": {"type": "number", "label": "Dias hacia atras si no se indican fechas", "required": False, "default": "1"},
     "PROCESS_BY_DAY": {"type": "select", "label": "Procesar dia por dia", "required": True, "options": ["true", "false"], "default": "true"},
-
     "DELETE_RANGE_BEFORE_LOAD": {"type": "select", "label": "Borrar rango antes de cargar IVR", "required": True, "options": ["true", "false"], "default": "true"},
-    "DRY_RUN": {"type": "select", "label": "Modo prueba sin escribir HANA", "required": True, "options": ["true", "false"], "default": "false"},
-
     "OUTPUT_DIR": {"type": "text", "label": "Carpeta de salida para Excel/CSV", "required": False},
     "OUTPUT_FORMAT": {"type": "select", "label": "Formato salida", "required": True, "options": ["xlsx", "csv"], "default": "xlsx"},
-
-    "ONLY_WITH_IVR": {"type": "select", "label": "Conservar solo conversaciones con IVR", "required": True, "options": ["true", "false"], "default": "true"},
-    "ENRICH_CLIENTS_FROM_HANA": {"type": "select", "label": "Enriquecer salidas con datos cliente desde HANA espejo", "required": True, "options": ["true", "false"], "default": "true"},
-    
-    "TOKEN_QUALTRICTS": {
-    "type": "global",
-    "global_key": "TOKEN_QUALTRICTS",
-    "label": "Token Qualtrics",
-    "required": True,
-    "secret": True}
+    "TOKEN_QUALTRICTS": {"type": "global", "global_key": "TOKEN_QUALTRICTS", "label": "Token Qualtrics", "required": True, "secret": True},
+    "POST_AUTOSERVICIO_QUALTRICTS_IVR": {"type": "global", "global_key": "POST_AUTOSERVICIO_QUALTRICTS_IVR", "label": "Endpoint Qualtrics", "required": True},
+    "GRAPH_TENANT_ID": {"type": "global", "global_key": "GRAPH_TENANT_ID", "label": "Microsoft Graph Tenant ID", "required": False},
+    "GRAPH_CLIENT_ID": {"type": "global", "global_key": "GRAPH_CLIENT_ID", "label": "Microsoft Graph Client ID", "required": False},
+    "GRAPH_CLIENT_SECRET": {"type": "global", "global_key": "GRAPH_CLIENT_SECRET", "label": "Microsoft Graph Client Secret", "required": False, "secret": True},
+    "GRAPH_SENDER_EMAIL": {"type": "global", "global_key": "GRAPH_SENDER_EMAIL", "label": "Correo remitente Graph", "required": False},
+    "SURVEY_REPORT_EMAIL_TO": {"type": "tags", "label": "Destinatarios reporte encuestas", "required": False},
+    "SURVEY_REPORT_EMAIL_CC": {"type": "tags", "label": "Copias reporte encuestas", "required": False},
+    "SURVEY_REPORT_SUBJECT": {"type": "text", "label": "Asunto reporte encuestas", "required": False, "default": "Reporte de Encuesta de Satisfacción - Autoservicio"}
 }
-
 LOGGER_NAME = "gns_ivr_pyflow"
 
 
@@ -201,6 +197,10 @@ def to_utc_z(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
+def local_day_start(d: date, tz: ZoneInfo) -> datetime:
+    return datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=tz)
+
+
 def parse_utc_z(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
@@ -236,6 +236,17 @@ def join_unique(values: Iterable[Any], sep: str = "|") -> str:
     return sep.join(seen)
 
 
+def split_list_value(value: Any) -> List[str]:
+    text = "" if value is None else str(value)
+    text = text.replace("\r", "\n").replace(",", ";").replace("\n", ";")
+    result: List[str] = []
+    for item in text.split(";"):
+        cleaned = item.strip()
+        if cleaned and cleaned not in result:
+            result.append(cleaned)
+    return result
+
+
 @dataclass
 class Config:
     genesys_client_id: str
@@ -269,9 +280,14 @@ class Config:
     enrich_clients_from_hana: bool
     qualtrics_token: str
     qualtrics_endpoint: str
-    qualtrics_token: str
-    qualtrics_endpoint: str
     qualtrics_delay_seconds: int
+    graph_tenant_id: str
+    graph_client_id: str
+    graph_client_secret: str
+    graph_sender_email: str
+    survey_report_email_to: List[str]
+    survey_report_email_cc: List[str]
+    survey_report_subject: str
 
 
 def load_config() -> Config:
@@ -312,108 +328,17 @@ def load_config() -> Config:
         max_conversations=env_int("MAX_CONVERSATIONS", 0),
         only_with_ivr=env_bool("ONLY_WITH_IVR", True),
         enrich_clients_from_hana=env_bool("ENRICH_CLIENTS_FROM_HANA", True),
-        qualtrics_token=env_str("TOKEN_QUALTRICTS", required=True),
-        qualtrics_endpoint=env_str("POST_AUTOSERVICIO_QUALTRICTS_QA", required=True),
-    )
-
-#Funcion para enviar encuesta
-def enviar_encuesta_qualtrics(config: Config,
-                              cliente: Dict[str, Any],
-                              logger: logging.Logger) -> bool:
-
-    correo = str(
-        cliente.get("CLIENTE_E_MAIL")
-        or cliente.get("E_MAIL")
-        or ""
-    ).strip()
-
-    if not correo:
-        logger.warning(
-            "Cliente sin correo. No se envía encuesta. DNI: %s",
-            cliente.get("ETIQUETA_EXTERNA")
-        )
-        return False
-
-    event_data = {}
-
-    for key, value in cliente.items():
-
-        if value is None:
-            event_data[key] = ""
-
-        elif isinstance(value, datetime):
-            event_data[key] = value.strftime("%Y-%m-%d %H:%M:%S")
-
-        elif isinstance(value, date):
-            event_data[key] = value.strftime("%Y-%m-%d")
-
-        else:
-            texto = str(value).strip()
-
-            if re.match(r"^\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}:\d{3}$", texto):
-                texto = texto[:-4]
-
-            elif re.match(r"^\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}\.\d{3,6}$", texto):
-                texto = texto.split(".")[0]
-
-            event_data[key] = texto
-
-    # Asegura campos importantes como en KNIME
-    event_data["E_MAIL"] = correo
-
-    payload = event_data
-
-    headers = {
-        "Content-Type": "application/json",
-        "X-API-TOKEN": config.qualtrics_token
-    }
-
-    try:
-        logger.info(
-            "Payload Qualtrics enviado: %s",
-            json.dumps(payload, ensure_ascii=False)[:3000]
-        )
-
-        response = requests.post(
-            config.qualtrics_endpoint,
-            json=payload,
-            headers=headers,
-            timeout=30
-        )
-
-        logger.info(
-            "Respuesta Qualtrics | Status=%s | Body=%s",
-            response.status_code,
-            response.text[:1000]
-        )
-
-        if response.status_code in (200, 201, 202):
-            logger.info(
-                "Encuesta enviada | Correo=%s | DNI=%s",
-                correo,
-                cliente.get("ETIQUETA_EXTERNA")
-            )
-            return True
-
-        logger.error(
-            "Error Qualtrics %s | %s",
-            response.status_code,
-            response.text
-        )
-        return False
-
-    except Exception as exc:
-        logger.error(
-            "Error enviando encuesta: %s",
-            str(exc)
-        )
-        return False
-    
         qualtrics_token=env_str("TOKEN_QUALTRICTS", ""),
-        qualtrics_endpoint=env_str("POST_AUTOSERVICIO_QUALTRICTS_QA", ""),
+        qualtrics_endpoint=env_str("POST_AUTOSERVICIO_QUALTRICTS_IVR", ""),
         qualtrics_delay_seconds=env_int("QUALTRICS_DELAY_SECONDS", 5),
+        graph_tenant_id=env_str("GRAPH_TENANT_ID", ""),
+        graph_client_id=env_str("GRAPH_CLIENT_ID", ""),
+        graph_client_secret=env_str("GRAPH_CLIENT_SECRET", ""),
+        graph_sender_email=env_str("GRAPH_SENDER_EMAIL", ""),
+        survey_report_email_to=split_list_value(env_str("SURVEY_REPORT_EMAIL_TO", "")),
+        survey_report_email_cc=split_list_value(env_str("SURVEY_REPORT_EMAIL_CC", "")),
+        survey_report_subject=env_str("SURVEY_REPORT_SUBJECT", "Reporte de Encuesta de Satisfacción - Autoservicio"),
     )
-
 
 def pyflow_progress(value: int) -> None:
     value = max(0, min(100, int(value)))
@@ -493,7 +418,7 @@ def enviar_encuesta_qualtrics(config: Config, cliente: Dict[str, Any], logger: l
 
 def enviar_encuestas_qualtrics(config: Config, rows: List[Dict[str, Any]], logger: logging.Logger) -> Tuple[int, int]:
     if not config.qualtrics_token or not config.qualtrics_endpoint:
-        raise ValueError("Para enviar encuestas debes configurar TOKEN_QUALTRICTS y POST_AUTOSERVICIO_QUALTRICTS_QA.")
+        raise ValueError("Para enviar encuestas debes configurar TOKEN_QUALTRICTS y POST_AUTOSERVICIO_QUALTRICTS_IVR.")
 
     logger.info("Enviando encuestas Qualtrics a clientes Full Autoservicio...")
     enviadas = 0
@@ -531,6 +456,254 @@ def enviar_encuestas_qualtrics(config: Config, rows: List[Dict[str, Any]], logge
     return enviadas, sin_correo
 
 
+def build_survey_report_html(total_autoservicio: int, enviadas: int, sin_correo: int, date_mode: str) -> str:
+    porcentaje_envio = (enviadas / total_autoservicio * 100) if total_autoservicio else 0
+    porcentaje_cobertura = max(0, min(100, porcentaje_envio))
+    now = datetime.now(ZoneInfo("America/Tegucigalpa"))
+
+    template = """<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" lang="es">
+<head>
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Resumen de Encuestas Enviadas</title>
+</head>
+<body style="margin: 0; padding: 0; width: 100% !important; -webkit-text-size-adjust: 100%; -ms-text-size-adjust: 100%; background-color: #f8fafc; font-family: 'NeoSans STD', 'Segoe UI', Arial, sans-serif;">
+  <table width="100%" border="0" cellspacing="0" cellpadding="0" style="background-color: #f8fafc; padding: 40px 10px;">
+    <tr>
+      <td align="center" valign="top">
+        <table width="100%" max-width="650" border="0" cellspacing="0" cellpadding="0" style="max-width: 650px; width: 100%; background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05); border: 1px solid #e2e8f0;">
+          <tr>
+            <td align="left" valign="top" style="background-color: #DA282D; padding: 40px 40px 35px 40px;">
+              <table width="100%" border="0" cellspacing="0" cellpadding="0">
+                <tr>
+                  <td valign="middle">
+                    <span style="font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 1.5px; color: #fecaca; display: block; margin-bottom: 6px;">SISTEMA DE MONITOREO DE PROCESOS</span>
+                    <h1 style="margin: 0; font-size: 24px; font-weight: 700; line-height: 1.2; color: #ffffff; letter-spacing: -0.5px;">Resumen de Encuestas Enviadas</h1>
+                    <p style="margin: 8px 0 0 0; font-size: 13px; color: #fecaca; opacity: 0.95;">Reporte automático generado por PyFlow Manager</p>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding: 40px;">
+              <table width="100%" border="0" cellspacing="0" cellpadding="0">
+                <tr>
+                  <td style="font-size: 14px; line-height: 1.6; color: #334155; padding-bottom: 30px;">
+                    <p style="margin: 0 0 10px 0;">Estimado equipo de operaciones,</p>
+                    <p style="margin: 0;">Se ha completado con éxito la ejecución programada para el envío de encuestas de satisfacción. A continuación, se presenta el consolidado de las estadísticas de cobertura obtenidas en este ciclo:</p>
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding-bottom: 30px;">
+                    <table width="100%" border="0" cellspacing="0" cellpadding="0">
+                      <tr>
+                        <td width="48%" valign="top" style="background-color: #f1f5f9; border-radius: 6px; padding: 20px; border: 1px solid #e2e8f0; text-align: left;">
+                          <span style="font-size: 11px; font-weight: 700; color: #64748b; text-transform: uppercase; letter-spacing: 0.5px; display: block; margin-bottom: 8px;">Clientes Identificados</span>
+                          <span style="font-size: 26px; font-weight: 700; color: #1e293b; display: block;">{{TOTAL_CLIENTES}}</span>
+                          <span style="font-size: 11px; color: #94a3b8; display: block; margin-top: 4px;">Población objetivo</span>
+                        </td>
+                        <td width="4%">&nbsp;</td>
+                        <td width="48%" valign="top" style="background-color: #f1f5f9; border-radius: 6px; padding: 20px; border: 1px solid #e2e8f0; text-align: left;">
+                          <span style="font-size: 11px; font-weight: 700; color: #DA282D; text-transform: uppercase; letter-spacing: 0.5px; display: block; margin-bottom: 8px;">Encuestas Enviadas</span>
+                          <span style="font-size: 26px; font-weight: 700; color: #DA282D; display: block;">{{ENCUESTAS_ENVIADAS}}</span>
+                          <span style="font-size: 11px; color: #94a3b8; display: block; margin-top: 4px;">Envíos efectivos</span>
+                        </td>
+                      </tr>
+                      <tr><td colspan="3" height="16"></td></tr>
+                      <tr>
+                        <td width="48%" valign="top" style="background-color: #f1f5f9; border-radius: 6px; padding: 20px; border: 1px solid #e2e8f0; text-align: left;">
+                          <span style="font-size: 11px; font-weight: 700; color: #64748b; text-transform: uppercase; letter-spacing: 0.5px; display: block; margin-bottom: 8px;">Sin Correo Válido</span>
+                          <span style="font-size: 26px; font-weight: 700; color: #475569; display: block;">{{SIN_CORREO}}</span>
+                          <span style="font-size: 11px; color: #94a3b8; display: block; margin-top: 4px;">Registros no procesados</span>
+                        </td>
+                        <td width="4%">&nbsp;</td>
+                        <td width="48%" valign="top" style="background-color: #fdf2f2; border-radius: 6px; padding: 20px; border: 1px solid #fee2e2; text-align: left;">
+                          <span style="font-size: 11px; font-weight: 700; color: #b91c1c; text-transform: uppercase; letter-spacing: 0.5px; display: block; margin-bottom: 8px;">Tasa de Cobertura</span>
+                          <span style="font-size: 26px; font-weight: 700; color: #b91c1c; display: block;">{{PORCENTAJE_COBERTURA}}%</span>
+                          <span style="font-size: 11px; color: #f87171; display: block; margin-top: 4px;">Porcentaje del total</span>
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+                <tr>
+                  <td style="background-color: #fafafa; border-radius: 6px; padding: 24px; border: 1px solid #f1f5f9; padding-bottom: 24px; margin-bottom: 30px;">
+                    <table width="100%" border="0" cellspacing="0" cellpadding="0">
+                      <tr>
+                        <td style="font-size: 12px; font-weight: 700; color: #475569; text-transform: uppercase; letter-spacing: 0.5px; padding-bottom: 8px;">Indicador Visual de Cobertura</td>
+                        <td align="right" style="font-size: 13px; font-weight: 700; color: #1e293b; padding-bottom: 8px;">{{PORCENTAJE_COBERTURA}}% Completado</td>
+                      </tr>
+                      <tr>
+                        <td colspan="2" style="padding-top: 4px;">
+                          <table width="100%" border="0" cellspacing="0" cellpadding="0" style="background-color: #e2e8f0; border-radius: 4px; overflow: hidden; height: 8px;">
+                            <tr>
+                              <td width="{{PORCENTAJE_COBERTURA}}%" style="background-color: #DA282D; height: 8px; border-radius: 4px 0 0 4px;"></td>
+                              <td style="background-color: #e2e8f0; height: 8px;"></td>
+                            </tr>
+                          </table>
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+                <tr><td height="25"></td></tr>
+                <tr>
+                  <td>
+                    <table width="100%" border="0" cellspacing="0" cellpadding="0" style="border-left: 3px solid #DA282D; padding-left: 16px;">
+                      <tr>
+                        <td style="font-size: 13px; line-height: 1.5; color: #64748b; font-style: italic;">
+                          <strong>Nota de exclusión técnica:</strong> Los registros identificados sin una cuenta de correo electrónico válida asociada han sido automáticamente excluidos del envío a través de este canal para salvaguardar la reputación del dominio emisor y evitar rebotes innecesarios.
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+                <tr><td height="35"></td></tr>
+                <tr>
+                  <td style="border-top: 1px solid #f1f5f9; padding-top: 25px; font-size: 12px; color: #64748b; line-height: 1.6;">
+                    <table width="100%" border="0" cellspacing="0" cellpadding="0">
+                      <tr>
+                        <td valign="top" style="color: #64748b;">
+                          Fecha de ejecución: <strong>{{FECHA_EJECUCION}}</strong><br />
+                          Hora de ejecución: <strong>{{HORA_EJECUCION}}</strong>
+                        </td>
+                        <td align="right" valign="top" style="color: #475569;">
+                          Generado por:<br />
+                          <strong style="color: #1e293b;">PyFlow Manager</strong><br />
+                          <span style="font-size: 11px; color: #94a3b8;">Automatización de Reportes y Procesos</span>
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td align="center" style="background-color: #f1f5f9; padding: 20px; border-top: 1px solid #e2e8f0; font-size: 11px; color: #94a3b8; line-height: 1.4;">
+              Este es un correo automático generado por el módulo de reportería integrado en PyFlow Manager.<br />
+              Por favor, no respondas a este mensaje de manera directa.
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>"""
+
+    return (
+        template
+        .replace("{{TOTAL_CLIENTES}}", escape(f"{total_autoservicio:,}"))
+        .replace("{{ENCUESTAS_ENVIADAS}}", escape(f"{enviadas:,}"))
+        .replace("{{SIN_CORREO}}", escape(f"{sin_correo:,}"))
+        .replace("{{PORCENTAJE_COBERTURA}}", escape(f"{porcentaje_cobertura:.1f}"))
+        .replace("{{FECHA_EJECUCION}}", escape(now.strftime("%d/%m/%Y")))
+        .replace("{{HORA_EJECUCION}}", escape(now.strftime("%I:%M %p")))
+    )
+
+
+def get_graph_access_token(config: Config, logger: logging.Logger) -> str:
+    if not config.graph_tenant_id or not config.graph_client_id or not config.graph_client_secret:
+        raise ValueError("Configura GRAPH_TENANT_ID, GRAPH_CLIENT_ID y GRAPH_CLIENT_SECRET para enviar el reporte por Microsoft Graph.")
+
+    url = f"https://login.microsoftonline.com/{config.graph_tenant_id}/oauth2/v2.0/token"
+    response = requests.post(
+        url,
+        data={
+            "client_id": config.graph_client_id,
+            "client_secret": config.graph_client_secret,
+            "scope": "https://graph.microsoft.com/.default",
+            "grant_type": "client_credentials",
+        },
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=30,
+    )
+
+    if response.status_code >= 400:
+        logger.error("Error obteniendo token Graph %s | %s", response.status_code, response.text[:1000])
+    response.raise_for_status()
+
+    token = response.json().get("access_token")
+    if not token:
+        raise RuntimeError("Microsoft Graph no devolvió access_token.")
+    return token
+
+
+def enviar_reporte_encuestas(config: Config, total_autoservicio: int, enviadas: int, sin_correo: int, date_mode: str, logger: logging.Logger) -> bool:
+    recipients = config.survey_report_email_to
+    cc = config.survey_report_email_cc
+
+    if not recipients:
+        logger.info("Reporte de encuestas no enviado: no hay destinatarios configurados en SURVEY_REPORT_EMAIL_TO.")
+        return False
+    if not config.graph_sender_email:
+        logger.warning("Reporte de encuestas no enviado: configura GRAPH_SENDER_EMAIL.")
+        return False
+
+    html = build_survey_report_html(total_autoservicio, enviadas, sin_correo, date_mode)
+    payload = {
+        "message": {
+            "subject": config.survey_report_subject,
+            "body": {
+                "contentType": "HTML",
+                "content": html,
+            },
+            "toRecipients": [
+                {"emailAddress": {"address": email}}
+                for email in recipients
+            ],
+            "ccRecipients": [
+                {"emailAddress": {"address": email}}
+                for email in cc
+            ],
+        },
+        "saveToSentItems": "true",
+    }
+
+    try:
+        token = get_graph_access_token(config, logger)
+        url = f"https://graph.microsoft.com/v1.0/users/{config.graph_sender_email}/sendMail"
+        response = requests.post(
+            url,
+            json=payload,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            timeout=30,
+        )
+
+        if response.status_code >= 400:
+            logger.error("Error enviando reporte Graph %s | %s", response.status_code, response.text[:1000])
+        response.raise_for_status()
+
+        logger.info("Reporte de encuestas enviado a: %s", ", ".join(recipients + cc))
+        return True
+    except Exception as exc:
+        logger.error("No se pudo enviar reporte de encuestas: %s", exc)
+        return False
+
+
+def normalize_run_mode(value: str) -> str:
+    text = (value or "").strip()
+    modes = {
+        "Cargar a SAP HANA": "cargar_hana",
+        "Analisis Autoservicio": "solo_autoservicio",
+        "Análisis Autoservicio": "solo_autoservicio",
+        "Enviar de Encuestas Autoservicio": "enviar_encuesta",
+        "Analisis Abandono": "solo_abandono",
+        "Análisis Abandono": "solo_abandono",
+        "HANA + Analisis Autoservicio": "cargar_y_autoservicio",
+        "HANA + Análisis Autoservicio": "cargar_y_autoservicio",
+        "HANA + Envio de encuestas": "cargar_hana_y_enviar_encuesta",
+        "HANA + Envío de encuestas": "cargar_hana_y_enviar_encuesta",
+    }
+    return modes.get(text, text)
+
+
 def calculate_interval(args: argparse.Namespace, config: Config) -> Tuple[datetime, datetime, str]:
     tz = ZoneInfo(config.timezone_name)
 
@@ -540,17 +713,20 @@ def calculate_interval(args: argparse.Namespace, config: Config) -> Tuple[dateti
         mode = "UTC manual"
     elif args.date:
         d = parse_local_date(args.date)
-        start_dt = datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=tz)
+        start_dt = local_day_start(d, tz)
         end_dt = start_dt + timedelta(days=1)
-        mode = f"Día local {d.isoformat()}"
+        mode = f"Dia local {d.isoformat()} 00:00 {config.timezone_name} -> {to_utc_z(start_dt)} Genesys"
     elif args.start_date and args.end_date:
         d1 = parse_local_date(args.start_date)
         d2 = parse_local_date(args.end_date)
         if d2 < d1:
             raise ValueError("END_DATE no puede ser menor que START_DATE.")
-        start_dt = datetime(d1.year, d1.month, d1.day, 0, 0, 0, tzinfo=tz)
-        end_dt = datetime(d2.year, d2.month, d2.day, 0, 0, 0, tzinfo=tz) + timedelta(days=1)
-        mode = f"Rango local {d1.isoformat()} al {d2.isoformat()} inclusive"
+        start_dt = local_day_start(d1, tz)
+        end_dt = local_day_start(d2, tz) + timedelta(days=1)
+        mode = (
+            f"Rango local {d1.isoformat()} 00:00 al {d2.isoformat()} 23:59:59 "
+            f"{config.timezone_name}; Genesys UTC {to_utc_z(start_dt)} -> {to_utc_z(end_dt)}"
+        )
     else:
         if config.days_back <= 0:
             raise ValueError("DAYS_BACK debe ser mayor que cero.")
@@ -563,9 +739,13 @@ def calculate_interval(args: argparse.Namespace, config: Config) -> Tuple[dateti
         raise ValueError("La fecha final debe ser mayor que la fecha inicial.")
 
     duration_days = (end_dt - start_dt).total_seconds() / 86400
-    if duration_days > config.max_range_days:
+    allowed_days = config.max_range_days
+    if args.start_date and args.end_date:
+        allowed_days = calendar.monthrange(start_dt.year, start_dt.month)[1]
+
+    if duration_days > allowed_days:
         raise ValueError(
-            f"Rango no permitido: {duration_days:.2f} días. Máximo permitido: {config.max_range_days} días."
+            f"Rango no permitido: {duration_days:.2f} dias. Maximo permitido para el mes seleccionado: {allowed_days} dias."
         )
 
     return start_dt, end_dt, mode
@@ -644,7 +824,13 @@ def create_details_job(config: Config, token: str, start_dt: datetime, end_dt: d
         "orderBy": "conversationStart",
         "paging": {"pageSize": config.job_page_size},
         "segmentFilters": [
-            {"type": "or", "predicates": [{"dimension": "mediaType", "value": "voice"}]}
+            {
+                "type": "and",
+                "predicates": [
+                    {"dimension": "mediaType", "operator": "matches", "value": "voice"},
+                    {"dimension": "segmentType", "operator": "matches", "value": "ivr"},
+                ],
+            }
         ],
     }
     logger.info("Creando job conversations details | %s", body["interval"])
@@ -669,27 +855,53 @@ def fetch_conversation_details(config: Config, token: str, start_dt: datetime, e
     job_id = create_details_job(config, token, start_dt, end_dt, logger)
     all_conversations: List[Dict[str, Any]] = []
     cursor = ""
-    for attempt in range(1, config.max_poll_attempts + 1):
+    empty_attempts = 0
+    page_number = 0
+
+    while True:
         data = get_job_results_page(config, token, job_id, cursor, logger)
         conversations = data.get("conversations") or []
-        next_cursor = data.get("cursor") or ""
+        next_cursor = str(data.get("cursor") or "").strip()
+
         if conversations:
+            page_number += 1
+            empty_attempts = 0
             all_conversations.extend(conversations)
-            logger.info("Página job recibida | conversaciones: %s | acumulado: %s", len(conversations), len(all_conversations))
+            logger.info(
+                "Pagina job %s recibida | conversaciones: %s | acumulado: %s | cursor siguiente: %s",
+                page_number,
+                len(conversations),
+                len(all_conversations),
+                "si" if next_cursor else "no",
+            )
         else:
-            logger.info("Job sin conversaciones todavía | intento %s/%s", attempt, config.max_poll_attempts)
+            empty_attempts += 1
+            logger.info("Job sin conversaciones todavia | intento espera %s/%s", empty_attempts, config.max_poll_attempts)
+
         if config.max_conversations and len(all_conversations) >= config.max_conversations:
-            logger.warning("Se alcanzó MAX_CONVERSATIONS=%s. Se corta extracción.", config.max_conversations)
+            logger.warning("Se alcanzo MAX_CONVERSATIONS=%s. Se corta extraccion.", config.max_conversations)
             return all_conversations[:config.max_conversations]
+
         if next_cursor:
             cursor = next_cursor
             time.sleep(config.api_sleep_seconds)
             continue
-        if conversations or all_conversations:
-            break
-        time.sleep(config.poll_seconds)
-    return all_conversations
 
+        if all_conversations:
+            logger.info(
+                "Lectura de job completada | paginas: %s | conversaciones acumuladas: %s",
+                page_number,
+                len(all_conversations),
+            )
+            break
+
+        if empty_attempts >= config.max_poll_attempts:
+            logger.warning("Job sin conversaciones tras %s intentos de espera.", config.max_poll_attempts)
+            break
+
+        time.sleep(config.poll_seconds)
+
+    return all_conversations
 
 def fetch_divisions_lookup(config: Config, token: str, logger: logging.Logger) -> Dict[str, str]:
     url = f"{config.genesys_api_base}/api/v2/authorization/divisions?pageSize=500"
@@ -735,6 +947,20 @@ def has_ivr(conversation: Dict[str, Any]) -> bool:
     for _p, purpose, session in iter_sessions(conversation):
         if purpose == "ivr" or session.get("flow"):
             return True
+
+    attrs = collect_attributes(conversation)
+    ivr_attr_names = (
+        "SPD_IVR_TrazaOpciones",
+        "SPD_IVR",
+        "IVR",
+        "IVR_OPCIONES",
+        "OPCIONES_NAVEGACION",
+    )
+    for key, value in attrs.items():
+        key_upper = str(key or "").upper()
+        if value and any(name.upper() in key_upper for name in ivr_attr_names):
+            return True
+
     return False
 
 
@@ -858,12 +1084,28 @@ def transform_conversation(conversation: Dict[str, Any], config: Config, divisio
     return row
 
 
-def transform_conversations(conversations: List[Dict[str, Any]], config: Config, divisions_lookup: Dict[str, str]) -> List[Dict[str, Any]]:
+def transform_conversations(
+    conversations: List[Dict[str, Any]],
+    config: Config,
+    divisions_lookup: Dict[str, str],
+    logger: Optional[logging.Logger] = None,
+) -> List[Dict[str, Any]]:
     rows = []
+    skipped_no_ivr = 0
     for conv in conversations:
         row = transform_conversation(conv, config, divisions_lookup)
         if row:
             rows.append(row)
+        elif config.only_with_ivr:
+            skipped_no_ivr += 1
+
+    if logger:
+        logger.info(
+            "Transformación IVR | conversaciones recibidas: %s | filas generadas: %s | descartadas sin evidencia IVR: %s",
+            len(conversations),
+            len(rows),
+            skipped_no_ivr,
+        )
     return rows
 
 
@@ -1209,21 +1451,21 @@ def main() -> int:
         config = load_config()
         if args.dry_run:
             config.dry_run = True
-        run_mode = env_str("RUN_MODE", "cargar_hana")
+        run_mode_raw = env_str("RUN_MODE", "Cargar a SAP HANA")
+        run_mode = normalize_run_mode(run_mode_raw)
         valid_modes = {
             "cargar_hana",
-            "cargar_y_autoservicio",
-            "cargar_y_abandono",
             "solo_autoservicio",
             "solo_abandono",
-            "cargar_y_ambos",
             "enviar_encuesta",
+            "cargar_y_autoservicio",
             "cargar_hana_y_enviar_encuesta",
-            "todo",
         }
         if run_mode not in valid_modes:
             raise ValueError(f"RUN_MODE inválido: {run_mode}. Valores válidos: {sorted(valid_modes)}")
-        send_surveys = run_mode in ("enviar_encuesta", "cargar_hana_y_enviar_encuesta", "todo")
+        send_surveys = run_mode in ("enviar_encuesta", "cargar_hana_y_enviar_encuesta")
+        write_autoservicio = run_mode in ("solo_autoservicio", "enviar_encuesta", "cargar_y_autoservicio")
+        write_abandono = run_mode == "solo_abandono"
         start_dt, end_dt, date_mode = calculate_interval(args, config)
         windows = build_windows(start_dt, end_dt, config.process_by_day)
         pyflow_progress(5)
@@ -1234,9 +1476,11 @@ def main() -> int:
             "HPR_HOST", "HPR_HOST_ESPEJO", "HPR_PORT", "HPR_USER", "HPR_PASSWORD",
             "HANA_SCHEMA", "HANA_IVR_TABLE", "RUN_MODE", "DATE", "START_DATE", "END_DATE", "START_UTC", "END_UTC",
             "GENESYS_TIMEZONE", "DAYS_BACK", "MAX_RANGE_DAYS", "PROCESS_BY_DAY", "DELETE_RANGE_BEFORE_LOAD", "DRY_RUN", "OUTPUT_DIR", "OUTPUT_FORMAT",
-            "ONLY_WITH_IVR", "ENRICH_CLIENTS_FROM_HANA", "TOKEN_QUALTRICTS", "POST_AUTOSERVICIO_QUALTRICTS_QA"
+            "ONLY_WITH_IVR", "ENRICH_CLIENTS_FROM_HANA", "TOKEN_QUALTRICTS", "POST_AUTOSERVICIO_QUALTRICTS_IVR"
         ])
         logger.info("Modo fecha: %s", date_mode)
+        logger.info("Inicio local calculado: %s", start_dt.astimezone(ZoneInfo(config.timezone_name)).strftime("%Y-%m-%d %H:%M:%S %Z"))
+        logger.info("Fin local calculado: %s", end_dt.astimezone(ZoneInfo(config.timezone_name)).strftime("%Y-%m-%d %H:%M:%S %Z"))
         logger.info("Inicio UTC: %s", to_utc_z(start_dt))
         logger.info("Fin UTC: %s", to_utc_z(end_dt))
         logger.info("Ventanas a procesar: %s", len(windows))
@@ -1251,7 +1495,7 @@ def main() -> int:
             logger.info("Procesando ventana %s/%s | %s -> %s", idx, len(windows), to_utc_z(w_start), to_utc_z(w_end))
             conversations = fetch_conversation_details(config, token, w_start, w_end, logger)
             total_conversations += len(conversations)
-            rows = transform_conversations(conversations, config, divisions_lookup)
+            rows = transform_conversations(conversations, config, divisions_lookup, logger)
             all_rows.extend(rows)
             logger.info("Ventana procesada | conversaciones: %s | filas IVR: %s | acumulado filas IVR: %s", len(conversations), len(rows), len(all_rows))
             pyflow_progress(15 + int((idx / max(len(windows), 1)) * 35))
@@ -1260,7 +1504,7 @@ def main() -> int:
         pyflow_progress(50)
         logger.info("=" * 80)
         logger.info("Extracción finalizada | conversaciones: %s | filas IVR: %s", total_conversations, total_ivr_rows)
-        must_load = run_mode in ("cargar_hana", "cargar_y_autoservicio", "cargar_y_abandono", "cargar_y_ambos", "cargar_hana_y_enviar_encuesta", "todo")
+        must_load = run_mode in ("cargar_hana", "cargar_y_autoservicio", "cargar_hana_y_enviar_encuesta")
         if must_load:
             if config.dry_run:
                 logger.warning("DRY_RUN=true. No se escribirá en SAP HANA.")
@@ -1273,8 +1517,8 @@ def main() -> int:
                 pyflow_progress(60)
                 loaded, failed = merge_ivr_rows(config, all_rows, logger, load_columns)
                 pyflow_progress(70)
-        need_auto = run_mode in ("cargar_y_autoservicio", "solo_autoservicio", "cargar_y_ambos", "enviar_encuesta", "cargar_hana_y_enviar_encuesta", "todo")
-        need_abandono = run_mode in ("cargar_y_abandono", "solo_abandono", "cargar_y_ambos", "todo")
+        need_auto = run_mode in ("solo_autoservicio", "enviar_encuesta", "cargar_y_autoservicio", "cargar_hana_y_enviar_encuesta")
+        need_abandono = run_mode == "solo_abandono"
         if need_auto or need_abandono:
             autoservicio_rows, abandono_rows = build_segment_bases(all_rows)
             pyflow_progress(72)
@@ -1289,44 +1533,24 @@ def main() -> int:
                 if need_auto:
                     autoservicio_rows = enrich_rows(autoservicio_rows, client_lookup)
 
-                    logger.info(
-                        "Enviando encuestas Qualtrics a clientes Full Autoservicio..."
-                    )
-
-                    enviadas = 0
-                    total_clientes = len(autoservicio_rows)
-
-                    for index, cliente in enumerate(autoservicio_rows, start=1):
-
-                        if enviar_encuesta_qualtrics(
-                            config,
-                            cliente,
-                            logger
-                        ):
-                            enviadas += 1
-
-                            if index < total_clientes:
-                                logger.info(
-                                    "Esperando 5 segundos antes del siguiente envío..."
-                                )
-                                time.sleep(5)
-
-                    logger.info(
-                        "Encuestas Qualtrics enviadas: %s",
-                        enviadas
-                    )  
-
-
                 if need_abandono:
                     abandono_rows = enrich_rows(abandono_rows, client_lookup)
             if need_auto:
                 if send_surveys:
                     surveys_sent, surveys_without_email = enviar_encuestas_qualtrics(config, autoservicio_rows, logger)
-                if run_mode in ("cargar_y_autoservicio", "solo_autoservicio", "cargar_y_ambos", "todo"):
+                    enviar_reporte_encuestas(
+                        config,
+                        total_autoservicio=len(autoservicio_rows),
+                        enviadas=surveys_sent,
+                        sin_correo=surveys_without_email,
+                        date_mode=date_mode,
+                        logger=logger,
+                    )
+                if write_autoservicio:
                     path = write_output(autoservicio_rows, config.output_dir, "GNS_IVR_Full_Autoservicio", config.output_format, logger)
                     if path:
                         output_files.append(path)
-            if need_abandono:
+            if need_abandono and write_abandono:
                 path = write_output(abandono_rows, config.output_dir, "GNS_IVR_Abandono_Real", config.output_format, logger)
                 if path:
                     output_files.append(path)

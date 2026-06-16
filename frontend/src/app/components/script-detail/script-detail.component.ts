@@ -148,6 +148,42 @@ import { environment } from '../../../environments/environment';
                     } @else if (param.control_type === 'textarea') {
                       <textarea rows="3" [(ngModel)]="paramValues[param.param_key]"
                         class="w-full bg-slate-900 border border-slate-800 rounded px-2.5 py-1.5 text-xs text-slate-300 focus:outline-none focus:border-blue-500"></textarea>
+                    } @else if (param.control_type === 'tags') {
+                      <div class="bg-slate-900 border border-slate-800 rounded-lg p-2.5 min-h-[88px] focus-within:border-blue-500">
+                        <div class="flex flex-wrap gap-2 mb-2 min-h-[28px]">
+                          @for (tag of tagItems(param.param_key); track tag) {
+                            <span class="inline-flex items-center gap-1.5 rounded-full border border-blue-500/40 bg-blue-500/10 px-2.5 py-1 text-[11px] text-blue-100 max-w-full">
+                              <span class="truncate max-w-[220px]">{{ tag }}</span>
+                              <button
+                                type="button"
+                                (click)="removeTagValue(param.param_key, tag)"
+                                class="text-blue-200 hover:text-rose-300 leading-none">
+                                ×
+                              </button>
+                            </span>
+                          } @empty {
+                            <span class="text-[11px] text-slate-500 py-1">
+                              Sin filtros agregados.
+                            </span>
+                          }
+                        </div>
+
+                        <div class="flex gap-2">
+                          <input
+                            type="text"
+                            [(ngModel)]="tagDraftValues[param.param_key]"
+                            (keydown)="onTagInputKeydown($event, param.param_key)"
+                            placeholder="Buscar o agregar valor..."
+                            class="min-w-0 flex-1 bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-xs text-slate-300 focus:outline-none focus:border-blue-500">
+
+                          <button
+                            type="button"
+                            (click)="addTagValue(param.param_key)"
+                            class="shrink-0 bg-blue-600 hover:bg-blue-500 text-white font-semibold text-xs px-3 py-1.5 rounded">
+                            Agregar
+                          </button>
+                        </div>
+                      </div>
                     } @else {
                       <input type="text" [(ngModel)]="paramValues[param.param_key]"
                         class="w-full bg-slate-900 border border-slate-800 rounded px-2.5 py-1.5 text-xs text-slate-300 focus:outline-none focus:border-blue-500">
@@ -365,6 +401,7 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
   executionParams: any[] = [];
   viewingExecutionParameters: number | null = null;
   paramValues: Record<string, any> = {};
+  tagDraftValues: Record<string, string> = {};
 
   private intervalId: ReturnType<typeof setInterval> | null = null;
   private eventSource: EventSource | null = null;
@@ -387,7 +424,9 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
   }
 
   isGlobalParam(param: any): boolean {
-    return String(param?.control_type || '').toLowerCase() === 'global';
+    return String(param?.control_type || '').toLowerCase() === 'global' ||
+      String(param?.param_type || '').toLowerCase() === 'global' ||
+      !!String(param?.global_key || '').trim();
   }
 
   scriptInputParams(): any[] {
@@ -436,6 +475,48 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
       : 'text-xs text-rose-400 font-semibold';
   }
 
+  tagItems(key: string): string[] {
+    return String(this.paramValues[key] || '')
+      .split(';')
+      .map(value => value.trim())
+      .filter(Boolean);
+  }
+
+  addTagValue(key: string) {
+    const draft = String(this.tagDraftValues[key] || '').trim();
+    if (!draft) return;
+
+    const current = this.tagItems(key);
+    const incoming = draft
+      .replace(/\r?\n/g, ';')
+      .replace(/,/g, ';')
+      .split(';')
+      .map(value => value.trim())
+      .filter(Boolean);
+
+    for (const value of incoming) {
+      if (!current.includes(value)) {
+        current.push(value);
+      }
+    }
+
+    this.paramValues[key] = current.join(';');
+    this.tagDraftValues[key] = '';
+  }
+
+  removeTagValue(key: string, value: string) {
+    this.paramValues[key] = this.tagItems(key)
+      .filter(item => item !== value)
+      .join(';');
+  }
+
+  onTagInputKeydown(event: KeyboardEvent, key: string) {
+    if (['Enter', 'Tab', ',', ';'].includes(event.key)) {
+      event.preventDefault();
+      this.addTagValue(key);
+    }
+  }
+
   loadScriptParameters() {
     const script = this.script;
     if (!script) return;
@@ -445,6 +526,7 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
         this.scriptParams = params || [];
 
         this.paramValues = {};
+        this.tagDraftValues = {};
 
         for (const p of this.scriptParams) {
           if (!this.isGlobalParam(p)) {
