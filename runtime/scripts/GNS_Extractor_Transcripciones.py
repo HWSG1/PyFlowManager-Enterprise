@@ -336,7 +336,10 @@ def request_with_retry(method: str, url: str, config: Config, logger: logging.Lo
             response = requests.request(method, url, timeout=config.request_timeout, **kwargs)
 
             if response.status_code in no_retry_statuses:
+                if response.status_code >= 400:
+                    logger.info("HTTP %s sin reintento | %s", response.status_code, response.text[:500])
                 response.raise_for_status()
+                return response
 
             if response.status_code == 429:
                 retry_after = response.headers.get("Retry-After")
@@ -357,6 +360,16 @@ def request_with_retry(method: str, url: str, config: Config, logger: logging.Lo
             response.raise_for_status()
             return response
 
+        except requests.HTTPError as exc:
+            last_error = exc
+            status = getattr(exc.response, "status_code", None)
+            if status in no_retry_statuses:
+                raise
+            if attempt >= config.max_retries:
+                break
+            wait = min(60, 5 * attempt)
+            logger.warning("Error request | intento %s/%s | %s | esperando %ss", attempt, config.max_retries, exc, wait)
+            time.sleep(wait)
         except Exception as exc:
             last_error = exc
             if attempt >= config.max_retries:
