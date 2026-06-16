@@ -387,7 +387,9 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
   }
 
   isGlobalParam(param: any): boolean {
-    return String(param?.control_type || '').toLowerCase() === 'global';
+    return String(param?.control_type || '').toLowerCase() === 'global' ||
+      String(param?.param_type || '').toLowerCase() === 'global' ||
+      !!String(param?.global_key || '').trim();
   }
 
   scriptInputParams(): any[] {

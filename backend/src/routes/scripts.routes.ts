@@ -54,7 +54,8 @@ function extractPyflowParams(content: string): Record<string, any> {
       .replace(/\bTrue\b/g, 'true')
       .replace(/\bFalse\b/g, 'false')
       .replace(/\bNone\b/g, 'null')
-      .replace(/'/g, '"');
+      .replace(/'/g, '"')
+      .replace(/,\s*([}\]])/g, '$1');
 
     return JSON.parse(jsonLike);
   } catch (error) {
@@ -242,8 +243,6 @@ router.get('/:id/parameters', async (req, res, next) => {
             s.name <> 'GNS_IVR.py'
             OR sp.param_key NOT IN (
               'DATE',
-              'START_DATE',
-              'END_DATE',
               'START_UTC',
               'END_UTC',
               'GENESYS_TIMEZONE',
@@ -257,6 +256,8 @@ router.get('/:id/parameters', async (req, res, next) => {
               'HANA_BATCH_SIZE',
               'MAX_CONVERSATIONS',
               'ENRICH_CLIENTS_FROM_HANA',
+              'ONLY_WITH_IVR',
+              'DRY_RUN',
               'QUALTRICS_DELAY_SECONDS'
             )
           )
@@ -271,20 +272,30 @@ router.get('/:id/parameters', async (req, res, next) => {
       if (runMode) {
         runMode.label = 'Modo de ejecucion';
         runMode.options_json = JSON.stringify([
-          'cargar_hana',
-          'cargar_y_autoservicio',
-          'cargar_y_abandono',
-          'solo_autoservicio',
-          'solo_abandono',
-          'cargar_y_ambos',
-          'enviar_encuesta',
-          'cargar_hana_y_enviar_encuesta',
-          'todo'
+          'Cargar a SAP HANA',
+          'Análisis Autoservicio',
+          'Enviar de Encuestas Autoservicio',
+          'Análisis Abandono',
+          'HANA + Análisis Autoservicio',
+          'HANA + Envío de encuestas'
         ]);
       }
 
       const hasParam = (key: string) => rows.some((row: any) => row.param_key === key);
       const baseId = rows.length ? Math.max(...rows.map((row: any) => Number(row.id) || 0)) + 1 : 1;
+      const forceGlobalParam = (key: string, label: string) => {
+        const param = rows.find((row: any) => row.param_key === key);
+        if (!param) return;
+
+        param.param_type = 'global';
+        param.control_type = 'global';
+        param.global_key = key;
+        param.label = label;
+      };
+
+      forceGlobalParam('TOKEN_QUALTRICTS', 'Token Qualtrics');
+      forceGlobalParam('POST_AUTOSERVICIO_QUALTRICTS_QA', 'Endpoint Qualtrics');
+      forceGlobalParam('POST_AUTOSERVICIO_QUALTRICTS_IVR', 'Endpoint Qualtrics');
 
       if (!hasParam('TOKEN_QUALTRICTS')) {
         rows.push({
@@ -293,7 +304,7 @@ router.get('/:id/parameters', async (req, res, next) => {
           param_key: 'TOKEN_QUALTRICTS',
           param_value: '',
           param_type: 'global',
-          control_type: 'text',
+          control_type: 'global',
           label: 'Token Qualtrics',
           options_json: null,
           is_required: true,
@@ -302,18 +313,18 @@ router.get('/:id/parameters', async (req, res, next) => {
         });
       }
 
-      if (!hasParam('POST_AUTOSERVICIO_QUALTRICTS_QA')) {
+      if (!hasParam('POST_AUTOSERVICIO_QUALTRICTS_IVR')) {
         rows.push({
           id: baseId + 1,
           script_id: scriptId,
-          param_key: 'POST_AUTOSERVICIO_QUALTRICTS_QA',
+          param_key: 'POST_AUTOSERVICIO_QUALTRICTS_IVR',
           param_value: '',
           param_type: 'global',
-          control_type: 'text',
+          control_type: 'global',
           label: 'Endpoint Qualtrics',
           options_json: null,
           is_required: true,
-          global_key: 'POST_AUTOSERVICIO_QUALTRICTS_QA',
+          global_key: 'POST_AUTOSERVICIO_QUALTRICTS_IVR',
           script_name: 'GNS_IVR.py'
         });
       }

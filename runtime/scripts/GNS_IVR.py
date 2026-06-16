@@ -26,6 +26,7 @@ import argparse
 import logging
 import traceback
 import re
+import calendar
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -69,38 +70,25 @@ PYFLOW_PARAMS = {
         "label": "Modo de ejecucion",
         "required": True,
         "options": [
-            "cargar_hana",
-            "cargar_y_autoservicio",
-            "cargar_y_abandono",
-            "solo_autoservicio",
-            "solo_abandono",
-            "cargar_y_ambos",
-            "enviar_encuesta",
-            "cargar_hana_y_enviar_encuesta",
-            "todo"
+            "Cargar a SAP HANA",
+            "Análisis Autoservicio",
+            "Enviar de Encuestas Autoservicio",
+            "Análisis Abandono",
+            "HANA + Análisis Autoservicio",
+            "HANA + Envío de encuestas"
         ],
-        "default": "cargar_hana"
+        "default": "Cargar a SAP HANA"
     },
+    "START_DATE": {"type": "date", "label": "Fecha inicio", "required": False},
+    "END_DATE": {"type": "date", "label": "Fecha fin", "required": False},
     "DAYS_BACK": {"type": "number", "label": "Dias hacia atras si no se indican fechas", "required": False, "default": "1"},
     "PROCESS_BY_DAY": {"type": "select", "label": "Procesar dia por dia", "required": True, "options": ["true", "false"], "default": "true"},
-
     "DELETE_RANGE_BEFORE_LOAD": {"type": "select", "label": "Borrar rango antes de cargar IVR", "required": True, "options": ["true", "false"], "default": "true"},
-    "DRY_RUN": {"type": "select", "label": "Modo prueba sin escribir HANA", "required": True, "options": ["true", "false"], "default": "false"},
-
     "OUTPUT_DIR": {"type": "text", "label": "Carpeta de salida para Excel/CSV", "required": False},
     "OUTPUT_FORMAT": {"type": "select", "label": "Formato salida", "required": True, "options": ["xlsx", "csv"], "default": "xlsx"},
-
-    "ONLY_WITH_IVR": {"type": "select", "label": "Conservar solo conversaciones con IVR", "required": True, "options": ["true", "false"], "default": "true"},
-    "ENRICH_CLIENTS_FROM_HANA": {"type": "select", "label": "Enriquecer salidas con datos cliente desde HANA espejo", "required": True, "options": ["true", "false"], "default": "true"},
-    
-    "TOKEN_QUALTRICTS": {
-    "type": "global",
-    "global_key": "TOKEN_QUALTRICTS",
-    "label": "Token Qualtrics",
-    "required": True,
-    "secret": True}
+    "TOKEN_QUALTRICTS": {"type": "global", "global_key": "TOKEN_QUALTRICTS", "label": "Token Qualtrics", "required": True, "secret": True},
+    "POST_AUTOSERVICIO_QUALTRICTS_IVR": {"type": "global", "global_key": "POST_AUTOSERVICIO_QUALTRICTS_IVR", "label": "Endpoint Qualtrics", "required": True}
 }
-
 LOGGER_NAME = "gns_ivr_pyflow"
 
 
@@ -269,8 +257,6 @@ class Config:
     enrich_clients_from_hana: bool
     qualtrics_token: str
     qualtrics_endpoint: str
-    qualtrics_token: str
-    qualtrics_endpoint: str
     qualtrics_delay_seconds: int
 
 
@@ -312,108 +298,10 @@ def load_config() -> Config:
         max_conversations=env_int("MAX_CONVERSATIONS", 0),
         only_with_ivr=env_bool("ONLY_WITH_IVR", True),
         enrich_clients_from_hana=env_bool("ENRICH_CLIENTS_FROM_HANA", True),
-        qualtrics_token=env_str("TOKEN_QUALTRICTS", required=True),
-        qualtrics_endpoint=env_str("POST_AUTOSERVICIO_QUALTRICTS_QA", required=True),
-    )
-
-#Funcion para enviar encuesta
-def enviar_encuesta_qualtrics(config: Config,
-                              cliente: Dict[str, Any],
-                              logger: logging.Logger) -> bool:
-
-    correo = str(
-        cliente.get("CLIENTE_E_MAIL")
-        or cliente.get("E_MAIL")
-        or ""
-    ).strip()
-
-    if not correo:
-        logger.warning(
-            "Cliente sin correo. No se envía encuesta. DNI: %s",
-            cliente.get("ETIQUETA_EXTERNA")
-        )
-        return False
-
-    event_data = {}
-
-    for key, value in cliente.items():
-
-        if value is None:
-            event_data[key] = ""
-
-        elif isinstance(value, datetime):
-            event_data[key] = value.strftime("%Y-%m-%d %H:%M:%S")
-
-        elif isinstance(value, date):
-            event_data[key] = value.strftime("%Y-%m-%d")
-
-        else:
-            texto = str(value).strip()
-
-            if re.match(r"^\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}:\d{3}$", texto):
-                texto = texto[:-4]
-
-            elif re.match(r"^\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}\.\d{3,6}$", texto):
-                texto = texto.split(".")[0]
-
-            event_data[key] = texto
-
-    # Asegura campos importantes como en KNIME
-    event_data["E_MAIL"] = correo
-
-    payload = event_data
-
-    headers = {
-        "Content-Type": "application/json",
-        "X-API-TOKEN": config.qualtrics_token
-    }
-
-    try:
-        logger.info(
-            "Payload Qualtrics enviado: %s",
-            json.dumps(payload, ensure_ascii=False)[:3000]
-        )
-
-        response = requests.post(
-            config.qualtrics_endpoint,
-            json=payload,
-            headers=headers,
-            timeout=30
-        )
-
-        logger.info(
-            "Respuesta Qualtrics | Status=%s | Body=%s",
-            response.status_code,
-            response.text[:1000]
-        )
-
-        if response.status_code in (200, 201, 202):
-            logger.info(
-                "Encuesta enviada | Correo=%s | DNI=%s",
-                correo,
-                cliente.get("ETIQUETA_EXTERNA")
-            )
-            return True
-
-        logger.error(
-            "Error Qualtrics %s | %s",
-            response.status_code,
-            response.text
-        )
-        return False
-
-    except Exception as exc:
-        logger.error(
-            "Error enviando encuesta: %s",
-            str(exc)
-        )
-        return False
-    
         qualtrics_token=env_str("TOKEN_QUALTRICTS", ""),
-        qualtrics_endpoint=env_str("POST_AUTOSERVICIO_QUALTRICTS_QA", ""),
+        qualtrics_endpoint=env_str("POST_AUTOSERVICIO_QUALTRICTS_IVR", ""),
         qualtrics_delay_seconds=env_int("QUALTRICS_DELAY_SECONDS", 5),
     )
-
 
 def pyflow_progress(value: int) -> None:
     value = max(0, min(100, int(value)))
@@ -493,7 +381,7 @@ def enviar_encuesta_qualtrics(config: Config, cliente: Dict[str, Any], logger: l
 
 def enviar_encuestas_qualtrics(config: Config, rows: List[Dict[str, Any]], logger: logging.Logger) -> Tuple[int, int]:
     if not config.qualtrics_token or not config.qualtrics_endpoint:
-        raise ValueError("Para enviar encuestas debes configurar TOKEN_QUALTRICTS y POST_AUTOSERVICIO_QUALTRICTS_QA.")
+        raise ValueError("Para enviar encuestas debes configurar TOKEN_QUALTRICTS y POST_AUTOSERVICIO_QUALTRICTS_IVR.")
 
     logger.info("Enviando encuestas Qualtrics a clientes Full Autoservicio...")
     enviadas = 0
@@ -531,6 +419,23 @@ def enviar_encuestas_qualtrics(config: Config, rows: List[Dict[str, Any]], logge
     return enviadas, sin_correo
 
 
+def normalize_run_mode(value: str) -> str:
+    text = (value or "").strip()
+    modes = {
+        "Cargar a SAP HANA": "cargar_hana",
+        "Analisis Autoservicio": "solo_autoservicio",
+        "Análisis Autoservicio": "solo_autoservicio",
+        "Enviar de Encuestas Autoservicio": "enviar_encuesta",
+        "Analisis Abandono": "solo_abandono",
+        "Análisis Abandono": "solo_abandono",
+        "HANA + Analisis Autoservicio": "cargar_y_autoservicio",
+        "HANA + Análisis Autoservicio": "cargar_y_autoservicio",
+        "HANA + Envio de encuestas": "cargar_hana_y_enviar_encuesta",
+        "HANA + Envío de encuestas": "cargar_hana_y_enviar_encuesta",
+    }
+    return modes.get(text, text)
+
+
 def calculate_interval(args: argparse.Namespace, config: Config) -> Tuple[datetime, datetime, str]:
     tz = ZoneInfo(config.timezone_name)
 
@@ -563,9 +468,13 @@ def calculate_interval(args: argparse.Namespace, config: Config) -> Tuple[dateti
         raise ValueError("La fecha final debe ser mayor que la fecha inicial.")
 
     duration_days = (end_dt - start_dt).total_seconds() / 86400
-    if duration_days > config.max_range_days:
+    allowed_days = config.max_range_days
+    if args.start_date and args.end_date:
+        allowed_days = calendar.monthrange(start_dt.year, start_dt.month)[1]
+
+    if duration_days > allowed_days:
         raise ValueError(
-            f"Rango no permitido: {duration_days:.2f} días. Máximo permitido: {config.max_range_days} días."
+            f"Rango no permitido: {duration_days:.2f} dias. Maximo permitido para el mes seleccionado: {allowed_days} dias."
         )
 
     return start_dt, end_dt, mode
@@ -1209,21 +1118,21 @@ def main() -> int:
         config = load_config()
         if args.dry_run:
             config.dry_run = True
-        run_mode = env_str("RUN_MODE", "cargar_hana")
+        run_mode_raw = env_str("RUN_MODE", "Cargar a SAP HANA")
+        run_mode = normalize_run_mode(run_mode_raw)
         valid_modes = {
             "cargar_hana",
-            "cargar_y_autoservicio",
-            "cargar_y_abandono",
             "solo_autoservicio",
             "solo_abandono",
-            "cargar_y_ambos",
             "enviar_encuesta",
+            "cargar_y_autoservicio",
             "cargar_hana_y_enviar_encuesta",
-            "todo",
         }
         if run_mode not in valid_modes:
             raise ValueError(f"RUN_MODE inválido: {run_mode}. Valores válidos: {sorted(valid_modes)}")
-        send_surveys = run_mode in ("enviar_encuesta", "cargar_hana_y_enviar_encuesta", "todo")
+        send_surveys = run_mode in ("enviar_encuesta", "cargar_hana_y_enviar_encuesta")
+        write_autoservicio = run_mode in ("solo_autoservicio", "enviar_encuesta", "cargar_y_autoservicio")
+        write_abandono = run_mode == "solo_abandono"
         start_dt, end_dt, date_mode = calculate_interval(args, config)
         windows = build_windows(start_dt, end_dt, config.process_by_day)
         pyflow_progress(5)
@@ -1234,7 +1143,7 @@ def main() -> int:
             "HPR_HOST", "HPR_HOST_ESPEJO", "HPR_PORT", "HPR_USER", "HPR_PASSWORD",
             "HANA_SCHEMA", "HANA_IVR_TABLE", "RUN_MODE", "DATE", "START_DATE", "END_DATE", "START_UTC", "END_UTC",
             "GENESYS_TIMEZONE", "DAYS_BACK", "MAX_RANGE_DAYS", "PROCESS_BY_DAY", "DELETE_RANGE_BEFORE_LOAD", "DRY_RUN", "OUTPUT_DIR", "OUTPUT_FORMAT",
-            "ONLY_WITH_IVR", "ENRICH_CLIENTS_FROM_HANA", "TOKEN_QUALTRICTS", "POST_AUTOSERVICIO_QUALTRICTS_QA"
+            "ONLY_WITH_IVR", "ENRICH_CLIENTS_FROM_HANA", "TOKEN_QUALTRICTS", "POST_AUTOSERVICIO_QUALTRICTS_IVR"
         ])
         logger.info("Modo fecha: %s", date_mode)
         logger.info("Inicio UTC: %s", to_utc_z(start_dt))
@@ -1260,7 +1169,7 @@ def main() -> int:
         pyflow_progress(50)
         logger.info("=" * 80)
         logger.info("Extracción finalizada | conversaciones: %s | filas IVR: %s", total_conversations, total_ivr_rows)
-        must_load = run_mode in ("cargar_hana", "cargar_y_autoservicio", "cargar_y_abandono", "cargar_y_ambos", "cargar_hana_y_enviar_encuesta", "todo")
+        must_load = run_mode in ("cargar_hana", "cargar_y_autoservicio", "cargar_hana_y_enviar_encuesta")
         if must_load:
             if config.dry_run:
                 logger.warning("DRY_RUN=true. No se escribirá en SAP HANA.")
@@ -1273,8 +1182,8 @@ def main() -> int:
                 pyflow_progress(60)
                 loaded, failed = merge_ivr_rows(config, all_rows, logger, load_columns)
                 pyflow_progress(70)
-        need_auto = run_mode in ("cargar_y_autoservicio", "solo_autoservicio", "cargar_y_ambos", "enviar_encuesta", "cargar_hana_y_enviar_encuesta", "todo")
-        need_abandono = run_mode in ("cargar_y_abandono", "solo_abandono", "cargar_y_ambos", "todo")
+        need_auto = run_mode in ("solo_autoservicio", "enviar_encuesta", "cargar_y_autoservicio", "cargar_hana_y_enviar_encuesta")
+        need_abandono = run_mode == "solo_abandono"
         if need_auto or need_abandono:
             autoservicio_rows, abandono_rows = build_segment_bases(all_rows)
             pyflow_progress(72)
@@ -1289,44 +1198,16 @@ def main() -> int:
                 if need_auto:
                     autoservicio_rows = enrich_rows(autoservicio_rows, client_lookup)
 
-                    logger.info(
-                        "Enviando encuestas Qualtrics a clientes Full Autoservicio..."
-                    )
-
-                    enviadas = 0
-                    total_clientes = len(autoservicio_rows)
-
-                    for index, cliente in enumerate(autoservicio_rows, start=1):
-
-                        if enviar_encuesta_qualtrics(
-                            config,
-                            cliente,
-                            logger
-                        ):
-                            enviadas += 1
-
-                            if index < total_clientes:
-                                logger.info(
-                                    "Esperando 5 segundos antes del siguiente envío..."
-                                )
-                                time.sleep(5)
-
-                    logger.info(
-                        "Encuestas Qualtrics enviadas: %s",
-                        enviadas
-                    )  
-
-
                 if need_abandono:
                     abandono_rows = enrich_rows(abandono_rows, client_lookup)
             if need_auto:
                 if send_surveys:
                     surveys_sent, surveys_without_email = enviar_encuestas_qualtrics(config, autoservicio_rows, logger)
-                if run_mode in ("cargar_y_autoservicio", "solo_autoservicio", "cargar_y_ambos", "todo"):
+                if write_autoservicio:
                     path = write_output(autoservicio_rows, config.output_dir, "GNS_IVR_Full_Autoservicio", config.output_format, logger)
                     if path:
                         output_files.append(path)
-            if need_abandono:
+            if need_abandono and write_abandono:
                 path = write_output(abandono_rows, config.output_dir, "GNS_IVR_Abandono_Real", config.output_format, logger)
                 if path:
                     output_files.append(path)
