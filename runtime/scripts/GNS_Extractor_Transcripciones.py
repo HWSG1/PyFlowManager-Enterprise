@@ -76,6 +76,7 @@ PYFLOW_PARAMS = {
     "CONTACT_LIST_ID": {"type": "tags", "label": "Contact List ID", "required": False},
     "CONTACT_LIST_NAME": {"type": "tags", "label": "Nombre lista de contacto", "required": False},
     "WRAPUP_CODE_ID": {"type": "tags", "label": "WrapUpCode ID opcional", "required": False},
+    "WRAPUP_CODE_NAME": {"type": "tags", "label": "Nombre de conclusión opcional", "required": False},
     "MAX_CONVERSATIONS": {"type": "number", "label": "Máximo conversaciones; vacío = todas", "required": False},
     "OUTPUT_CSV": {"type": "text", "label": "Ruta CSV de salida", "required": False},
     "JSON_OUTPUT_DIR": {"type": "text", "label": "Carpeta JSON opcional", "required": False}
@@ -205,6 +206,7 @@ class Config:
     contact_list_id: str
     contact_list_name: str
     wrapup_code_id: str
+    wrapup_code_name: str
     max_conversations: int
     page_size: int
     request_timeout: int
@@ -241,6 +243,7 @@ def load_config() -> Config:
         contact_list_id=env_str("CONTACT_LIST_ID", ""),
         contact_list_name=env_str("CONTACT_LIST_NAME", ""),
         wrapup_code_id=env_str("WRAPUP_CODE_ID", ""),
+        wrapup_code_name=env_str("WRAPUP_CODE_NAME", ""),
         max_conversations=env_int("MAX_CONVERSATIONS", 0),
         page_size=env_int("PAGE_SIZE", 500),
         request_timeout=env_int("REQUEST_TIMEOUT", 120),
@@ -519,12 +522,34 @@ def resolve_contact_list_id(config: Config, token: str, logger: logging.Logger) 
     return join_filter_values(resolved)
 
 
+def resolve_wrapup_code_id(config: Config, token: str, logger: logging.Logger) -> str:
+    if config.wrapup_code_id:
+        return join_filter_values(split_filter_values(config.wrapup_code_id))
+    if not config.wrapup_code_name:
+        return ""
+
+    names = split_filter_values(config.wrapup_code_name)
+    logger.info("Resolviendo conclusiones por nombre: %s", ", ".join(names))
+    wrapup_codes = paged_get_entities(config, token, logger, "/api/v2/routing/wrapupcodes")
+    resolved: List[str] = []
+
+    for name in names:
+        found = find_first_by_name(wrapup_codes, name)
+        if not found:
+            raise ValueError(f"No se encontró conclusión con nombre: {name}")
+        logger.info("Conclusión resuelta: %s -> %s", found.get("name"), found.get("id"))
+        resolved.append(str(found.get("id") or ""))
+
+    return join_filter_values(resolved)
+
+
 def apply_resolved_filters(config: Config, token: str, logger: logging.Logger) -> Config:
     """Resuelve filtros por nombre a sus IDs y los coloca en el mismo config."""
     config.queue_id = resolve_queue_id(config, token, logger)
     config.user_id = resolve_user_id(config, token, logger)
     config.campaign_id = resolve_campaign_id(config, token, logger)
     config.contact_list_id = resolve_contact_list_id(config, token, logger)
+    config.wrapup_code_id = resolve_wrapup_code_id(config, token, logger)
     return config
 
 
@@ -535,7 +560,7 @@ def validate_filter_safety(config: Config, logger: logging.Logger) -> None:
         "QUEUE_ID/QUEUE_NAME": config.queue_id or config.queue_name,
         "CAMPAIGN_ID/CAMPAIGN_NAME": config.campaign_id or config.campaign_name,
         "CONTACT_LIST_ID/CONTACT_LIST_NAME": config.contact_list_id or config.contact_list_name,
-        "WRAPUP_CODE_ID": config.wrapup_code_id,
+        "WRAPUP_CODE_ID/WRAPUP_CODE_NAME": config.wrapup_code_id or config.wrapup_code_name,
         "MAX_CONVERSATIONS": str(config.max_conversations) if config.max_conversations else "",
     }
     active = [k for k, v in filters.items() if str(v or "").strip()]
@@ -853,7 +878,7 @@ def main() -> int:
             "GENESYS_CLIENT_ID", "GENESYS_CLIENT_SECRET", "GENESYS_REGION", "START_DATE", "END_DATE",
             "OUTPUT_MODE", "CONVERSATION_ID", "USER_ID", "USER_NAME",
             "QUEUE_ID", "QUEUE_NAME", "CAMPAIGN_ID", "CAMPAIGN_NAME", "CONTACT_LIST_ID", "CONTACT_LIST_NAME",
-            "WRAPUP_CODE_ID", "MAX_CONVERSATIONS", "OUTPUT_CSV"
+            "WRAPUP_CODE_ID", "WRAPUP_CODE_NAME", "MAX_CONVERSATIONS", "OUTPUT_CSV"
         ])
         logger.info("Modo fecha: %s", date_mode)
         logger.info("Intervalo Genesys: %s/%s", start_utc, end_utc)

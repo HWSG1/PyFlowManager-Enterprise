@@ -293,13 +293,31 @@ router.get('/:id/parameters', async (req, res, next) => {
         'CAMPAIGN_NAME',
         'CONTACT_LIST_ID',
         'CONTACT_LIST_NAME',
-        'WRAPUP_CODE_ID'
+        'WRAPUP_CODE_ID',
+        'WRAPUP_CODE_NAME'
       ]);
 
       for (const row of rows) {
         if (tagParams.has(row.param_key)) {
           row.control_type = 'tags';
         }
+      }
+
+      if (!rows.some((row: any) => row.param_key === 'WRAPUP_CODE_NAME')) {
+        const baseId = rows.length ? Math.max(...rows.map((row: any) => Number(row.id) || 0)) + 1 : 1;
+        rows.push({
+          id: baseId,
+          script_id: scriptId,
+          param_key: 'WRAPUP_CODE_NAME',
+          param_value: '',
+          param_type: 'env',
+          control_type: 'tags',
+          label: 'Nombre de conclusión opcional',
+          options_json: null,
+          is_required: false,
+          global_key: null,
+          script_name: 'GNS_Extractor_Transcripciones.py'
+        });
       }
     }
 
