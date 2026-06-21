@@ -413,6 +413,11 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
 
   ngOnInit() {
     this.loadScriptParameters();
+
+    const selectedExecutionId = this.svc.consumeSelectedExecutionLogId();
+    if (selectedExecutionId !== null) {
+      this.openExecutionLog(selectedExecutionId);
+    }
   }
 
   get script() {

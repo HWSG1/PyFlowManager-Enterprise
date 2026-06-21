@@ -379,9 +379,11 @@ export class LogsComponent {
   viewLog(ex: Execution) {
     const target = this.svc.scripts().find(s => s.name === ex.script);
     if (target) {
-      this.svc.openScriptDetail(target);
-      this.svc.showToast(`Log ${ex.id} cargado en consola.`);
+      this.svc.openScriptDetail(target, ex.id);
+      return;
     }
+
+    this.svc.showToast(`No se encontró el script asociado a ${ex.id}.`, 'error');
   }
 
   exportLogs() {

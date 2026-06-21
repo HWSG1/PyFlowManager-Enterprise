@@ -486,24 +486,22 @@ export class DashboardComponent implements AfterViewInit, OnDestroy {
     if (!value) return '-';
 
     try {
-      const text = String(value);
-      const match = text.match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})/);
-      const date = match
-        ? new Date(
-            Number(match[1]),
-            Number(match[2]) - 1,
-            Number(match[3]),
-            Number(match[4]),
-            Number(match[5])
-          )
-        : new Date(text);
+      const text = String(value).trim();
+      const sqlDateWithoutTimezone = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2}(?:\.\d+)?)$/.exec(text);
+      const normalized = sqlDateWithoutTimezone
+        ? `${sqlDateWithoutTimezone[1]}T${sqlDateWithoutTimezone[2]}Z`
+        : text;
+      const date = value instanceof Date ? value : new Date(normalized);
+
+      if (Number.isNaN(date.getTime())) return text;
 
       return date.toLocaleString('es-HN', {
         day: '2-digit',
         month: '2-digit',
         year: 'numeric',
         hour: '2-digit',
-        minute: '2-digit'
+        minute: '2-digit',
+        timeZone: 'America/Tegucigalpa'
       });
     } catch {
       return String(value);
