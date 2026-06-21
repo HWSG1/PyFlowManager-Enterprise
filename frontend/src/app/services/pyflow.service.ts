@@ -569,10 +569,21 @@ export class PyflowService {
   }
 
   dashboard = signal<any | null>(null);
+  private dashboardChartRange: { dateFrom: string; dateTo: string } | null = null;
 
-  async loadDashboard() {
-    const res = await fetch(`${this.apiUrl}/dashboard/summary`);
+  async loadDashboard(dateFrom?: string, dateTo?: string) {
+    if (dateFrom && dateTo) {
+      this.dashboardChartRange = { dateFrom, dateTo };
+    }
+
+    const query = this.dashboardChartRange
+      ? `?dateFrom=${encodeURIComponent(this.dashboardChartRange.dateFrom)}&dateTo=${encodeURIComponent(this.dashboardChartRange.dateTo)}`
+      : '';
+    const res = await fetch(`${this.apiUrl}/dashboard/summary${query}`);
     const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data?.message || 'Error obteniendo dashboard');
+    }
     this.dashboard.set(data);
     return data;
   }

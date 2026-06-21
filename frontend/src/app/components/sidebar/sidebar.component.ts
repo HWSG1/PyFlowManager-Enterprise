@@ -97,7 +97,7 @@ export class SidebarComponent {
 
   btnClass(tab: TabName): string {
     const base = 'w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-all';
-    const active = 'text-blue-400 bg-slate-900 border-l-4 border-blue-500';
+    const active = 'text-accent bg-slate-900 border-l-4 border-accent';
     const inactive = 'text-slate-400 hover:text-slate-100 hover:bg-slate-900/50 border-l-4 border-transparent';
     return `${base} ${this.svc.activeTab() === tab ? active : inactive}`;
   }
