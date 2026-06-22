@@ -6,6 +6,10 @@ import { exec } from 'child_process';
 import path from 'path';
 import multer from 'multer';
 import fs from 'fs';
+import { createVersionSnapshot } from '../services/versioning.service';
+import { auditEvent } from '../services/audit.service';
+import { requireAuth, requireExecutionAccess, requirePermission, requireScriptAccess } from '../services/security.service';
+import { extractPyflowParams, syncScriptParameters } from '../services/scriptParameters.service';
 
 const router = Router();
 
@@ -22,53 +26,15 @@ const storage = multer.diskStorage({
 
 const upload = multer({ storage });
 
-function extractPyflowParams(content: string): Record<string, any> {
-  const startIndex = content.indexOf('PYFLOW_PARAMS');
-  if (startIndex === -1) return {};
-
-  const equalIndex = content.indexOf('=', startIndex);
-  if (equalIndex === -1) return {};
-
-  const braceStart = content.indexOf('{', equalIndex);
-  if (braceStart === -1) return {};
-
-  let depth = 0;
-  let braceEnd = -1;
-
-  for (let i = braceStart; i < content.length; i++) {
-    if (content[i] === '{') depth++;
-    if (content[i] === '}') depth--;
-
-    if (depth === 0) {
-      braceEnd = i;
-      break;
-    }
-  }
-
-  if (braceEnd === -1) return {};
-
-  const pythonDict = content.substring(braceStart, braceEnd + 1);
-
-  try {
-    const jsonLike = pythonDict
-      .replace(/\bTrue\b/g, 'true')
-      .replace(/\bFalse\b/g, 'false')
-      .replace(/\bNone\b/g, 'null')
-      .replace(/'/g, '"')
-      .replace(/,\s*([}\]])/g, '$1');
-
-    return JSON.parse(jsonLike);
-  } catch (error) {
-    console.error('Error parseando PYFLOW_PARAMS:', error);
-    return {};
-  }
-}
-
-router.get('/', async (_req, res, next) => {
+router.get('/', requireAuth, async (req, res, next) => {
   try {
     const pool = await getPool();
+    const user = (req as any).user;
 
-    const result = await pool.request().query(`
+    const result = await pool.request()
+      .input('user_id', sql.Int, user.id)
+      .input('is_super_admin', sql.Bit, !!user.is_super_admin)
+      .query(`
       SELECT
         id,
         name,
@@ -88,6 +54,21 @@ router.get('/', async (_req, res, next) => {
         total_errors,
         last_duration_seconds
       FROM dbo.vw_ScriptsSummary
+      WHERE @is_super_admin = 1 OR (
+        EXISTS (
+          SELECT 1 FROM dbo.UserRoles ur
+          JOIN dbo.RolePermissions rp ON rp.role_id = ur.role_id
+          JOIN dbo.Permissions p ON p.id = rp.permission_id
+          WHERE ur.user_id = @user_id AND p.permission_key = 'scripts.view'
+        )
+        AND (
+          NOT EXISTS (SELECT 1 FROM dbo.ScriptAccess sa WHERE sa.script_id = vw_ScriptsSummary.id)
+          OR EXISTS (
+            SELECT 1 FROM dbo.ScriptAccess sa
+            WHERE sa.script_id = vw_ScriptsSummary.id AND sa.user_id = @user_id AND sa.can_view = 1
+          )
+        )
+      )
       ORDER BY name
     `);
 
@@ -97,11 +78,15 @@ router.get('/', async (_req, res, next) => {
   }
 });
 
-router.post('/', upload.single('file'), async (req, res, next) => {
+router.post('/', requireAuth, requirePermission('scripts.create'), upload.single('file'), async (req, res, next) => {
   try {
     const body = req.body || {};
     const pool = await getPool();
     const uploadedFile = req.file;
+
+    if (uploadedFile?.path) {
+      extractPyflowParams(fs.readFileSync(uploadedFile.path, 'utf8'));
+    }
 
     const rawFilePath = uploadedFile
       ? uploadedFile.filename
@@ -152,52 +137,21 @@ router.post('/', upload.single('file'), async (req, res, next) => {
     const scriptId = insertedScript.id;
 
     if (uploadedFile?.path) {
+      await createVersionSnapshot(
+        scriptId,
+        body.version || '1.0.0',
+        uploadedFile.path,
+        (req as any).user?.id || body.created_by_user_id || env.defaultUserId,
+        body.change_notes || 'Versión inicial'
+      );
       const content = fs.readFileSync(uploadedFile.path, 'utf8');
-      const pyflowParams = extractPyflowParams(content);
-
-      for (const [key, config] of Object.entries<any>(pyflowParams)) {
-        await pool.request()
-          .input('script_id', sql.Int, scriptId)
-          .input('param_key', sql.NVarChar(150), key)
-          .input('param_value', sql.NVarChar(1000), String(config.default ?? ''))
-          .input('param_type', sql.NVarChar(30), 'env')
-          .input('control_type', sql.NVarChar(30), config.type ?? 'text')
-          .input('is_secret', sql.Bit, 0)
-          .input('description', sql.NVarChar(500), config.description || config.label || null)
-          .input('label', sql.NVarChar(255), config.label || key)
-          .input('options_json', sql.NVarChar(sql.MAX), config.options ? JSON.stringify(config.options) : null)
-          .input('is_required', sql.Bit, config.required ? 1 : 0)
-          .input('global_key', sql.NVarChar(150), config.global_key || null)
-          .query(`
-            INSERT INTO dbo.ScriptParameters (
-              script_id,
-              param_key,
-              param_value,
-              param_type,
-              control_type,
-              is_secret,
-              description,
-              label,
-              options_json,
-              is_required,
-              global_key
-            )
-            VALUES (
-              @script_id,
-              @param_key,
-              @param_value,
-              @param_type,
-              @control_type,
-              @is_secret,
-              @description,
-              @label,
-              @options_json,
-              @is_required,
-              @global_key
-            )
-          `);
-      }
+      await syncScriptParameters(scriptId, content);
     }
+
+    await auditEvent(req, 'script.create', 'script', scriptId, null, {
+      name: insertedScript.name,
+      version: body.version || '1.0.0'
+    });
 
     res.status(201).json(insertedScript);
   } catch (err) {
@@ -205,7 +159,7 @@ router.post('/', upload.single('file'), async (req, res, next) => {
   }
 });
 
-router.get('/:id/parameters', async (req, res, next) => {
+router.get('/:id/parameters', requireAuth, requireScriptAccess('view'), async (req, res, next) => {
   try {
     const pool = await getPool();
     const scriptId = Number(req.params.id);
@@ -829,7 +783,7 @@ router.get('/:id/parameters', async (req, res, next) => {
   }
 });
 
-router.patch('/:id/toggle', async (req, res, next) => {
+router.patch('/:id/toggle', requireAuth, requireScriptAccess('edit'), async (req, res, next) => {
   try {
     const pool = await getPool();
     const id = Number(req.params.id);
@@ -845,15 +799,18 @@ router.patch('/:id/toggle', async (req, res, next) => {
       `);
 
     res.json(result.recordset[0]);
+    await auditEvent(req, 'script.status.toggle', 'script', id, null, result.recordset[0]?.is_active);
   } catch (err) {
     next(err);
   }
 });
 
-router.delete('/:id', async (req, res, next) => {
+router.delete('/:id', requireAuth, requireScriptAccess('edit'), async (req, res, next) => {
   try {
     const pool = await getPool();
     const id = Number(req.params.id);
+    const before = await pool.request().input('id', sql.Int, id)
+      .query('SELECT id,name,is_active FROM dbo.Scripts WHERE id=@id');
 
     await pool.request()
       .input('id', sql.Int, id)
@@ -864,13 +821,14 @@ router.delete('/:id', async (req, res, next) => {
         WHERE id = @id
       `);
 
+    await auditEvent(req, 'script.delete', 'script', id, before.recordset[0] || null, { is_active: false });
     res.json({ ok: true });
   } catch (err) {
     next(err);
   }
 });
 
-router.delete('/:id/definitive', async (req, res, next) => {
+router.delete('/:id/definitive', requireAuth, requireScriptAccess('edit'), async (req, res, next) => {
   const pool = await getPool();
   const scriptId = Number(req.params.id);
 
@@ -893,7 +851,15 @@ router.delete('/:id/definitive', async (req, res, next) => {
       return res.status(404).json({ message: 'Script no encontrado.' });
     }
 
-    const filePath = scriptResult.recordset[0].file_path;
+    const deletedScript = scriptResult.recordset[0];
+    const filePath = deletedScript.file_path;
+    const allowedDir = path.resolve(env.runtime.scriptsDir);
+    const fullPath = filePath
+      ? path.resolve(path.isAbsolute(filePath) ? filePath : path.join(allowedDir, filePath))
+      : null;
+    if (fullPath && fullPath !== allowedDir && !fullPath.startsWith(`${allowedDir}${path.sep}`)) {
+      return res.status(400).json({ message: 'Ruta de archivo fuera del directorio permitido.' });
+    }
 
     await tx.begin();
 
@@ -901,20 +867,6 @@ router.delete('/:id/definitive', async (req, res, next) => {
     request.input('script_id', sql.Int, scriptId);
 
     await request.query(`
-      DELETE FROM dbo.ScheduleParameters
-      WHERE schedule_id IN (
-        SELECT id FROM dbo.Schedules WHERE script_id = @script_id
-      );
-
-      DELETE FROM dbo.Schedules
-      WHERE script_id = @script_id;
-
-      DELETE FROM dbo.ScriptParameters
-      WHERE script_id = @script_id;
-
-      DELETE FROM dbo.ScriptVersions
-      WHERE script_id = @script_id;
-
       DELETE FROM dbo.ExecutionLogs
       WHERE execution_id IN (
         SELECT id FROM dbo.ScriptExecutions WHERE script_id = @script_id
@@ -936,30 +888,45 @@ router.delete('/:id/definitive', async (req, res, next) => {
       DELETE FROM dbo.ScriptExecutions
       WHERE script_id = @script_id;
 
+      DELETE FROM dbo.ScheduleParameters
+      WHERE schedule_id IN (
+        SELECT id FROM dbo.Schedules WHERE script_id = @script_id
+      );
+
+      DELETE FROM dbo.Schedules
+      WHERE script_id = @script_id;
+
+      DELETE FROM dbo.ScriptAccess
+      WHERE script_id = @script_id;
+
+      DELETE FROM dbo.ScriptParameters
+      WHERE script_id = @script_id;
+
+      DELETE FROM dbo.ScriptVersions
+      WHERE script_id = @script_id;
+
       DELETE FROM dbo.Scripts
       WHERE id = @script_id;
     `);
 
     await tx.commit();
 
-    if (filePath) {
-      const fullPath = path.isAbsolute(filePath)
-        ? filePath
-        : path.resolve(env.runtime.scriptsDir, filePath);
-
-      const allowedDir = path.resolve(env.runtime.scriptsDir);
-
-      if (!fullPath.startsWith(allowedDir)) {
-        return res.status(400).json({
-          message: 'Ruta de archivo fuera del directorio permitido.'
-        });
-      }
-
+    if (fullPath) {
       if (fs.existsSync(fullPath)) {
         fs.unlinkSync(fullPath);
       }
     }
 
+    const versionsRoot = path.resolve(env.runtime.scriptsDir, '.versions');
+    const scriptVersionsDirectory = path.resolve(versionsRoot, String(scriptId));
+    if (
+      scriptVersionsDirectory.startsWith(`${versionsRoot}${path.sep}`) &&
+      fs.existsSync(scriptVersionsDirectory)
+    ) {
+      fs.rmSync(scriptVersionsDirectory, { recursive: true, force: true });
+    }
+
+    await auditEvent(req, 'script.delete.definitive', 'script', scriptId, deletedScript, null);
     return res.json({
       ok: true,
       message: 'Script eliminado definitivamente.'
@@ -973,13 +940,13 @@ router.delete('/:id/definitive', async (req, res, next) => {
   }
 });
 
-router.post('/:id/run', async (req, res, next) => {
+router.post('/:id/run', requireAuth, requireScriptAccess('execute'), async (req, res, next) => {
   try {
     const id = Number(req.params.id);
 
     const result = await runScript(
       id,
-      req.body?.triggered_by_user_id || env.defaultUserId,
+      (req as any).user?.id || req.body?.triggered_by_user_id || env.defaultUserId,
       req.body?.parameters || {}
     );
 
@@ -989,7 +956,7 @@ router.post('/:id/run', async (req, res, next) => {
   }
 });
 
-router.post('/executions/:id/cancel', async (req, res, next) => {
+router.post('/executions/:id/cancel', requireAuth, requirePermission('executions.cancel'), requireExecutionAccess('execute'), async (req, res, next) => {
   try {
     const executionId = Number(req.params.id);
     const pool = await getPool();
@@ -1022,6 +989,8 @@ router.post('/executions/:id/cancel', async (req, res, next) => {
       .input('exit_code', sql.Int, -9)
       .input('error_message', sql.NVarChar(sql.MAX), 'Ejecución cancelada manualmente')
       .execute('dbo.usp_FinishScriptExecution');
+
+    await auditEvent(req, 'execution.cancel', 'execution', executionId, { status: execution.status }, { status: 'Cancelado' });
 
     res.json({ ok: true, message: 'Ejecución cancelada correctamente.' });
   } catch (err) {

@@ -8,30 +8,12 @@ import { environment } from '../../environments/environment';
 function formatDate(value: any): string {
   if (!value) return 'Nunca';
 
-  const raw = String(value);
-  const match = raw.match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})/);
-
-  if (match) {
-    const [, year, month, day, hour, minute] = match;
-    const date = new Date(
-      Number(year),
-      Number(month) - 1,
-      Number(day),
-      Number(hour),
-      Number(minute)
-    );
-
-    return new Intl.DateTimeFormat('es-HN', {
-      day: '2-digit',
-      month: '2-digit',
-      year: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit',
-      hour12: true
-    }).format(date);
-  }
-
-  const date = new Date(raw);
+  const raw = String(value).trim();
+  const sqlDateWithoutTimezone = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2}(?:\.\d+)?)$/.exec(raw);
+  const normalized = sqlDateWithoutTimezone
+    ? `${sqlDateWithoutTimezone[1]}T${sqlDateWithoutTimezone[2]}Z`
+    : raw;
+  const date = value instanceof Date ? value : new Date(normalized);
 
   if (Number.isNaN(date.getTime())) {
     return raw;
@@ -43,7 +25,8 @@ function formatDate(value: any): string {
     year: 'numeric',
     hour: '2-digit',
     minute: '2-digit',
-    hour12: true
+    hour12: true,
+    timeZone: 'America/Tegucigalpa'
   }).format(date);
 }
 
@@ -85,6 +68,7 @@ export class PyflowService {
   private autoRefreshSub: Subscription | null = null;
   selectedExecutionParameters = signal<any[]>([]);
   showExecutionParametersModal = signal(false);
+  selectedExecutionLogId = signal<number | null>(null);
   editingScheduleId = signal<number | null>(null);
   editingScheduleData = signal<any>(null);
 
@@ -223,10 +207,25 @@ export class PyflowService {
     this.pushBrowserState(tab);
   }
 
-  openScriptDetail(script: Script) {
+  openScriptDetail(script: Script, executionId?: string | number) {
+    const cleanExecutionId = executionId === undefined
+      ? null
+      : Number(String(executionId).replace('EX-', ''));
+
+    this.selectedExecutionLogId.set(
+      cleanExecutionId !== null && Number.isFinite(cleanExecutionId)
+        ? cleanExecutionId
+        : null
+    );
     this.selectedScript.set(script);
     this.activeTab.set('script-detail');
     this.pushBrowserState('script-detail', script.id);
+  }
+
+  consumeSelectedExecutionLogId(): number | null {
+    const executionId = this.selectedExecutionLogId();
+    this.selectedExecutionLogId.set(null);
+    return executionId;
   }
 
   private setupBrowserHistory() {
@@ -402,7 +401,8 @@ export class PyflowService {
   }
 
   watchExecution(executionId: number) {
-    const source = new EventSource(`${this.apiUrl}/executions/${executionId}/stream`);
+    const token = encodeURIComponent(localStorage.getItem('pyflow_token') || '');
+    const source = new EventSource(`${this.apiUrl}/executions/${executionId}/stream?access_token=${token}`);
 
     source.onmessage = (event) => {
       const payload = JSON.parse(event.data);
@@ -463,6 +463,34 @@ export class PyflowService {
 
   getScriptParameters(scriptId: number) {
     return this.http.get<any[]>(`${this.apiUrl}/scripts/${scriptId}/parameters`);
+  }
+
+  getScriptGovernance(scriptId: number) {
+    return this.http.get<any>(`${this.apiUrl}/governance/scripts/${scriptId}`);
+  }
+
+  updateScriptPolicy(scriptId: number, policy: any) {
+    return this.http.put(`${this.apiUrl}/governance/scripts/${scriptId}/policy`, policy);
+  }
+
+  updateScriptAccess(scriptId: number, entries: any[]) {
+    return this.http.put(`${this.apiUrl}/governance/scripts/${scriptId}/access`, { entries });
+  }
+
+  uploadScriptVersion(scriptId: number, file: File, version: string, notes: string) {
+    const form = new FormData();
+    form.append('file', file);
+    form.append('version', version);
+    form.append('notes', notes);
+    return this.http.post(`${this.apiUrl}/governance/scripts/${scriptId}/versions`, form);
+  }
+
+  restoreScriptVersion(scriptId: number, versionId: number) {
+    return this.http.post(`${this.apiUrl}/governance/scripts/${scriptId}/versions/${versionId}/restore`, {});
+  }
+
+  getAuditEvents() {
+    return this.http.get<any[]>(`${this.apiUrl}/governance/audit`);
   }
 
   toggleScheduleStatus(id: number) {
@@ -570,10 +598,21 @@ export class PyflowService {
   }
 
   dashboard = signal<any | null>(null);
+  private dashboardChartRange: { dateFrom: string; dateTo: string } | null = null;
 
-  async loadDashboard() {
-    const res = await fetch(`${this.apiUrl}/dashboard/summary`);
+  async loadDashboard(dateFrom?: string, dateTo?: string) {
+    if (dateFrom && dateTo) {
+      this.dashboardChartRange = { dateFrom, dateTo };
+    }
+
+    const query = this.dashboardChartRange
+      ? `?dateFrom=${encodeURIComponent(this.dashboardChartRange.dateFrom)}&dateTo=${encodeURIComponent(this.dashboardChartRange.dateTo)}`
+      : '';
+    const res = await fetch(`${this.apiUrl}/dashboard/summary${query}`, { headers: this.authHeaders() });
     const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data?.message || 'Error obteniendo dashboard');
+    }
     this.dashboard.set(data);
     return data;
   }

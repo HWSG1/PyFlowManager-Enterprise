@@ -2686,3 +2686,81 @@ window.PYFLOW_MANUAL_DATA = {
     "updatedAt": "2026-06-03 07:41"
   }
 };
+
+// Información incorporada con la primera fase de gobierno y automatización.
+(() => {
+  const manual = window.PYFLOW_MANUAL_DATA;
+  const column = (name, type, nullable = true, identity = false) => ({ name, type, nullable, identity });
+  const addColumns = (table, columns) => {
+    manual.schema[table] = manual.schema[table] || [];
+    const current = new Set(manual.schema[table].map(item => item.name));
+    columns.filter(item => !current.has(item.name)).forEach(item => manual.schema[table].push(item));
+  };
+
+  manual.metadata.updatedAt = '2026-06-21';
+  manual.metadata.version = '1.0 · Enterprise';
+  manual.release = {
+    features: [
+      { title: 'Reintentos configurables', body: 'Cantidad, espera inicial y estrategia incremental por script. Los reintentos pendientes permanecen en SQL Server.', location: 'Script → Gobierno y automatización → Política' },
+      { title: 'Alertas automáticas', body: 'Correo por éxito o fallo final mediante Microsoft Graph, con destinatarios configurables.', location: 'Script → Gobierno y automatización → Política' },
+      { title: 'Versionado y rollback', body: 'Snapshots inmutables, checksum SHA-256, notas y restauración de versiones anteriores.', location: 'Script → Gobierno y automatización → Versiones' },
+      { title: 'Permisos por script', body: 'Control individual para ver, ejecutar, editar y programar cada script.', location: 'Script → Gobierno y automatización → Accesos' },
+      { title: 'Auditoría ampliada', body: 'Registro de cambios de usuarios, variables, scripts, políticas, programaciones, versiones y ejecuciones.', location: 'Configuración → Auditoría' }
+    ],
+    databaseOptions: [
+      { scenario: 'Base nueva · SQL Server 2019', file: 'PyFlowManager_Create_SQLServer_2019.sql', action: 'Ejecutar una sola vez sobre una instancia compatible con SQL Server 2019.' },
+      { scenario: 'Base nueva · SQL Server 2025', file: 'PyFlowManager_Create_SQLServer_2025.sql', action: 'Ejecutar una sola vez sobre SQL Server 2025.' },
+      { scenario: 'Base existente', file: '03_First_Phase_Governance.sql', action: 'Respaldar y ejecutar solamente esta migración idempotente.' }
+    ]
+  };
+
+  addColumns('Scripts', [
+    column('max_retries', 'smallint', false),
+    column('retry_delay_seconds', 'int', false),
+    column('retry_backoff_factor', 'decimal(6,2)', false),
+    column('alert_on_success', 'bit', false),
+    column('alert_on_failure', 'bit', false),
+    column('alert_recipients', 'nvarchar(max)')
+  ]);
+  addColumns('ExecutionQueue', [
+    column('available_at', 'datetime2(0)'),
+    column('triggered_by_user_id', 'int'),
+    column('trigger_type', 'nvarchar(20)'),
+    column('retry_attempt', 'smallint', false),
+    column('parent_execution_id', 'int')
+  ]);
+  manual.schema.ScriptAccess = [
+    column('script_id', 'int', false), column('user_id', 'int', false),
+    column('can_view', 'bit', false), column('can_execute', 'bit', false),
+    column('can_edit', 'bit', false), column('can_schedule', 'bit', false),
+    column('granted_by_user_id', 'int'), column('created_at', 'datetime2(0)', false),
+    column('updated_at', 'datetime2(0)', false)
+  ];
+  manual.schema.AuditEvents = [
+    column('id', 'bigint', false, true), column('user_id', 'int'),
+    column('username', 'nvarchar(150)'), column('action_key', 'nvarchar(150)', false),
+    column('entity_type', 'nvarchar(100)', false), column('entity_id', 'nvarchar(150)'),
+    column('old_value', 'nvarchar(max)'), column('new_value', 'nvarchar(max)'),
+    column('ip_address', 'nvarchar(80)'), column('user_agent', 'nvarchar(500)'),
+    column('created_at', 'datetime2(0)', false)
+  ];
+  manual.tableDescriptions.ScriptAccess = 'Permisos específicos por usuario y script. Complementa los permisos generales asignados por rol.';
+  manual.tableDescriptions.AuditEvents = 'Auditoría general de cambios y acciones. Los valores sensibles se almacenan enmascarados.';
+
+  [
+    ['scripts.schedule', 'scripts', 'schedule', 'Crear y editar programaciones del script'],
+    ['scripts.manage_access', 'scripts', 'manage_access', 'Administrar permisos específicos del script'],
+    ['audit.view', 'audit', 'view', 'Consultar auditoría general']
+  ].forEach(([permission_key, module_key, action_key, description]) => {
+    if (!manual.permissions.some(item => item.permission_key === permission_key)) {
+      manual.permissions.push({ permission_key, module_key, action_key, description });
+    }
+  });
+
+  manual.troubles.unshift(
+    { title: 'La migración funciona en una computadora y en otra no', body: 'Verifique que la segunda computadora tenga el mismo código, ejecute npm run migrate:governance desde backend y confirme DB_SERVER, DB_PORT y DB_DATABASE en el archivo .env.' },
+    { title: 'No se envían alertas de ejecución', body: 'Revise las variables globales GRAPH_TENANT_ID, GRAPH_CLIENT_ID, GRAPH_CLIENT_SECRET y GRAPH_SENDER_EMAIL, los permisos Mail.Send de la aplicación y los destinatarios de la política del script.' },
+    { title: 'No puedo ver o ejecutar un script', body: 'El usuario necesita el permiso general del rol y, cuando el script tiene accesos específicos, la casilla correspondiente en ScriptAccess.' },
+    { title: 'Una versión no se puede publicar', body: 'Cada versión debe ser única. Revise también que PYFLOW_PARAMS sea válido y que la versión solo contenga letras, números, punto, guion o guion bajo.' }
+  );
+})();

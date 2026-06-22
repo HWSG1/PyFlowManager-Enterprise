@@ -44,6 +44,7 @@ export async function processExecutionQueue(): Promise<void> {
       SELECT TOP 1 *
       FROM dbo.ExecutionQueue WITH (READPAST)
       WHERE status = 'PENDING'
+        AND (available_at IS NULL OR available_at <= SYSUTCDATETIME())
       ORDER BY created_at ASC
     `);
 
@@ -69,11 +70,13 @@ export async function processExecutionQueue(): Promise<void> {
 
     await runScript(
         queueItem.script_id,
-        undefined,
+        queueItem.triggered_by_user_id || undefined,
         parameters,
         true,
         queueItem.schedule_id || undefined,
-        queueItem.schedule_id ? 'schedule' : 'queue'
+        queueItem.trigger_type || (queueItem.schedule_id ? 'schedule' : 'queue'),
+        Number(queueItem.retry_attempt || 0),
+        queueItem.parent_execution_id || undefined
       );
 
       await pool.request()

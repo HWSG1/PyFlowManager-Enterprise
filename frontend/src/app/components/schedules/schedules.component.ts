@@ -70,6 +70,42 @@ import { Schedule } from '../../models/models';
                         rows="3"
                         class="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-300 focus:outline-none focus:border-blue-500">
                       </textarea>
+                    } @else if (p.control_type === 'tags') {
+                      <div class="bg-slate-900 border border-slate-800 rounded-lg p-2.5 min-h-[88px] focus-within:border-blue-500">
+                        <div class="flex flex-wrap gap-2 mb-2 min-h-[28px]">
+                          @for (tag of tagItems(p); track tag) {
+                            <span class="inline-flex items-center gap-1.5 rounded-full border border-blue-500/40 bg-blue-500/10 px-2.5 py-1 text-[11px] text-blue-100 max-w-full">
+                              <span class="truncate max-w-[220px]">{{ tag }}</span>
+                              <button
+                                type="button"
+                                (click)="removeTagValue(p, tag)"
+                                class="text-blue-200 hover:text-rose-300 leading-none"
+                                title="Quitar valor">
+                                ×
+                              </button>
+                            </span>
+                          } @empty {
+                            <span class="text-[11px] text-slate-500 py-1">
+                              Sin valores agregados.
+                            </span>
+                          }
+                        </div>
+
+                        <div class="flex gap-2">
+                          <input
+                            type="text"
+                            [(ngModel)]="tagDraftValues[p.param_key]"
+                            (keydown)="onTagInputKeydown($event, p)"
+                            placeholder="Buscar o agregar valor..."
+                            class="min-w-0 flex-1 bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-xs text-slate-300 focus:outline-none focus:border-blue-500">
+                          <button
+                            type="button"
+                            (click)="addTagValue(p)"
+                            class="shrink-0 bg-blue-600 hover:bg-blue-500 text-white font-semibold text-xs px-3 py-1.5 rounded">
+                            Agregar
+                          </button>
+                        </div>
+                      </div>
                     } @else {
                       <input
                         [type]="getInputType(p.control_type)"
@@ -350,6 +386,7 @@ export class SchedulesComponent {
   } = this.getEmptyScheduleForm();
 
   scheduleParameters: any[] = [];
+  tagDraftValues: Record<string, string> = {};
   scheduleNameFilter = '';
   scheduleStatusFilter = 'all';
 
@@ -406,6 +443,7 @@ export class SchedulesComponent {
     this.svc.clearEditingSchedule();
     this.newSchedule = this.getEmptyScheduleForm();
     this.scheduleParameters = [];
+    this.tagDraftValues = {};
     this.buildCronFromControls();
   }
 
@@ -425,6 +463,7 @@ export class SchedulesComponent {
 
     this.svc.getScriptParameters(Number(this.newSchedule.scriptId)).subscribe({
       next: params => {
+        this.tagDraftValues = {};
         this.scheduleParameters = params
           .filter(p => p.control_type !== 'global')
           .map(p => ({
@@ -478,6 +517,49 @@ export class SchedulesComponent {
     if (controlType === 'number') return 'number';
 
     return 'text';
+  }
+
+  tagItems(param: any): string[] {
+    return String(param?.value || '')
+      .split(';')
+      .map(value => value.trim())
+      .filter(Boolean);
+  }
+
+  addTagValue(param: any) {
+    const key = String(param?.param_key || '');
+    const draft = String(this.tagDraftValues[key] || '').trim();
+    if (!draft) return;
+
+    const current = this.tagItems(param);
+    const incoming = draft
+      .replace(/\r?\n/g, ';')
+      .replace(/,/g, ';')
+      .split(';')
+      .map(value => value.trim())
+      .filter(Boolean);
+
+    for (const value of incoming) {
+      if (!current.includes(value)) {
+        current.push(value);
+      }
+    }
+
+    param.value = current.join(';');
+    this.tagDraftValues[key] = '';
+  }
+
+  removeTagValue(param: any, value: string) {
+    param.value = this.tagItems(param)
+      .filter(item => item !== value)
+      .join(';');
+  }
+
+  onTagInputKeydown(event: KeyboardEvent, param: any) {
+    if (['Enter', 'Tab', ',', ';'].includes(event.key)) {
+      event.preventDefault();
+      this.addTagValue(param);
+    }
   }
 
   onFrequencyChange() {
@@ -705,6 +787,7 @@ export class SchedulesComponent {
 
         this.svc.getScriptParameters(Number(schedule.script_id)).subscribe({
           next: params => {
+            this.tagDraftValues = {};
             this.scheduleParameters = params
               .filter(p => p.control_type !== 'global')
               .map(p => ({

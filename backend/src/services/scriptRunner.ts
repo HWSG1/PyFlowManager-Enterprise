@@ -6,6 +6,8 @@ import { getPool, sql } from '../db/sql';
 import { env } from '../config/env';
 import { addExecutionLog } from './dbLogService';
 import { emitExecutionLog } from './logBus';
+import { sendExecutionAlert } from './notification.service';
+import { auditEvent } from './audit.service';
 
 function resolveScriptPath(filePath: string): string {
   if (path.isAbsolute(filePath)) {
@@ -54,7 +56,9 @@ export async function runScript(
   parameters: Record<string, string> = {},
   skipQueueCheck = false,
   scheduleId?: number,
-  triggerType: 'manual' | 'schedule' | 'queue' = 'manual',
+  triggerType: 'manual' | 'schedule' | 'queue' | 'retry' = 'manual',
+  retryAttempt = 0,
+  parentExecutionId?: number,
 ): Promise<{ executionId: number }> {
   const pool = await getPool();
 
@@ -62,15 +66,16 @@ export async function runScript(
     .input('id', sql.Int, scriptId)
     .query(`
       SELECT TOP 1
-        id,
-        environment_id,
-        name,
-        file_path,
-        working_directory,
-        python_interpreter,
-        is_active
-      FROM dbo.Scripts
-      WHERE id = @id
+        s.id, s.environment_id, s.name, s.file_path, s.working_directory,
+        s.python_interpreter, s.is_active, s.max_retries, s.retry_delay_seconds,
+        s.retry_backoff_factor, s.alert_on_success, s.alert_on_failure,
+        s.alert_recipients, v.id AS current_version_id
+      FROM dbo.Scripts s
+      OUTER APPLY (
+        SELECT TOP 1 id FROM dbo.ScriptVersions
+        WHERE script_id = s.id AND is_current = 1 ORDER BY id DESC
+      ) v
+      WHERE s.id = @id
     `);
 
   if (!scriptResult.recordset.length) {
@@ -119,12 +124,21 @@ if (!skipQueueCheck) {
       .input('schedule_id', sql.Int, scheduleId || null)
       .input('parameters_json', sql.NVarChar(sql.MAX), JSON.stringify(parameters || {}))
       .input('status', sql.NVarChar(30), 'PENDING')
+      .input('triggered_by_user_id', sql.Int, triggeredByUserId || env.defaultUserId)
+      .input('trigger_type', sql.NVarChar(20), triggerType)
+      .input('retry_attempt', sql.SmallInt, retryAttempt)
+      .input('parent_execution_id', sql.Int, parentExecutionId || null)
       .query(`
         INSERT INTO dbo.ExecutionQueue (
           script_id,
           schedule_id,
           parameters_json,
           status,
+          available_at,
+          triggered_by_user_id,
+          trigger_type,
+          retry_attempt,
+          parent_execution_id,
           created_at
         )
         OUTPUT INSERTED.id
@@ -133,6 +147,11 @@ if (!skipQueueCheck) {
           @schedule_id,
           @parameters_json,
           @status,
+          SYSUTCDATETIME(),
+          @triggered_by_user_id,
+          @trigger_type,
+          @retry_attempt,
+          @parent_execution_id,
           GETDATE()
         )
       `);
@@ -200,10 +219,10 @@ if (!skipQueueCheck) {
 
   const startRequest = pool.request()
     .input('script_id', sql.Int, scriptId)
-    .input('script_version_id', sql.Int, null)
+    .input('script_version_id', sql.Int, script.current_version_id || null)
     .input('schedule_id', sql.Int, scheduleId || null)
     .input('triggered_by_user_id', sql.Int, triggeredByUserId || env.defaultUserId)
-    .input('parent_execution_id', sql.Int, null)
+    .input('parent_execution_id', sql.Int, parentExecutionId || null)
     .input('trigger_type', sql.NVarChar(20), triggerType)
     .input('command_line', sql.NVarChar(sql.MAX), commandLine)
     .input('working_directory', sql.NVarChar(1000), workingDirectory)
@@ -213,6 +232,11 @@ if (!skipQueueCheck) {
 
   const startResult = await startRequest.execute('dbo.usp_StartScriptExecution');
   const executionId = startResult.output.execution_id as number;
+
+  await pool.request()
+    .input('execution_id', sql.Int, executionId)
+    .input('retry_attempt', sql.SmallInt, retryAttempt)
+    .query('UPDATE dbo.ScriptExecutions SET retry_attempt=@retry_attempt WHERE id=@execution_id');
 
   for (const [key, value] of Object.entries(finalParameters)) {
     await pool.request()
@@ -314,21 +338,12 @@ if (!skipQueueCheck) {
 
   child.on('error', async (error) => {
     const msg = `Error iniciando proceso Python: ${error.message}`;
-
+    rememberLine(recentOutput, msg);
     await addExecutionLog(executionId, 'ERROR', msg);
-
-    await pool.request()
-      .input('execution_id', sql.Int, executionId)
-      .input('status', sql.NVarChar(20), 'Error')
-      .input('exit_code', sql.Int, -1)
-      .input('error_message', sql.NVarChar(sql.MAX), msg)
-      .execute('dbo.usp_FinishScriptExecution');
-
     emitExecutionLog(executionId, {
       level: 'ERROR',
       message: msg,
-      done: true,
-      status: 'Error'
+      source: 'runner'
     });
   });
 
@@ -377,6 +392,67 @@ if (!skipQueueCheck) {
       .input('exit_code', sql.Int, exitCode)
       .input('error_message', sql.NVarChar(sql.MAX), exitCode === 0 ? null : msg)
       .execute('dbo.usp_FinishScriptExecution');
+
+    await auditEvent(null, 'execution.finish', 'execution', executionId, null, {
+      script_id: scriptId,
+      status,
+      exit_code: exitCode,
+      retry_attempt: retryAttempt
+    });
+
+    const maxRetries = Math.max(0, Number(script.max_retries || 0));
+    const shouldRetry = status === 'Error' && retryAttempt < maxRetries;
+
+    if (shouldRetry) {
+      const baseDelay = Math.max(1, Number(script.retry_delay_seconds || 60));
+      const backoff = Math.max(1, Number(script.retry_backoff_factor || 1));
+      const delaySeconds = Math.round(baseDelay * Math.pow(backoff, retryAttempt));
+      const rootExecutionId = parentExecutionId || executionId;
+      const retryMessage = `Reintento ${retryAttempt + 1}/${maxRetries} programado en ${delaySeconds} segundos.`;
+      await addExecutionLog(executionId, 'WARNING', retryMessage);
+      emitExecutionLog(executionId, { level: 'WARNING', message: retryMessage, retryScheduled: true });
+
+      await pool.request()
+        .input('script_id', sql.Int, scriptId)
+        .input('schedule_id', sql.Int, scheduleId || null)
+        .input('parameters_json', sql.NVarChar(sql.MAX), JSON.stringify(parameters || {}))
+        .input('triggered_by_user_id', sql.Int, triggeredByUserId || env.defaultUserId)
+        .input('retry_attempt', sql.SmallInt, retryAttempt + 1)
+        .input('parent_execution_id', sql.Int, rootExecutionId)
+        .input('delay_seconds', sql.Int, delaySeconds)
+        .query(`
+          INSERT INTO dbo.ExecutionQueue (
+            script_id, schedule_id, parameters_json, status, created_at, available_at,
+            triggered_by_user_id, trigger_type, retry_attempt, parent_execution_id
+          ) VALUES (
+            @script_id, @schedule_id, @parameters_json, 'PENDING', SYSUTCDATETIME(),
+            DATEADD(SECOND, @delay_seconds, SYSUTCDATETIME()), @triggered_by_user_id,
+            'retry', @retry_attempt, @parent_execution_id
+          )
+        `);
+    }
+
+    const shouldAlert =
+      (status === 'Exitoso' && script.alert_on_success) ||
+      (status === 'Error' && !shouldRetry && script.alert_on_failure);
+
+    if (shouldAlert && script.alert_recipients) {
+      const finished = await pool.request()
+        .input('execution_id', sql.Int, executionId)
+        .query('SELECT start_time,end_time,duration_seconds,error_message FROM dbo.ScriptExecutions WHERE id=@execution_id');
+      const row = finished.recordset[0] || {};
+      await sendExecutionAlert({
+        executionId,
+        scriptName: script.name,
+        status,
+        startedAt: row.start_time,
+        endedAt: row.end_time,
+        durationSeconds: row.duration_seconds,
+        errorMessage: row.error_message,
+        retryAttempt,
+        recipients: script.alert_recipients
+      });
+    }
 
     emitExecutionLog(executionId, {
       level: exitCode === 0 ? 'INFO' : 'ERROR',

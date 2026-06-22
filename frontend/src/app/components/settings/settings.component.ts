@@ -4,7 +4,7 @@ import { FormsModule } from '@angular/forms';
 import { PyflowService } from '../../services/pyflow.service';
 import { ThemeService } from '../../services/theme.service';
 
-type SettingsView = 'system' | 'variables' | 'themes';
+type SettingsView = 'system' | 'variables' | 'themes' | 'audit';
 
 @Component({
   selector: 'app-settings',
@@ -22,6 +22,7 @@ type SettingsView = 'system' | 'variables' | 'themes';
           <button type="button" [class]="viewButtonClass('system')" (click)="activeView = 'system'">Sistema</button>
           <button type="button" [class]="viewButtonClass('variables')" (click)="activeView = 'variables'">Variables</button>
           <button type="button" [class]="viewButtonClass('themes')" (click)="activeView = 'themes'">Temas</button>
+          <button type="button" [class]="viewButtonClass('audit')" (click)="openAudit()">Auditoría</button>
         </div>
       </div>
 
@@ -152,6 +153,25 @@ type SettingsView = 'system' | 'variables' | 'themes';
           </div>
         </div>
       }
+
+      @if (activeView === 'audit') {
+        <div class="card rounded-xl overflow-hidden">
+          <div class="p-5 border-b border-app flex items-center justify-between">
+            <div><h3 class="font-semibold">Auditoría general</h3><p class="text-xs text-muted">Cambios de gobierno, permisos, versiones y ejecuciones.</p></div>
+            <button type="button" class="btn-secondary" (click)="loadAudit()">Actualizar</button>
+          </div>
+          <div class="overflow-x-auto max-h-[620px] custom-scrollbar">
+            <table class="w-full text-xs">
+              <thead class="bg-slate-900 text-muted sticky top-0"><tr><th class="p-3 text-left">Fecha</th><th class="text-left">Usuario</th><th class="text-left">Acción</th><th class="text-left">Entidad</th><th class="text-left">Detalle</th></tr></thead>
+              <tbody>
+                @for (event of auditEvents; track event.audit_key) {
+                  <tr class="border-t border-app"><td class="p-3 whitespace-nowrap">{{event.created_at | date:'dd/MM/yyyy HH:mm:ss'}}</td><td>{{event.username}}</td><td class="font-semibold text-accent">{{event.action_key}}</td><td>{{event.entity_type}} {{event.entity_id || ''}}</td><td class="max-w-[360px] truncate text-muted" [title]="event.new_value">{{event.new_value || event.old_value || '-'}}</td></tr>
+                } @empty { <tr><td colspan="5" class="p-6 text-center text-muted">No hay eventos o no tienes permiso para consultarlos.</td></tr> }
+              </tbody>
+            </table>
+          </div>
+        </div>
+      }
     </div>
   `
 })
@@ -162,6 +182,7 @@ export class SettingsComponent implements OnInit {
   adminPin = '';
   variableFilter = '';
   selectedEnvironment = 3;
+  auditEvents: any[] = [];
 
   environments = [
     { id: 1, name: 'DEV' },
@@ -187,6 +208,21 @@ export class SettingsComponent implements OnInit {
       }));
       this.systemSettings = this.svc.systemSettings().map((x: any) => ({ ...x }));
     }, 300);
+  }
+
+  openAudit() {
+    this.activeView = 'audit';
+    this.loadAudit();
+  }
+
+  loadAudit() {
+    this.svc.getAuditEvents().subscribe({
+      next: rows => this.auditEvents = rows || [],
+      error: err => {
+        this.auditEvents = [];
+        this.svc.showToast(err?.error?.message || 'No se pudo cargar la auditoría.', 'error');
+      }
+    });
   }
 
   addVar() {

@@ -2,9 +2,12 @@ import { Router } from 'express';
 import { CronExpressionParser } from 'cron-parser';
 import { getPool, sql } from '../db/sql';
 import { env } from '../config/env';
+import { requireAuth, requireScriptAccess } from '../services/security.service';
+import { auditEvent } from '../services/audit.service';
 
 const router = Router();
 const TIMEZONE = 'America/Tegucigalpa';
+router.use(requireAuth);
 
 function calculateNextRunAt(cronExpression: string, fromDate: Date = new Date()): Date {
   const interval = CronExpressionParser.parse(cronExpression, {
@@ -29,11 +32,15 @@ function normalizeParameters(parameters: any): Record<string, string> {
   return result;
 }
 
-router.get('/', async (_req, res, next) => {
+router.get('/', async (req, res, next) => {
   try {
     const pool = await getPool();
+    const user = (req as any).user;
 
-    const result = await pool.request().query(`
+    const result = await pool.request()
+      .input('user_id', sql.Int, user.id)
+      .input('is_super_admin', sql.Bit, !!user.is_super_admin)
+      .query(`
       SELECT
         sch.id,
         sch.script_id,
@@ -47,6 +54,21 @@ router.get('/', async (_req, res, next) => {
       FROM dbo.Schedules sch
       JOIN dbo.Scripts s ON s.id = sch.script_id
       WHERE sch.is_active = 1
+        AND (@is_super_admin = 1 OR (
+          EXISTS (
+            SELECT 1 FROM dbo.UserRoles ur
+            JOIN dbo.RolePermissions rp ON rp.role_id = ur.role_id
+            JOIN dbo.Permissions p ON p.id = rp.permission_id
+            WHERE ur.user_id = @user_id AND p.permission_key = 'scripts.view'
+          )
+          AND (
+            NOT EXISTS (SELECT 1 FROM dbo.ScriptAccess sa WHERE sa.script_id = sch.script_id)
+            OR EXISTS (
+              SELECT 1 FROM dbo.ScriptAccess sa
+              WHERE sa.script_id = sch.script_id AND sa.user_id = @user_id AND sa.can_view = 1
+            )
+          )
+        ))
       ORDER BY sch.next_run_at
     `);
 
@@ -56,7 +78,7 @@ router.get('/', async (_req, res, next) => {
   }
 });
 
-router.post('/', async (req, res, next) => {
+router.post('/', requireScriptAccess('schedule'), async (req, res, next) => {
   try {
     const body = req.body || {};
 
@@ -149,6 +171,11 @@ router.post('/', async (req, res, next) => {
       }
 
       await transaction.commit();
+      await auditEvent(req, 'schedule.create', 'schedule', schedule.id, null, {
+        script_id: scriptId,
+        cron_expression: cronExpression,
+        parameters
+      });
       res.status(201).json(schedule);
     } catch (err) {
       await transaction.rollback();
@@ -159,10 +186,12 @@ router.post('/', async (req, res, next) => {
   }
 });
 
-router.delete('/:id', async (req, res, next) => {
+router.delete('/:id', requireScriptAccess('schedule'), async (req, res, next) => {
   try {
     const scheduleId = Number(req.params.id);
     const pool = await getPool();
+    const before = await pool.request().input('id', sql.Int, scheduleId)
+      .query('SELECT * FROM dbo.Schedules WHERE id=@id');
 
     await pool.request()
       .input('id', sql.Int, scheduleId)
@@ -174,18 +203,22 @@ router.delete('/:id', async (req, res, next) => {
         WHERE id = @id
       `);
 
+    await auditEvent(req, 'schedule.delete', 'schedule', scheduleId, before.recordset[0] || null, { is_active: false });
     res.json({ ok: true });
   } catch (err) {
     next(err);
   }
 });
 
-router.patch('/:id/toggle', async (req, res, next) => {
+router.patch('/:id/toggle', requireScriptAccess('schedule'), async (req, res, next) => {
   try {
     const pool = await getPool();
+    const id = Number(req.params.id);
+    const before = await pool.request().input('id', sql.Int, id)
+      .query('SELECT * FROM dbo.Schedules WHERE id=@id');
 
     await pool.request()
-      .input('id', sql.Int, Number(req.params.id))
+      .input('id', sql.Int, id)
       .query(`
         UPDATE dbo.Schedules
         SET
@@ -194,13 +227,16 @@ router.patch('/:id/toggle', async (req, res, next) => {
         WHERE id = @id
       `);
 
+    await auditEvent(req, 'schedule.toggle', 'schedule', id, before.recordset[0] || null, {
+      is_active: !before.recordset[0]?.is_active
+    });
     res.json({ ok: true });
   } catch (err) {
     next(err);
   }
 });
 
-router.get('/:id', async (req, res, next) => {
+router.get('/:id', requireScriptAccess('view'), async (req, res, next) => {
   try {
     const pool = await getPool();
     const scheduleId = Number(req.params.id);
@@ -239,11 +275,14 @@ router.get('/:id', async (req, res, next) => {
   }
 });
 
-router.put('/:id', async (req, res, next) => {
+router.put('/:id', requireScriptAccess('schedule'), async (req, res, next) => {
   try {
     const pool = await getPool();
     const scheduleId = Number(req.params.id);
     const body = req.body || {};
+    const before = await pool.request().input('id', sql.Int, scheduleId)
+      .query(`SELECT s.*, (SELECT param_key,param_value FROM dbo.ScheduleParameters WHERE schedule_id=s.id FOR JSON PATH) parameters_json
+              FROM dbo.Schedules s WHERE s.id=@id`);
 
     const scriptId = Number(body.scriptId || body.script_id);
     const cronExpression = String(body.cronExpression || body.cron_expression || '').trim();
@@ -331,6 +370,13 @@ router.put('/:id', async (req, res, next) => {
       }
 
       await transaction.commit();
+      await auditEvent(req, 'schedule.update', 'schedule', scheduleId, before.recordset[0] || null, {
+        script_id: scriptId,
+        cron_expression: cronExpression,
+        frequency_label: body.frequency || body.frequency_label || null,
+        next_run_at: nextRunAt,
+        parameters
+      });
       res.json({ ok: true, next_run_at: nextRunAt });
     } catch (err) {
       await transaction.rollback();

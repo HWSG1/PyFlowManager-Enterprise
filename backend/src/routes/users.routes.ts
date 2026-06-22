@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { getPool, sql } from '../db/sql';
 import { hashPassword, requireAuth, requirePermission } from '../services/security.service';
+import { auditEvent } from '../services/audit.service';
 
 const router = Router();
 router.use(requireAuth);
@@ -33,13 +34,16 @@ router.post('/', requirePermission('users.manage'), async (req, res, next) => {
       .input('theme_key', sql.NVarChar(80), b.theme_key || 'dark-blue')
       .query(`INSERT INTO dbo.Users(username,email,display_name,password_hash,is_active,auth_provider,theme_key)
               OUTPUT INSERTED.id VALUES(@username,@email,@display_name,@password_hash,@is_active,@auth_provider,@theme_key)`);
-    res.json({ ok: true, id: result.recordset[0].id });
+    const userId = result.recordset[0].id;
+    await auditEvent(req, 'user.create', 'user', userId, null, { username: b.username, email: b.email, display_name: b.display_name });
+    res.json({ ok: true, id: userId });
   } catch (err) { next(err); }
 });
 
 router.put('/:id', requirePermission('users.manage'), async (req, res, next) => {
   try {
     const b = req.body || {}; const pool = await getPool();
+    const before = await pool.request().input('id', sql.Int, Number(req.params.id)).query('SELECT id,email,display_name,is_active,auth_provider,theme_key FROM dbo.Users WHERE id=@id');
     const rawAuthProvider = String(b.auth_provider || 'local').toLowerCase();
 
     const authProviderMap: Record<string, string> = {
@@ -70,12 +74,15 @@ router.put('/:id', requirePermission('users.manage'), async (req, res, next) => 
       .input('auth_provider', sql.NVarChar(50), authProvider)
       .input('theme_key', sql.NVarChar(80), b.theme_key)
       .query(`UPDATE dbo.Users SET email=@email, display_name=@display_name, is_active=@is_active, auth_provider=@auth_provider, theme_key=@theme_key, updated_at=GETDATE() WHERE id=@id`);
+    await auditEvent(req, 'user.update', 'user', req.params.id, before.recordset[0], {
+      email: b.email, display_name: b.display_name, is_active: b.is_active, auth_provider: authProvider, theme_key: b.theme_key
+    });
     res.json({ ok: true });
   } catch (err) { next(err); }
 });
 
 router.post('/:id/password', requirePermission('users.manage'), async (req, res, next) => {
-  try { const pool = await getPool(); await pool.request().input('id', sql.Int, Number(req.params.id)).input('password_hash', sql.NVarChar(sql.MAX), hashPassword(req.body?.password || 'PyFlow123*')).query(`UPDATE dbo.Users SET password_hash=@password_hash, updated_at=GETDATE() WHERE id=@id`); res.json({ ok: true }); }
+  try { const pool = await getPool(); await pool.request().input('id', sql.Int, Number(req.params.id)).input('password_hash', sql.NVarChar(sql.MAX), hashPassword(req.body?.password || 'PyFlow123*')).query(`UPDATE dbo.Users SET password_hash=@password_hash, updated_at=GETDATE() WHERE id=@id`); await auditEvent(req, 'user.password.reset', 'user', req.params.id); res.json({ ok: true }); }
   catch (err) { next(err); }
 });
 

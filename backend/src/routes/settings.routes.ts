@@ -1,8 +1,10 @@
 import { Router } from 'express';
 import { getPool, sql } from '../db/sql';
 import { requireAuth, requirePermission, validateAdminPin } from '../services/security.service';
+import { auditEvent } from '../services/audit.service';
 
 const router = Router();
+router.use(requireAuth);
 
 router.get('/', async (_req, res, next) => {
   try {
@@ -79,7 +81,7 @@ router.get('/audit', requireAuth, requirePermission('settings.manage'), async (_
   catch (err) { next(err); }
 });
 
-router.post('/global-variables', async (req, res, next) => {
+router.post('/global-variables', requirePermission('settings.manage'), async (req, res, next) => {
   try {
     const variables = Array.isArray(req.body?.variables) ? req.body.variables : [];
     const pool = await getPool();
@@ -92,6 +94,11 @@ router.post('/global-variables', async (req, res, next) => {
       const description = item.description || null;
 
       if (!varKey) continue;
+
+      const before = await pool.request()
+        .input('id', sql.Int, id)
+        .input('var_key', sql.NVarChar(150), varKey)
+        .query('SELECT TOP 1 id,var_key,is_secret,description FROM dbo.GlobalVariables WHERE id=@id OR var_key=@var_key');
 
       await pool.request()
         .input('id', sql.Int, id)
@@ -130,6 +137,13 @@ router.post('/global-variables', async (req, res, next) => {
             INSERT (var_key, var_value, is_secret, description)
             VALUES (source.var_key, source.var_value, source.is_secret, source.description);
         `);
+
+      await auditEvent(req, 'global_variable.upsert', 'global_variable', id || varKey, before.recordset[0] || null, {
+        var_key: varKey,
+        is_secret: !!isSecret,
+        description,
+        value_changed: String(varValue) !== '********'
+      });
     }
 
     res.json({ ok: true });
@@ -138,8 +152,16 @@ router.post('/global-variables', async (req, res, next) => {
   }
 });
 
-router.delete('/global-variables/:id', async (req, res, next) => {
-  try { const pool = await getPool(); await pool.request().input('id', sql.Int, Number(req.params.id)).query(`DELETE FROM dbo.GlobalVariables WHERE id=@id`); res.json({ ok: true }); }
+router.delete('/global-variables/:id', requirePermission('settings.manage'), async (req, res, next) => {
+  try {
+    const pool = await getPool();
+    const id = Number(req.params.id);
+    const before = await pool.request().input('id', sql.Int, id)
+      .query('SELECT id,var_key,is_secret,description FROM dbo.GlobalVariables WHERE id=@id');
+    await pool.request().input('id', sql.Int, id).query(`DELETE FROM dbo.GlobalVariables WHERE id=@id`);
+    await auditEvent(req, 'global_variable.delete', 'global_variable', id, before.recordset[0] || null, null);
+    res.json({ ok: true });
+  }
   catch (err) { next(err); }
 });
 

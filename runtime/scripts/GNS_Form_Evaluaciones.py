@@ -60,8 +60,12 @@ import math
 import argparse
 import logging
 import traceback
+import csv
+import base64
+import mimetypes
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta, timezone
+from html import escape
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Tuple, Optional
 
@@ -77,6 +81,11 @@ try:
     from hdbcli import dbapi
 except ImportError:
     dbapi = None
+
+try:
+    import pandas as pd
+except Exception:
+    pd = None
 
 # =========================================================
 # PYFLOW MANAGER PARAMS
@@ -98,18 +107,19 @@ PYFLOW_PARAMS = {
     "HANA_FORM_EVALUACIONES_TABLE": {"type": "text", "label": "Tabla formularios/preguntas", "required": True, "default": "GNS_API_FORM_EVALUACIONES"},
     "HANA_EVALUACIONES_TABLE": {"type": "text", "label": "Tabla evaluaciones", "required": True, "default": "GNS_API_EVALUACIONES"},
     "RUN_MODE": {"type": "select", "label": "Modo ejecución", "required": True, "options": ["formularios_y_evaluaciones", "solo_formularios", "solo_evaluaciones"], "default": "formularios_y_evaluaciones"},
-    "DATE": {"type": "date", "label": "Fecha específica local", "required": False},
     "START_DATE": {"type": "date", "label": "Fecha inicial local", "required": False},
     "END_DATE": {"type": "date", "label": "Fecha final local", "required": False},
-    "START_UTC": {"type": "text", "label": "Inicio UTC exacto", "required": False},
-    "END_UTC": {"type": "text", "label": "Fin UTC exacto", "required": False},
     "DAYS_BACK": {"type": "number", "label": "Días hacia atrás si no se indican fechas", "required": False, "default": "5"},
-    "GENESYS_TIMEZONE": {"type": "text", "label": "Zona horaria Genesys", "required": True, "default": "America/Tegucigalpa"},
-    "HANA_BATCH_SIZE": {"type": "number", "label": "Filas por lote HANA", "required": False, "default": "1000"},
-    "REQUEST_TIMEOUT": {"type": "number", "label": "Timeout HTTP segundos", "required": False, "default": "120"},
-    "API_SLEEP_SECONDS": {"type": "number", "label": "Pausa entre requests", "required": False, "default": "1"},
-    "API_MAX_RETRIES": {"type": "number", "label": "Reintentos HTTP", "required": False, "default": "5"},
-    "DRY_RUN": {"type": "select", "label": "Modo prueba sin insertar", "required": True, "options": ["true", "false"], "default": "false"}
+    "REPORT_OUTPUT_DIR": {"type": "text", "label": "Carpeta de salida del reporte (opcional)", "required": False},
+    "REPORT_OUTPUT_FORMAT": {"type": "select", "label": "Formato del reporte", "required": False, "options": ["xlsx", "csv"], "default": "xlsx"},
+    "ATTACH_REPORT_FILE": {"type": "select", "label": "Adjuntar archivo al correo", "required": False, "options": ["false", "true"], "default": "false"},
+    "GRAPH_TENANT_ID": {"type": "global", "global_key": "GRAPH_TENANT_ID", "label": "Microsoft Graph Tenant ID", "required": False},
+    "GRAPH_CLIENT_ID": {"type": "global", "global_key": "GRAPH_CLIENT_ID", "label": "Microsoft Graph Client ID", "required": False},
+    "GRAPH_CLIENT_SECRET": {"type": "global", "global_key": "GRAPH_CLIENT_SECRET", "label": "Microsoft Graph Client Secret", "required": False, "secret": True},
+    "GRAPH_SENDER_EMAIL": {"type": "global", "global_key": "GRAPH_SENDER_EMAIL", "label": "Correo remitente Graph", "required": False},
+    "FORM_EVALUACIONES_REPORT_EMAIL_TO": {"type": "tags", "label": "Destinatarios reporte formularios/evaluaciones", "required": False},
+    "FORM_EVALUACIONES_REPORT_EMAIL_CC": {"type": "tags", "label": "Copias reporte formularios/evaluaciones", "required": False},
+    "FORM_EVALUACIONES_REPORT_SUBJECT": {"type": "text", "label": "Asunto reporte formularios/evaluaciones", "required": False, "default": "Reporte de Formularios y Evaluaciones Genesys"}
 }
 
 LOGGER_NAME = "gns_form_evaluaciones_pyflow"
@@ -152,6 +162,22 @@ def env_bool(name: str, default: bool = False) -> bool:
     if not value:
         return default
     return value in ("1", "true", "yes", "y", "si", "sí")
+
+
+def split_list_value(value: Any) -> List[str]:
+    text = "" if value is None else str(value)
+    text = text.replace("\r", "\n").replace(",", ";").replace("\n", ";")
+    result: List[str] = []
+    for item in text.split(";"):
+        cleaned = item.strip()
+        if cleaned and cleaned not in result:
+            result.append(cleaned)
+    return result
+
+
+def pyflow_progress(value: int) -> None:
+    value = max(0, min(100, int(value)))
+    print(f"PYFLOW_PROGRESS={value}", flush=True)
 
 
 def normalize_genesys_domain(value: str) -> str:
@@ -206,6 +232,16 @@ class Config:
     request_timeout: int
     api_sleep_seconds: float
     api_max_retries: int
+    report_output_dir: str
+    report_output_format: str
+    attach_report_file: bool
+    graph_tenant_id: str
+    graph_client_id: str
+    graph_client_secret: str
+    graph_sender_email: str
+    report_email_to: List[str]
+    report_email_cc: List[str]
+    report_email_subject: str
 
 
 def get_env(name: str, default: Optional[str] = None, required: bool = True) -> str:
@@ -239,6 +275,16 @@ def load_config() -> Config:
         request_timeout=env_int("REQUEST_TIMEOUT", 120),
         api_sleep_seconds=env_float("API_SLEEP_SECONDS", 1.0),
         api_max_retries=env_int("API_MAX_RETRIES", 5),
+        report_output_dir=env_str("REPORT_OUTPUT_DIR", ""),
+        report_output_format=env_str("REPORT_OUTPUT_FORMAT", "xlsx").lower(),
+        attach_report_file=env_bool("ATTACH_REPORT_FILE", False),
+        graph_tenant_id=env_str("GRAPH_TENANT_ID", ""),
+        graph_client_id=env_str("GRAPH_CLIENT_ID", ""),
+        graph_client_secret=env_str("GRAPH_CLIENT_SECRET", ""),
+        graph_sender_email=env_str("GRAPH_SENDER_EMAIL", ""),
+        report_email_to=split_list_value(env_str("FORM_EVALUACIONES_REPORT_EMAIL_TO", "")),
+        report_email_cc=split_list_value(env_str("FORM_EVALUACIONES_REPORT_EMAIL_CC", "")),
+        report_email_subject=env_str("FORM_EVALUACIONES_REPORT_SUBJECT", "Reporte de Formularios y Evaluaciones Genesys"),
     )
 
 
@@ -694,6 +740,7 @@ def fetch_published_forms(config: Config, token: str, logger: logging.Logger) ->
 
         response = request_with_retries("GET", url, config, logger, token=token)
         detailed_forms.append(response.json())
+        pyflow_progress(15 + int((idx / max(1, len(forms_basic))) * 15))
 
         time.sleep(config.api_sleep_seconds)
 
@@ -729,7 +776,7 @@ def transform_forms(forms: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return rows
 
 
-def run_forms(config: Config, token: str, logger: logging.Logger, dry_run: bool) -> Tuple[int, int, Dict[str, str]]:
+def run_forms(config: Config, token: str, logger: logging.Logger, dry_run: bool) -> Tuple[int, int, Dict[str, str], List[Dict[str, Any]]]:
     forms = fetch_published_forms(config, token, logger)
     rows = transform_forms(forms)
 
@@ -738,7 +785,7 @@ def run_forms(config: Config, token: str, logger: logging.Logger, dry_run: bool)
     if dry_run:
         logger.warning("DRY RUN activo. No se cargará catálogo de formularios a HANA.")
         lookup = {r["ID_PREGUNTA"]: r["PREGUNTA"] for r in rows if r.get("ID_PREGUNTA")}
-        return len(rows), 0, lookup
+        return len(rows), 0, lookup, rows
 
     delete_all_from_table(config, config.forms_table, logger)
 
@@ -757,7 +804,7 @@ def run_forms(config: Config, token: str, logger: logging.Logger, dry_run: bool)
 
     lookup = {r["ID_PREGUNTA"]: r["PREGUNTA"] for r in rows if r.get("ID_PREGUNTA")}
 
-    return loaded, failed, lookup
+    return loaded, failed, lookup, rows
 
 
 # =========================================================
@@ -954,7 +1001,7 @@ def run_evaluations(
     question_lookup: Dict[str, str],
     logger: logging.Logger,
     dry_run: bool
-) -> Tuple[int, int, int, int]:
+) -> Tuple[int, int, int, int, List[Dict[str, Any]]]:
 
     if not question_lookup:
         question_lookup = get_question_lookup_from_hana(config, logger)
@@ -981,6 +1028,7 @@ def run_evaluations(
             rows = transform_evaluations(evaluations, question_lookup)
             all_rows.extend(rows)
             users_ok += 1
+            pyflow_progress(40 + int((idx / max(1, len(users))) * 40))
 
             logger.info(
                 "Usuario procesado OK | evaluaciones: %s | filas obtenidas: %s | acumulado filas: %s",
@@ -994,13 +1042,14 @@ def run_evaluations(
         except Exception as exc:
             users_error += 1
             logger.exception("Error consultando usuario %s: %s", user_id, exc)
+            pyflow_progress(40 + int((idx / max(1, len(users))) * 40))
             time.sleep(max(config.api_sleep_seconds, 3))
 
     logger.info("Extracción evaluaciones finalizada. Filas transformadas: %s", len(all_rows))
 
     if dry_run:
         logger.warning("DRY RUN activo. No se cargarán evaluaciones a HANA.")
-        return len(all_rows), 0, users_ok, users_error
+        return len(all_rows), 0, users_ok, users_error, all_rows
 
     delete_evaluations_range(config, start_date, end_date, logger)
 
@@ -1068,7 +1117,195 @@ def run_evaluations(
 
     loaded, failed = insert_rows(config, config.evaluations_table, columns, all_rows, logger)
 
-    return loaded, failed, users_ok, users_error
+    return loaded, failed, users_ok, users_error, all_rows
+
+
+def validate_report_directory(config: Config) -> Optional[str]:
+    raw_path = (config.report_output_dir or "").strip()
+    if not raw_path:
+        return None
+
+    path = os.path.abspath(os.path.expandvars(os.path.expanduser(raw_path)))
+    if not os.path.isdir(path):
+        raise ValueError(f"La carpeta de salida del reporte no existe o no es válida: {path}")
+    if not os.access(path, os.W_OK):
+        raise ValueError(f"La carpeta de salida del reporte no permite escritura: {path}")
+    return path
+
+
+def write_csv_report(path: str, rows: List[Dict[str, Any]]) -> None:
+    columns = list(rows[0].keys())
+    with open(path, "w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_report_files(
+    config: Config,
+    form_rows: List[Dict[str, Any]],
+    evaluation_rows: List[Dict[str, Any]],
+    logger: logging.Logger
+) -> List[str]:
+    output_dir = validate_report_directory(config)
+    if not output_dir:
+        logger.info("Reporte en archivo no generado: no se indicó carpeta de salida.")
+        return []
+
+    report_format = (config.report_output_format or "xlsx").strip().lower()
+    if report_format not in ("xlsx", "csv"):
+        raise ValueError("REPORT_OUTPUT_FORMAT debe ser xlsx o csv.")
+    if not form_rows and not evaluation_rows:
+        logger.warning("No hay datos para generar el archivo de reporte.")
+        return []
+
+    timestamp = datetime.now(ZoneInfo(config.timezone_name)).strftime("%Y%m%d_%H%M%S")
+    generated: List[str] = []
+
+    if report_format == "xlsx":
+        if pd is None:
+            raise RuntimeError("Para generar Excel instala pandas y openpyxl: pip install pandas openpyxl")
+        path = os.path.join(output_dir, f"GNS_Form_Evaluaciones_{timestamp}.xlsx")
+        with pd.ExcelWriter(path, engine="openpyxl") as writer:
+            if form_rows:
+                pd.DataFrame(form_rows).to_excel(writer, sheet_name="Formularios", index=False)
+            if evaluation_rows:
+                pd.DataFrame(evaluation_rows).to_excel(writer, sheet_name="Evaluaciones", index=False)
+        generated.append(path)
+    else:
+        if form_rows:
+            path = os.path.join(output_dir, f"GNS_Formularios_{timestamp}.csv")
+            write_csv_report(path, form_rows)
+            generated.append(path)
+        if evaluation_rows:
+            path = os.path.join(output_dir, f"GNS_Evaluaciones_{timestamp}.csv")
+            write_csv_report(path, evaluation_rows)
+            generated.append(path)
+
+    for path in generated:
+        logger.info("Archivo de reporte generado: %s", path)
+    return generated
+
+
+def build_file_attachment(path: str) -> Dict[str, str]:
+    content_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
+    with open(path, "rb") as handle:
+        content = base64.b64encode(handle.read()).decode("ascii")
+    return {
+        "@odata.type": "#microsoft.graph.fileAttachment",
+        "name": os.path.basename(path),
+        "contentType": content_type,
+        "contentBytes": content,
+    }
+
+
+def get_graph_access_token(config: Config, logger: logging.Logger) -> str:
+    if not config.graph_tenant_id or not config.graph_client_id or not config.graph_client_secret:
+        raise ValueError("Configura GRAPH_TENANT_ID, GRAPH_CLIENT_ID y GRAPH_CLIENT_SECRET para enviar el reporte.")
+
+    response = requests.post(
+        f"https://login.microsoftonline.com/{config.graph_tenant_id}/oauth2/v2.0/token",
+        data={
+            "client_id": config.graph_client_id,
+            "client_secret": config.graph_client_secret,
+            "scope": "https://graph.microsoft.com/.default",
+            "grant_type": "client_credentials",
+        },
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=30,
+    )
+    if response.status_code >= 400:
+        logger.error("Error obteniendo token Graph %s | %s", response.status_code, response.text[:1000])
+    response.raise_for_status()
+    token = response.json().get("access_token")
+    if not token:
+        raise RuntimeError("Microsoft Graph no devolvió access_token.")
+    return token
+
+
+def build_report_html(
+    forms_loaded: int,
+    forms_failed: int,
+    eval_loaded: int,
+    eval_failed: int,
+    users_ok: int,
+    users_error: int,
+    date_mode: str,
+    duration_seconds: float
+) -> str:
+    now = datetime.now(ZoneInfo("America/Tegucigalpa"))
+    total = forms_loaded + eval_loaded + forms_failed + eval_failed
+    loaded = forms_loaded + eval_loaded
+    coverage = (loaded / total * 100) if total else 0
+    return f"""<!doctype html>
+<html lang="es"><body style="margin:0;background:#f8fafc;font-family:'Segoe UI',Arial,sans-serif;color:#334155;">
+<table width="100%" cellspacing="0" cellpadding="0" style="padding:40px 10px;"><tr><td align="center">
+<table width="100%" cellspacing="0" cellpadding="0" style="max-width:650px;background:#fff;border:1px solid #e2e8f0;border-radius:8px;overflow:hidden;">
+<tr><td style="background:#DA282D;padding:34px 40px;color:#fff;"><div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1.4px;color:#fecaca;">PyFlow Manager</div><h1 style="margin:8px 0 0;font-size:24px;">Reporte de Formularios y Evaluaciones</h1><p style="margin:8px 0 0;color:#fecaca;font-size:13px;">Genesys Cloud Quality</p></td></tr>
+<tr><td style="padding:34px 40px;"><p style="font-size:14px;line-height:1.6;">Se completó el proceso de extracción y carga de formularios y evaluaciones.</p>
+<table width="100%" cellspacing="0" cellpadding="0"><tr>
+<td width="48%" style="background:#f1f5f9;border:1px solid #e2e8f0;border-radius:6px;padding:20px;"><div style="font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;">Formularios / preguntas</div><div style="font-size:26px;font-weight:700;margin-top:8px;">{forms_loaded:,}</div><div style="font-size:11px;color:#94a3b8;">Fallidos: {forms_failed:,}</div></td><td width="4%">&nbsp;</td>
+<td width="48%" style="background:#f1f5f9;border:1px solid #e2e8f0;border-radius:6px;padding:20px;"><div style="font-size:11px;font-weight:700;color:#DA282D;text-transform:uppercase;">Filas de evaluaciones</div><div style="font-size:26px;font-weight:700;color:#DA282D;margin-top:8px;">{eval_loaded:,}</div><div style="font-size:11px;color:#94a3b8;">Fallidas: {eval_failed:,}</div></td>
+</tr></table>
+<div style="margin-top:20px;background:#fafafa;border:1px solid #e2e8f0;border-radius:6px;padding:20px;font-size:13px;line-height:1.7;"><strong>Usuarios procesados:</strong> {users_ok:,}<br><strong>Usuarios con error:</strong> {users_error:,}<br><strong>Resultado de carga:</strong> {coverage:.1f}%<br><strong>Periodo:</strong> {escape(date_mode)}<br><strong>Duración:</strong> {duration_seconds:.2f} segundos</div>
+<div style="margin-top:24px;border-top:1px solid #e2e8f0;padding-top:18px;font-size:12px;color:#64748b;">Generado el {escape(now.strftime('%d/%m/%Y'))} a las {escape(now.strftime('%I:%M %p'))}.</div></td></tr>
+</table></td></tr></table></body></html>"""
+
+
+def send_report_email(
+    config: Config,
+    forms_loaded: int,
+    forms_failed: int,
+    eval_loaded: int,
+    eval_failed: int,
+    users_ok: int,
+    users_error: int,
+    date_mode: str,
+    duration_seconds: float,
+    report_files: List[str],
+    logger: logging.Logger
+) -> bool:
+    if not config.report_email_to:
+        logger.info("Reporte por correo no enviado: no hay destinatarios configurados.")
+        return False
+    if not config.graph_sender_email:
+        logger.warning("Reporte por correo no enviado: configura GRAPH_SENDER_EMAIL.")
+        return False
+
+    payload: Dict[str, Any] = {
+        "message": {
+            "subject": config.report_email_subject,
+            "body": {
+                "contentType": "HTML",
+                "content": build_report_html(forms_loaded, forms_failed, eval_loaded, eval_failed, users_ok, users_error, date_mode, duration_seconds),
+            },
+            "toRecipients": [{"emailAddress": {"address": email}} for email in config.report_email_to],
+            "ccRecipients": [{"emailAddress": {"address": email}} for email in config.report_email_cc],
+        },
+        "saveToSentItems": "true",
+    }
+
+    if config.attach_report_file and report_files:
+        payload["message"]["attachments"] = [build_file_attachment(path) for path in report_files]
+    elif config.attach_report_file:
+        logger.warning("Se solicitó adjuntar el reporte, pero no se generó ningún archivo.")
+
+    try:
+        token = get_graph_access_token(config, logger)
+        response = requests.post(
+            f"https://graph.microsoft.com/v1.0/users/{config.graph_sender_email}/sendMail",
+            json=payload,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            timeout=30,
+        )
+        if response.status_code >= 400:
+            logger.error("Error enviando reporte Graph %s | %s", response.status_code, response.text[:1000])
+        response.raise_for_status()
+        logger.info("Reporte enviado a: %s", ", ".join(config.report_email_to + config.report_email_cc))
+        return True
+    except Exception as exc:
+        logger.error("No se pudo enviar el reporte: %s", exc)
+        return False
 
 
 def main() -> int:
@@ -1105,9 +1342,13 @@ def main() -> int:
     eval_failed = 0
     users_ok = 0
     users_error = 0
+    form_rows: List[Dict[str, Any]] = []
+    evaluation_rows: List[Dict[str, Any]] = []
+    report_files: List[str] = []
     general_errors: List[str] = []
 
     try:
+        pyflow_progress(3)
         config = load_config()
         start_date, end_date, date_mode = parse_dates(args, config.timezone_name)
 
@@ -1126,6 +1367,7 @@ def main() -> int:
         logger.info("=" * 80)
 
         token = get_access_token(config, logger)
+        pyflow_progress(10)
 
         question_lookup: Dict[str, str] = {}
 
@@ -1134,19 +1376,20 @@ def main() -> int:
             logger.info("PASO 1/2: CARGA DE FORMULARIOS/PREGUNTAS")
             logger.info("=" * 80)
 
-            forms_loaded, forms_failed, question_lookup = run_forms(
+            forms_loaded, forms_failed, question_lookup, form_rows = run_forms(
                 config,
                 token,
                 logger,
                 args.dry_run
             )
+            pyflow_progress(35)
 
         if not args.solo_formularios:
             logger.info("=" * 80)
             logger.info("PASO 2/2: CARGA DE EVALUACIONES")
             logger.info("=" * 80)
 
-            eval_loaded, eval_failed, users_ok, users_error = run_evaluations(
+            eval_loaded, eval_failed, users_ok, users_error, evaluation_rows = run_evaluations(
                 config,
                 token,
                 start_date,
@@ -1155,6 +1398,25 @@ def main() -> int:
                 logger,
                 args.dry_run
             )
+            pyflow_progress(85)
+
+        report_files = write_report_files(config, form_rows, evaluation_rows, logger)
+        pyflow_progress(93)
+
+        send_report_email(
+            config,
+            forms_loaded,
+            forms_failed,
+            eval_loaded,
+            eval_failed,
+            users_ok,
+            users_error,
+            date_mode,
+            time.time() - start_time,
+            report_files,
+            logger
+        )
+        pyflow_progress(98)
 
     except Exception as exc:
         general_errors.append(str(exc))
@@ -1179,7 +1441,10 @@ def main() -> int:
     logger.info("Duración total: %.2f segundos", duration)
     logger.info("=" * 80)
 
-    return 0 if not general_errors and forms_failed == 0 and eval_failed == 0 and users_error == 0 else 1
+    success = not general_errors and forms_failed == 0 and eval_failed == 0 and users_error == 0
+    if success:
+        pyflow_progress(100)
+    return 0 if success else 1
 
 
 if __name__ == "__main__":

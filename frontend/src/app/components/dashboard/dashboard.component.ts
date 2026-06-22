@@ -1,6 +1,8 @@
-import { Component, AfterViewInit, OnDestroy, ElementRef, ViewChild } from '@angular/core';
+import { Component, AfterViewInit, OnDestroy, ElementRef, ViewChild, effect } from '@angular/core';
 import { CommonModule } from '@angular/common';
+import { FormsModule } from '@angular/forms';
 import { PyflowService } from '../../services/pyflow.service';
+import { ThemeService } from '../../services/theme.service';
 import { Chart, registerables } from 'chart.js';
 
 Chart.register(...registerables);
@@ -8,7 +10,7 @@ Chart.register(...registerables);
 @Component({
   selector: 'app-dashboard',
   standalone: true,
-  imports: [CommonModule],
+  imports: [CommonModule, FormsModule],
   template: `
     <div class="flex flex-col gap-6">
 
@@ -97,11 +99,48 @@ Chart.register(...registerables);
 
         <!-- Histórico -->
         <div class="bg-slate-950 border border-slate-800 p-5 rounded-xl xl:col-span-3 h-fit">
-          <div class="flex items-center justify-between mb-4">
+          <div class="flex flex-col gap-3 mb-4 lg:flex-row lg:items-end lg:justify-between">
             <h4 class="font-semibold text-white">Histórico de Ejecuciones</h4>
-            <span class="text-xs bg-slate-900 border border-slate-800 px-2 py-1 rounded-md text-slate-400">
-              Últimos 7 días
-            </span>
+            <div class="flex flex-wrap items-end gap-2">
+              <label class="text-[10px] font-semibold text-slate-400 uppercase">
+                Periodo
+                <select
+                  [(ngModel)]="chartRangePreset"
+                  (ngModelChange)="onChartPresetChange()"
+                  [disabled]="chartLoading"
+                  class="mt-1 block min-w-[180px] bg-slate-900 border border-slate-800 rounded-md px-2 py-1.5 text-xs text-slate-300 focus:outline-none focus:border-blue-500 disabled:opacity-50">
+                  <option value="today">Hoy</option>
+                  <option value="yesterday">Ayer</option>
+                  <option value="last7">Últimos 7 días</option>
+                  <option value="currentMonth">Mes actual</option>
+                  <option value="previousMonth">Mes anterior</option>
+                  <option value="last3Months">Últimos 3 meses</option>
+                  <option value="custom">Rango personalizado</option>
+                </select>
+              </label>
+
+              @if (chartRangePreset === 'custom') {
+                <label class="text-[10px] font-semibold text-slate-400 uppercase">
+                  Desde
+                  <input
+                    type="date"
+                    [(ngModel)]="chartDateFrom"
+                    (ngModelChange)="onCustomRangeChange()"
+                    [max]="chartDateTo"
+                    class="mt-1 block bg-slate-900 border border-slate-800 rounded-md px-2 py-1.5 text-xs text-slate-300 focus:outline-none focus:border-blue-500">
+                </label>
+                <label class="text-[10px] font-semibold text-slate-400 uppercase">
+                  Hasta
+                  <input
+                    type="date"
+                    [(ngModel)]="chartDateTo"
+                    (ngModelChange)="onCustomRangeChange()"
+                    [min]="chartDateFrom"
+                    [max]="todayIso"
+                    class="mt-1 block bg-slate-900 border border-slate-800 rounded-md px-2 py-1.5 text-xs text-slate-300 focus:outline-none focus:border-blue-500">
+                </label>
+              }
+            </div>
           </div>
 
           <div class="h-80 relative">
@@ -344,10 +383,24 @@ export class DashboardComponent implements AfterViewInit, OnDestroy {
   @ViewChild('dashChart') chartRef!: ElementRef<HTMLCanvasElement>;
 
   lastUpdate = 'Justo ahora';
+  todayIso = this.localIsoDate();
+  chartRangePreset = 'last7';
+  chartDateFrom = this.addDays(this.todayIso, -6);
+  chartDateTo = this.todayIso;
+  chartLoading = false;
   chart: Chart | null = null;
   refreshTimer: any;
 
-  constructor(public svc: PyflowService) {}
+  constructor(public svc: PyflowService, private themes: ThemeService) {
+    effect(() => {
+      this.themes.activeTheme();
+      setTimeout(() => {
+        if (this.chartRef?.nativeElement) {
+          this.updateChart(this.dashboard?.executionsHistory || this.dashboard?.executionsLast7Days || []);
+        }
+      });
+    });
+  }
 
   get dashboard() {
     return this.svc.dashboard();
@@ -368,14 +421,14 @@ export class DashboardComponent implements AfterViewInit, OnDestroy {
 
   async refresh() {
     try {
-      const data = await this.svc.loadDashboard();
+      const data = await this.svc.loadDashboard(this.chartDateFrom, this.chartDateTo);
 
       this.lastUpdate = new Date().toLocaleTimeString('es-HN', {
         hour: '2-digit',
         minute: '2-digit'
       });
 
-      this.updateChart(data?.executionsLast7Days || []);
+      this.updateChart(data?.executionsHistory || data?.executionsLast7Days || []);
     } catch (error) {
       console.error('Error cargando dashboard:', error);
       this.lastUpdate = 'Error al actualizar';
@@ -386,15 +439,105 @@ export class DashboardComponent implements AfterViewInit, OnDestroy {
     }
   }
 
+  async applyChartRange() {
+    if (!this.chartDateFrom || !this.chartDateTo || this.chartDateFrom > this.chartDateTo) {
+      this.svc.showToast('Selecciona un rango de fechas válido.', 'error');
+      return;
+    }
+
+    this.chartLoading = true;
+    try {
+      await this.refresh();
+    } finally {
+      this.chartLoading = false;
+    }
+  }
+
+  async onChartPresetChange() {
+    if (this.chartRangePreset === 'custom') return;
+
+    this.todayIso = this.localIsoDate();
+    const currentMonthStart = `${this.todayIso.slice(0, 7)}-01`;
+
+    switch (this.chartRangePreset) {
+      case 'today':
+        this.chartDateFrom = this.todayIso;
+        this.chartDateTo = this.todayIso;
+        break;
+      case 'yesterday':
+        this.chartDateFrom = this.addDays(this.todayIso, -1);
+        this.chartDateTo = this.chartDateFrom;
+        break;
+      case 'currentMonth':
+        this.chartDateFrom = currentMonthStart;
+        this.chartDateTo = this.todayIso;
+        break;
+      case 'previousMonth':
+        this.chartDateTo = this.addDays(currentMonthStart, -1);
+        this.chartDateFrom = `${this.chartDateTo.slice(0, 7)}-01`;
+        break;
+      case 'last3Months':
+        this.chartDateFrom = this.addMonths(currentMonthStart, -2);
+        this.chartDateTo = this.todayIso;
+        break;
+      default:
+        this.chartDateFrom = this.addDays(this.todayIso, -6);
+        this.chartDateTo = this.todayIso;
+        break;
+    }
+
+    await this.applyChartRange();
+  }
+
+  onCustomRangeChange() {
+    if (
+      this.chartRangePreset === 'custom' &&
+      this.chartDateFrom &&
+      this.chartDateTo &&
+      this.chartDateFrom <= this.chartDateTo
+    ) {
+      void this.applyChartRange();
+    }
+  }
+
+  private localIsoDate(): string {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'America/Tegucigalpa',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit'
+    }).format(new Date());
+    return parts;
+  }
+
+  private addDays(isoDate: string, days: number): string {
+    const date = new Date(`${isoDate}T00:00:00.000Z`);
+    date.setUTCDate(date.getUTCDate() + days);
+    return date.toISOString().slice(0, 10);
+  }
+
+  private addMonths(isoDate: string, months: number): string {
+    const date = new Date(`${isoDate}T00:00:00.000Z`);
+    date.setUTCMonth(date.getUTCMonth() + months);
+    return date.toISOString().slice(0, 10);
+  }
+
   updateChart(rows: any[]) {
-    const labels = rows.map(r =>
-      new Date(r.executionDate).toLocaleDateString('es-HN', {
-        weekday: 'short'
-      })
-    );
+    const labels = rows.map(r => {
+      const isoDate = String(r.executionDate || '').slice(0, 10);
+      return new Date(`${isoDate}T12:00:00`).toLocaleDateString('es-HN', {
+        weekday: 'short',
+        day: '2-digit',
+        month: '2-digit'
+      });
+    });
 
     const success = rows.map(r => Number(r.successCount || 0));
     const errors = rows.map(r => Number(r.errorCount || 0));
+    const themeStyles = getComputedStyle(document.documentElement);
+    const accent = themeStyles.getPropertyValue('--accent').trim() || '#2563eb';
+    const muted = themeStyles.getPropertyValue('--muted').trim() || '#94a3b8';
+    const border = themeStyles.getPropertyValue('--border').trim() || '#1e293b';
 
     this.chart?.destroy();
 
@@ -409,8 +552,9 @@ export class DashboardComponent implements AfterViewInit, OnDestroy {
           {
             label: 'Exitosas',
             data: success,
-            borderColor: 'rgba(16,185,129,0.9)',
-            backgroundColor: 'rgba(16,185,129,0.15)',
+            borderColor: accent,
+            backgroundColor: this.withAlpha(accent, 0.16),
+            pointBackgroundColor: accent,
             tension: 0.35,
             fill: true,
             pointRadius: 4
@@ -432,7 +576,7 @@ export class DashboardComponent implements AfterViewInit, OnDestroy {
         plugins: {
           legend: {
             labels: {
-              color: '#94a3b8',
+              color: muted,
               font: { size: 11 }
             }
           }
@@ -440,17 +584,33 @@ export class DashboardComponent implements AfterViewInit, OnDestroy {
         scales: {
           x: {
             stacked: true,
-            ticks: { color: '#64748b' },
-            grid: { color: '#1e293b' }
+            ticks: { color: muted, autoSkip: true, maxTicksLimit: 14 },
+            grid: { color: border }
           },
           y: {
             stacked: false,
-            ticks: { color: '#64748b' },
-            grid: { color: '#1e293b' }
+            ticks: { color: muted },
+            grid: { color: border }
           }
         }
       }
     });
+  }
+
+  private withAlpha(color: string, alpha: number): string {
+    const hex = color.replace('#', '').trim();
+    const normalized = hex.length === 3
+      ? hex.split('').map(char => char + char).join('')
+      : hex;
+
+    if (!/^[0-9a-f]{6}$/i.test(normalized)) {
+      return color;
+    }
+
+    const red = parseInt(normalized.slice(0, 2), 16);
+    const green = parseInt(normalized.slice(2, 4), 16);
+    const blue = parseInt(normalized.slice(4, 6), 16);
+    return `rgba(${red}, ${green}, ${blue}, ${alpha})`;
   }
 
   normalizeStatus(status: string): string {
@@ -486,24 +646,22 @@ export class DashboardComponent implements AfterViewInit, OnDestroy {
     if (!value) return '-';
 
     try {
-      const text = String(value);
-      const match = text.match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})/);
-      const date = match
-        ? new Date(
-            Number(match[1]),
-            Number(match[2]) - 1,
-            Number(match[3]),
-            Number(match[4]),
-            Number(match[5])
-          )
-        : new Date(text);
+      const text = String(value).trim();
+      const sqlDateWithoutTimezone = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2}(?:\.\d+)?)$/.exec(text);
+      const normalized = sqlDateWithoutTimezone
+        ? `${sqlDateWithoutTimezone[1]}T${sqlDateWithoutTimezone[2]}Z`
+        : text;
+      const date = value instanceof Date ? value : new Date(normalized);
+
+      if (Number.isNaN(date.getTime())) return text;
 
       return date.toLocaleString('es-HN', {
         day: '2-digit',
         month: '2-digit',
         year: 'numeric',
         hour: '2-digit',
-        minute: '2-digit'
+        minute: '2-digit',
+        timeZone: 'America/Tegucigalpa'
       });
     } catch {
       return String(value);
