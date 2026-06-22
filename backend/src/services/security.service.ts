@@ -59,7 +59,9 @@ export async function auditLogin(userId: number | null, username: string, method
 
 export async function requireAuth(req: Request, res: Response, next: NextFunction) {
   const auth = req.headers.authorization || '';
-  const token = auth.startsWith('Bearer ') ? auth.substring(7) : '';
+  const token = auth.startsWith('Bearer ')
+    ? auth.substring(7)
+    : typeof req.query.access_token === 'string' ? req.query.access_token : '';
   const payload = token ? verifyToken(token) : null;
   if (!payload) return res.status(401).json({ message: 'Sesión no válida o expirada.' });
   (req as any).user = payload;
@@ -85,6 +87,103 @@ export function requirePermission(permission: string) {
       }
       next();
     } catch (err) { next(err); }
+  };
+}
+
+export type ScriptAccessAction = 'view' | 'execute' | 'edit' | 'schedule' | 'manage_access';
+
+export function requireScriptAccess(action: ScriptAccessAction) {
+  return async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const user = (req as any).user;
+      if (!user?.id) return res.status(401).json({ message: 'Sesión requerida.' });
+      if (user.is_super_admin) return next();
+
+      let scriptId = Number(req.body?.scriptId || req.body?.script_id || req.params.id);
+      if (req.baseUrl.endsWith('/schedules') && req.params.id && !req.body?.scriptId && !req.body?.script_id) {
+        const schedule = await (await getPool()).request()
+          .input('schedule_id', sql.Int, Number(req.params.id))
+          .query('SELECT script_id FROM dbo.Schedules WHERE id = @schedule_id');
+        scriptId = Number(schedule.recordset[0]?.script_id);
+      }
+      if (!scriptId) return res.status(400).json({ message: 'Script requerido.' });
+
+      const permissionKey = action === 'manage_access' ? 'scripts.manage_access' : `scripts.${action}`;
+      const accessColumn = action === 'manage_access' ? 'can_edit' : `can_${action}`;
+      const pool = await getPool();
+      const result = await pool.request()
+        .input('user_id', sql.Int, user.id)
+        .input('script_id', sql.Int, scriptId)
+        .input('permission_key', sql.NVarChar(150), permissionKey)
+        .query(`
+          SELECT TOP 1 1 ok
+          FROM dbo.UserRoles ur
+          JOIN dbo.RolePermissions rp ON rp.role_id = ur.role_id
+          JOIN dbo.Permissions p ON p.id = rp.permission_id
+          WHERE ur.user_id = @user_id
+            AND p.permission_key = @permission_key
+            AND (
+              NOT EXISTS (SELECT 1 FROM dbo.ScriptAccess WHERE script_id = @script_id)
+              OR EXISTS (
+                SELECT 1 FROM dbo.ScriptAccess
+                WHERE script_id = @script_id
+                  AND user_id = @user_id
+                  AND ${accessColumn} = 1
+              )
+            )
+        `);
+
+      if (!result.recordset.length) {
+        return res.status(403).json({ message: 'No tienes permiso para esta acción sobre el script.' });
+      }
+      next();
+    } catch (error) {
+      next(error);
+    }
+  };
+}
+
+export function requireExecutionAccess(action: 'view' | 'execute' = 'view') {
+  return async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const user = (req as any).user;
+      if (!user?.id) return res.status(401).json({ message: 'Sesion requerida.' });
+      if (user.is_super_admin) return next();
+
+      const executionId = Number(req.params.id);
+      const permissionKey = `scripts.${action}`;
+      const accessColumn = `can_${action}`;
+      const pool = await getPool();
+      const result = await pool.request()
+        .input('execution_id', sql.Int, executionId)
+        .input('user_id', sql.Int, user.id)
+        .input('permission_key', sql.NVarChar(150), permissionKey)
+        .query(`
+          SELECT TOP 1 1 ok
+          FROM dbo.ScriptExecutions ex
+          WHERE ex.id = @execution_id
+            AND EXISTS (
+              SELECT 1 FROM dbo.UserRoles ur
+              JOIN dbo.RolePermissions rp ON rp.role_id = ur.role_id
+              JOIN dbo.Permissions p ON p.id = rp.permission_id
+              WHERE ur.user_id = @user_id AND p.permission_key = @permission_key
+            )
+            AND (
+              NOT EXISTS (SELECT 1 FROM dbo.ScriptAccess WHERE script_id = ex.script_id)
+              OR EXISTS (
+                SELECT 1 FROM dbo.ScriptAccess
+                WHERE script_id = ex.script_id AND user_id = @user_id AND ${accessColumn} = 1
+              )
+            )
+        `);
+
+      if (!result.recordset.length) {
+        return res.status(403).json({ message: 'No tienes permiso para esta ejecucion.' });
+      }
+      next();
+    } catch (error) {
+      next(error);
+    }
   };
 }
 

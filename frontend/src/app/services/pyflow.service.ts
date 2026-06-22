@@ -401,7 +401,8 @@ export class PyflowService {
   }
 
   watchExecution(executionId: number) {
-    const source = new EventSource(`${this.apiUrl}/executions/${executionId}/stream`);
+    const token = encodeURIComponent(localStorage.getItem('pyflow_token') || '');
+    const source = new EventSource(`${this.apiUrl}/executions/${executionId}/stream?access_token=${token}`);
 
     source.onmessage = (event) => {
       const payload = JSON.parse(event.data);
@@ -462,6 +463,34 @@ export class PyflowService {
 
   getScriptParameters(scriptId: number) {
     return this.http.get<any[]>(`${this.apiUrl}/scripts/${scriptId}/parameters`);
+  }
+
+  getScriptGovernance(scriptId: number) {
+    return this.http.get<any>(`${this.apiUrl}/governance/scripts/${scriptId}`);
+  }
+
+  updateScriptPolicy(scriptId: number, policy: any) {
+    return this.http.put(`${this.apiUrl}/governance/scripts/${scriptId}/policy`, policy);
+  }
+
+  updateScriptAccess(scriptId: number, entries: any[]) {
+    return this.http.put(`${this.apiUrl}/governance/scripts/${scriptId}/access`, { entries });
+  }
+
+  uploadScriptVersion(scriptId: number, file: File, version: string, notes: string) {
+    const form = new FormData();
+    form.append('file', file);
+    form.append('version', version);
+    form.append('notes', notes);
+    return this.http.post(`${this.apiUrl}/governance/scripts/${scriptId}/versions`, form);
+  }
+
+  restoreScriptVersion(scriptId: number, versionId: number) {
+    return this.http.post(`${this.apiUrl}/governance/scripts/${scriptId}/versions/${versionId}/restore`, {});
+  }
+
+  getAuditEvents() {
+    return this.http.get<any[]>(`${this.apiUrl}/governance/audit`);
   }
 
   toggleScheduleStatus(id: number) {
@@ -579,7 +608,7 @@ export class PyflowService {
     const query = this.dashboardChartRange
       ? `?dateFrom=${encodeURIComponent(this.dashboardChartRange.dateFrom)}&dateTo=${encodeURIComponent(this.dashboardChartRange.dateTo)}`
       : '';
-    const res = await fetch(`${this.apiUrl}/dashboard/summary${query}`);
+    const res = await fetch(`${this.apiUrl}/dashboard/summary${query}`, { headers: this.authHeaders() });
     const data = await res.json();
     if (!res.ok) {
       throw new Error(data?.message || 'Error obteniendo dashboard');

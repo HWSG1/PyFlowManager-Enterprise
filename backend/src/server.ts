@@ -13,6 +13,7 @@ import usersRoutes from './routes/users.routes';
 import themesRoutes from './routes/themes.routes';
 import { startScheduler } from './services/schedulerService';
 import dashboardRoutes from "./routes/dashboard.routes";
+import governanceRoutes from './routes/governance.routes';
 import { processExecutionQueue } from './services/executionQueue.service';
 
 fs.mkdirSync(env.runtime.scriptsDir, { recursive: true });
@@ -39,6 +40,7 @@ app.use('/api/settings', settingsRoutes);
 app.use('/api/users', usersRoutes);
 app.use('/api/themes', themesRoutes);
 app.use("/api/dashboard", dashboardRoutes);
+app.use('/api/governance', governanceRoutes);
 
 app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   console.error(err);

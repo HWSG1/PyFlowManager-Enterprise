@@ -3,11 +3,12 @@ import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { PyflowService } from '../../services/pyflow.service';
 import { environment } from '../../../environments/environment';
+import { ScriptGovernanceComponent } from '../script-governance/script-governance.component';
 
 @Component({
   selector: 'app-script-detail',
   standalone: true,
-  imports: [CommonModule, FormsModule],
+  imports: [CommonModule, FormsModule, ScriptGovernanceComponent],
   template: `
     <div class="h-full min-h-0 flex flex-col gap-4 overflow-hidden">
 
@@ -253,6 +254,10 @@ import { environment } from '../../../environments/environment';
               </div>
             </div>
           </div>
+
+          @if (script?.id) {
+            <app-script-governance [scriptId]="script!.id" />
+          }
 
           <!-- Danger Zone -->
           <div class="bg-rose-950/20 border border-rose-900/60 p-5 rounded-xl shrink-0 mb-2">
@@ -727,7 +732,8 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
       this.svc.loadExecutions();
     }, 2000);
 
-    this.eventSource = new EventSource(`${environment.apiUrl}/executions/${executionId}/stream`);
+    const token = encodeURIComponent(localStorage.getItem('pyflow_token') || '');
+    this.eventSource = new EventSource(`${environment.apiUrl}/executions/${executionId}/stream?access_token=${token}`);
 
     this.eventSource.onmessage = event => {
       if (sessionId !== this.consoleSessionId || this.currentExecutionId !== executionId) return;

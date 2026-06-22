@@ -2,6 +2,7 @@ import { Router } from "express";
 import { getPool, sql } from "../db/sql";
 import os from "os";
 import osUtils from "os-utils";
+import { requireAuth } from "../services/security.service";
 
 const router = Router();
 const DASHBOARD_TIMEZONE = "America/Tegucigalpa";
@@ -34,7 +35,7 @@ function getCpuUsagePercent(): Promise<number> {
   });
 }
 
-router.get("/summary", async (req, res) => {
+router.get("/summary", requireAuth, async (req, res) => {
   try {
     const defaultDateTo = localIsoDate();
     const dateFrom = String(req.query.dateFrom || addUtcDays(defaultDateTo, -6));
@@ -55,52 +56,75 @@ router.get("/summary", async (req, res) => {
     }
 
     const pool = await getPool();
+    const user = (req as any).user;
+    const visibleScriptsCte = `
+      SELECT s.id FROM Scripts s
+      WHERE @is_super_admin = 1 OR (
+        EXISTS (
+          SELECT 1 FROM dbo.UserRoles ur
+          JOIN dbo.RolePermissions rp ON rp.role_id=ur.role_id
+          JOIN dbo.Permissions p ON p.id=rp.permission_id
+          WHERE ur.user_id=@user_id AND p.permission_key='scripts.view'
+        )
+        AND (
+          NOT EXISTS (SELECT 1 FROM dbo.ScriptAccess sa WHERE sa.script_id=s.id)
+          OR EXISTS (SELECT 1 FROM dbo.ScriptAccess sa WHERE sa.script_id=s.id AND sa.user_id=@user_id AND sa.can_view=1)
+        )
+      )`;
 
-    const summary = await pool.request().query(`
+    const summary = await pool.request()
+    .input("user_id", sql.Int, user.id)
+    .input("is_super_admin", sql.Bit, !!user.is_super_admin)
+    .query(`
     DECLARE @todayStart DATETIME = DATEADD(HOUR, -6, CAST(CAST(GETDATE() AS DATE) AS DATETIME));
     DECLARE @tomorrowStart DATETIME = DATEADD(DAY, 1, @todayStart);
+    ;WITH VisibleScripts AS (${visibleScriptsCte})
 
     SELECT
-        (SELECT COUNT(*) FROM Scripts) AS totalScripts,
+        (SELECT COUNT(*) FROM VisibleScripts) AS totalScripts,
 
-        (SELECT COUNT(*) FROM Scripts WHERE is_active = 1) AS activeScripts,
+        (SELECT COUNT(*) FROM Scripts s JOIN VisibleScripts v ON v.id=s.id WHERE s.is_active = 1) AS activeScripts,
 
         (SELECT COUNT(*)
-        FROM ScriptExecutions
-        WHERE start_time >= DATEADD(HOUR,-24,GETDATE())
+        FROM ScriptExecutions ex JOIN VisibleScripts v ON v.id=ex.script_id
+        WHERE ex.start_time >= DATEADD(HOUR,-24,GETDATE())
         ) AS executionsToday,
 
         (SELECT COUNT(*)
-        FROM ScriptExecutions
-        WHERE status = 'Exitoso'
-        AND start_time >= DATEADD(HOUR,-24,GETDATE())
+        FROM ScriptExecutions ex JOIN VisibleScripts v ON v.id=ex.script_id
+        WHERE ex.status = 'Exitoso'
+        AND ex.start_time >= DATEADD(HOUR,-24,GETDATE())
         ) AS successToday,
 
         (SELECT COUNT(*)
-        FROM ScriptExecutions
-        WHERE status = 'Error'
-        AND start_time >= DATEADD(HOUR,-24,GETDATE())
+        FROM ScriptExecutions ex JOIN VisibleScripts v ON v.id=ex.script_id
+        WHERE ex.status = 'Error'
+        AND ex.start_time >= DATEADD(HOUR,-24,GETDATE())
         ) AS errorsToday,
 
         (SELECT COUNT(*)
-        FROM ScriptExecutions
-        WHERE status IN ('Ejecutando', 'RUNNING')
+        FROM ScriptExecutions ex JOIN VisibleScripts v ON v.id=ex.script_id
+        WHERE ex.status IN ('Ejecutando', 'RUNNING')
         ) AS runningCount,
 
         (SELECT COUNT(*)
-        FROM ExecutionQueue
-        WHERE status IN ('PENDING', 'Pendiente', 'En Cola')
+        FROM ExecutionQueue q JOIN VisibleScripts v ON v.id=q.script_id
+        WHERE q.status IN ('PENDING', 'Pendiente', 'En Cola')
         ) AS queuedCount,
 
         ISNULL((
         SELECT AVG(ISNULL(duration_seconds, 0))
-        FROM ScriptExecutions
-        WHERE start_time >= @todayStart
-            AND start_time < @tomorrowStart
+        FROM ScriptExecutions ex JOIN VisibleScripts v ON v.id=ex.script_id
+        WHERE ex.start_time >= @todayStart
+            AND ex.start_time < @tomorrowStart
         ), 0) AS avgDurationSeconds
     `);
 
-    const lastExecutions = await pool.request().query(`
+    const lastExecutions = await pool.request()
+    .input("user_id", sql.Int, user.id)
+    .input("is_super_admin", sql.Bit, !!user.is_super_admin)
+    .query(`
+      WITH VisibleScripts AS (${visibleScriptsCte})
       SELECT TOP 8
         e.id,
         s.name AS script,
@@ -112,10 +136,15 @@ router.get("/summary", async (req, res) => {
       FROM ScriptExecutions e
       INNER JOIN Scripts s
         ON s.id = e.script_id
+      INNER JOIN VisibleScripts v ON v.id = e.script_id
       ORDER BY e.id DESC
     `);
 
-    const nextSchedules = await pool.request().query(`
+    const nextSchedules = await pool.request()
+    .input("user_id", sql.Int, user.id)
+    .input("is_super_admin", sql.Bit, !!user.is_super_admin)
+    .query(`
+        WITH VisibleScripts AS (${visibleScriptsCte})
         SELECT TOP 5
             sc.id,
             s.name AS script,
@@ -127,6 +156,7 @@ router.get("/summary", async (req, res) => {
         FROM Schedules sc
         INNER JOIN Scripts s
             ON s.id = sc.script_id
+        INNER JOIN VisibleScripts v ON v.id = sc.script_id
         WHERE sc.is_active = 1
             AND sc.next_run_at IS NOT NULL
         ORDER BY sc.next_run_at ASC
@@ -135,17 +165,20 @@ router.get("/summary", async (req, res) => {
     const chart = await pool.request()
     .input("date_from", sql.Date, dateFrom)
     .input("date_to", sql.Date, dateTo)
+    .input("user_id", sql.Int, user.id)
+    .input("is_super_admin", sql.Bit, !!user.is_super_admin)
     .query(`
+    WITH VisibleScripts AS (${visibleScriptsCte})
     SELECT
         CAST(DATEADD(HOUR, -6, start_time) AS DATE) AS executionDate,
 
         SUM(CASE WHEN status = 'Exitoso' THEN 1 ELSE 0 END) AS successCount,
         SUM(CASE WHEN status = 'Error' THEN 1 ELSE 0 END) AS errorCount
 
-    FROM ScriptExecutions
-    WHERE start_time >= DATEADD(HOUR, 6, CAST(@date_from AS DATETIME2))
-      AND start_time < DATEADD(HOUR, 6, DATEADD(DAY, 1, CAST(@date_to AS DATETIME2)))
-    GROUP BY CAST(DATEADD(HOUR, -6, start_time) AS DATE)
+    FROM ScriptExecutions ex JOIN VisibleScripts v ON v.id=ex.script_id
+    WHERE ex.start_time >= DATEADD(HOUR, 6, CAST(@date_from AS DATETIME2))
+      AND ex.start_time < DATEADD(HOUR, 6, DATEADD(DAY, 1, CAST(@date_to AS DATETIME2)))
+    GROUP BY CAST(DATEADD(HOUR, -6, ex.start_time) AS DATE)
     ORDER BY executionDate
     `);
 
