@@ -1,25 +1,40 @@
 <!doctype html>
 <html lang="es">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Manual PyFlow Manager</title>
-<link rel="stylesheet" href="assets/style.css">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Manual operativo, técnico y de instalación de PyFlow Manager.">
+  <title>Manual PyFlow Manager</title>
+  <link rel="stylesheet" href="assets/style.css">
 </head>
 <body>
-<div class="layout">
-  <aside class="sidebar">
-    <div class="brand">
-      <div class="brandmark">PF</div>
-      <div><h1 class="logo">PyFlow Manager</h1><p class="subtitle">Manual operativo y técnico</p></div>
+  <a class="skip-link" href="#main">Ir al contenido</a>
+  <header class="mobile-header">
+    <button id="menuToggle" class="icon-button" type="button" aria-label="Abrir contenido" aria-controls="sidebar" aria-expanded="false">☰</button>
+    <div>
+      <strong>PyFlow Manager</strong>
+      <span>Manual operativo</span>
     </div>
-    <input id="search" class="search" placeholder="Buscar parámetro, módulo, tabla o error...">
-    <div id="searchInfo" class="searchInfo"></div>
-    <nav id="nav" class="nav"></nav>
-  </aside>
-  <main id="main" class="content"></main>
-</div>
-<script src="assets/data.js"></script>
-<script src="assets/app.js"></script>
+  </header>
+  <div id="sidebarBackdrop" class="sidebar-backdrop" hidden></div>
+  <div class="layout">
+    <aside id="sidebar" class="sidebar" aria-label="Contenido del manual">
+      <div class="brand">
+        <div class="brandmark" aria-hidden="true">PF</div>
+        <div>
+          <h1 class="logo">PyFlow Manager</h1>
+          <p class="subtitle">Manual operativo y técnico</p>
+        </div>
+        <button id="menuClose" class="icon-button sidebar-close" type="button" aria-label="Cerrar contenido">×</button>
+      </div>
+      <label class="search-label" for="search">Buscar en el manual</label>
+      <input id="search" class="search" type="search" placeholder="Parámetro, módulo, tabla o error..." autocomplete="off">
+      <div id="searchInfo" class="searchInfo" aria-live="polite"></div>
+      <nav id="nav" class="nav"></nav>
+    </aside>
+    <main id="main" class="content" tabindex="-1"></main>
+  </div>
+  <script src="assets/data.js"></script>
+  <script src="assets/app.js"></script>
 </body>
 </html>
