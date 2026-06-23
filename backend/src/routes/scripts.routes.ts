@@ -950,7 +950,32 @@ router.post('/:id/run', requireAuth, requireScriptAccess('execute'), async (req,
       req.body?.parameters || {}
     );
 
-    res.status(202).json(result);
+    const runResult: any = result;
+
+    const executionId =
+      runResult?.executionId ??
+      runResult?.execution_id ??
+      runResult?.id ??
+      runResult?.recordset?.[0]?.id;
+
+    if (!executionId) {
+      console.error('runScript no devolvió executionId:', runResult);
+
+      return res.status(500).json({
+        message: 'runScript no devolvió executionId',
+        result: runResult
+      });
+    }
+
+    console.log('Resultado runScript:', runResult);
+    console.log('executionId normalizado:', executionId);
+
+    res.status(202).json({
+      ...runResult,
+      executionId,
+      execution_id: executionId,
+      id: executionId
+    });
   } catch (err) {
     next(err);
   }

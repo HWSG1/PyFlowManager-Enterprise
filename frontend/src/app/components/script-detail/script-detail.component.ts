@@ -631,56 +631,90 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
   }
 
   runScript() {
-    if (!this.script || this.isRunning) return;
+  if (!this.script || this.isRunning) return;
 
-    if (!this.validateParameters()) {
-      return;
-    }
-
-    this.stopConsoleWatch();
-    this.viewingExecutionParameters = null;
-    this.executionParams = [];
-    this.consoleLines = [];
-    this.shouldFollowConsole = true;
-    this.scrollConsoleToBottom(true);
-    this.statusText = 'Iniciando...';
-    this.progress = 5;
-    this.isRunning = true;
-
-    this.svc.showToast(`Ejecutando ${this.script.name}`, 'info');
-
-    fetch(`${environment.apiUrl}/scripts/${this.script.id}/run`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        parameters: this.paramValues
-      })
-    })
-      .then(r => r.json())
-      .then(result => {
-        this.currentExecutionId = result.executionId;
-
-        this.consoleLines.push({
-          text: `[SYSTEM] Ejecución EX-${result.executionId} iniciada`,
-          cls: 'text-blue-400'
-        });
-        this.scrollConsoleToBottom();
-
-        this.connectExecutionStream(result.executionId);
-      })
-      .catch(err => {
-        this.isRunning = false;
-        this.statusText = 'Error';
-
-        this.consoleLines.push({
-          text: `[ERROR] ${err.message}`,
-          cls: 'text-red-400'
-        });
-        this.scrollConsoleToBottom();
-      });
+  if (!this.validateParameters()) {
+    return;
   }
+
+  const token =
+    localStorage.getItem('pyflow_token') ||
+    localStorage.getItem('token') ||
+    localStorage.getItem('access_token') ||
+    localStorage.getItem('auth_token');
+
+  if (!token) {
+    this.svc.showToast('Sesión inválida o expirada. Inicia sesión nuevamente.', 'error');
+    return;
+  }
+
+  this.stopConsoleWatch();
+  this.viewingExecutionParameters = null;
+  this.executionParams = [];
+  this.consoleLines = [];
+  this.shouldFollowConsole = true;
+  this.scrollConsoleToBottom(true);
+  this.statusText = 'Iniciando...';
+  this.progress = 5;
+  this.isRunning = true;
+
+  this.svc.showToast(`Ejecutando ${this.script.name}`, 'info');
+
+  fetch(`${environment.apiUrl}/scripts/${this.script.id}/run`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`
+    },
+    body: JSON.stringify({
+      parameters: this.paramValues
+    })
+  })
+    .then(async r => {
+      const data = await r.json().catch(() => ({}));
+
+      if (!r.ok) {
+        throw new Error(data?.message || data?.error || `Error HTTP ${r.status}`);
+      }
+
+      return data;
+    })
+    .then(result => {
+      const executionId =
+        result?.executionId ??
+        result?.execution_id ??
+        result?.id;
+
+      if (!executionId) {
+        console.error('Respuesta sin executionId:', result);
+        throw new Error('El backend no devolvió el ID de ejecución.');
+      }
+
+      this.currentExecutionId = Number(executionId);
+
+      this.consoleLines.push({
+        text: `[SYSTEM] Ejecución EX-${executionId} iniciada`,
+        cls: 'text-blue-400'
+      });
+
+      this.scrollConsoleToBottom();
+      this.connectExecutionStream(Number(executionId));
+    })
+    .catch(err => {
+      this.isRunning = false;
+      this.statusText = 'Error';
+      this.progress = 0;
+
+      console.log('TOKEN:', token);
+      this.consoleLines.push({
+        text: `[ERROR] ${err.message}`,
+        cls: 'text-red-400'
+      });
+
+      this.scrollConsoleToBottom();
+      this.svc.showToast(err.message, 'error');
+    });
+}
 
   connectExecutionStream(executionId: number) {
     this.stopConsoleWatch();

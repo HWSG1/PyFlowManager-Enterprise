@@ -1,0 +1,194 @@
+﻿conversationId,communicationId,conversationStart,conversationEnd,originatingDirection,ContactId,ContactListId,CampaignId,phrases_count,transcript_first_marker,transcript_last_marker,text,fecha_carga
+df9b15c1-a37e-4652-afa7-73b0213a847d,217dd819-5937-3bd4-82f9-bca15c52e39e,2026-06-20T18:23:14.104Z,,outbound,aef41b4f7c5f5f925adc07b85fc6b3d1,d7a89557-d741-4f67-9412-48423ea35d0e,fdc6719b-009a-4ad6-a508-fe1654d3bb3d,1,,,external: es el servicio de buzón de voz,2026-06-22 11:49:10
+712d2f76-451a-4cad-9fc6-9d44a6d5a00f,34b2db97-c942-3aa4-9d27-aaf43403be27,2026-06-20T18:26:36.352Z,,outbound,078280e59b3c718cfe94ebe82ce9f942,d7a89557-d741-4f67-9412-48423ea35d0e,fdc6719b-009a-4ad6-a508-fe1654d3bb3d,2,,,"external: bienvenido al buzón tigo
+internal: a las personas",2026-06-22 11:49:15
+b86fd42d-c4ed-4755-acb1-8502db4df698,d71a0ad6-a438-376f-8278-59b60d319880,2026-06-22T01:54:42.965Z,,outbound,,,,0,,,,2026-06-22 11:50:20
+46228663-f3a5-4b7b-b875-53bb5786f855,d76c9012-e637-37b3-a3f3-ef0a86e4fb1a,2026-06-22T02:12:38.935Z,,inbound,,,,109,,,"external: que
+external: token el token tengo que ir allá yo
+internal: muchas gracias por llamar a banco falabella le atiende josé casco con quién tengo el gusto
+external: hola buenas noches con daniela mejía
+internal: muy buenas noches señorita arila cómo puedo ayudarle
+external: pues fíjese que hace un tiempito se me bloqueó la aplicación del token porque dice que tengo que actualizarlo
+external: y no puedo hacer transferencias ni nada de eso
+internal: ok y realizó lo que es la actualización de lo que es la aplicación
+external: si pero me me dice que es inválida cuando le pongo la la identidad que dice que hay que tomarle una foto entonces me dice que es invalida
+internal: correcto pero le dice le queda aquí la información es inválida o no le está tomando lo que es la la fotografía o la imagen
+external: no no
+internal: dice token inválido
+external: sí
+internal: bien comprendo con mucho gusto vamos a realizar lo que es la verificación si nos aparece lo que es el token bloqueado igual siempre voy a realizar lo que es una serie de preguntas esto es por seguridad lo que es la información me ayuda por favor señorita dariela confirmándome cuál es su número de teléfono registrado
+external: sí sí
+external: noventa y nueve
+internal: sí
+external: setenta y nueve ochenta y cuatro cero cuatro
+internal: muy bien
+internal: en qué fecha realizó la última transacción
+external: yo le digo
+internal: transacción me refiero a lo que son a pagos compras retiros en atm o transferencias entre cuentas
+external: que no
+external: como el viernes o transacción el pago que hizo de la tarjeta
+external: cincuenta que lo he quitado entonces sería el viernes
+external: pero yo me lo de
+external: entonces fue el viernes
+internal: que el día viernes
+external: si que se hizo un pago en el banco atlántico por una cuenta de una constancia de banco
+internal: el día viernes diecinueve de junio
+internal: okay
+internal: me confirma por favor su correo electrónico registrado
+external: um me diga daniela
+external: cero cinco once
+external: arroba gmail punto com
+internal: posee tarjetas adicionales que usted le haya brindado como un familiar o amigo extensiones de sus tarjetas titulares
+external: el usuario dice o no
+internal: no no no tarjetas si usted si usted cuenta con tarjetas adicionales que le haya brindado a algún familiar o amigo
+external: no no
+external: no no
+internal: muchas gracias
+internal: y tarjetas de débito o crédito propias
+external: no
+internal: no cuenta con tarjeta de débito propia
+external: sí solo eso
+internal: me confirma los cuatro últimos dígitos de su tarjeta de débito
+external: huy
+external: la perdió
+external: permítame
+external: encontró un whatsapp
+external: encontró
+internal: gracias por su
+internal: no
+external: si no
+external: yo
+external: mire pues
+external: moneda sur
+external: sí
+external: mira digo mira todas esas cosas ustedes
+external: ah okay eso
+external: son ahí disculpe cuarenta y tres cincuenta y cinco
+internal: cuarenta y tres cincuenta y cinco
+internal: ok muy bien
+internal: ok ahorita estoy realizando lo que es la verificación
+internal: bien
+external: pero igual que
+external: aquí
+external: no me acuerdo
+internal: una consulta este lo desinstaló no lo tiene no lo había instalado anteriormente o qué por qué razón lo
+internal: no había utilizado lo que es el token
+external: es que si lo quería utilizar ya días para hacer una transferencia y me decía que estaba desactualizado y pues quise actualizarlo desde aquí con la identidad tomándole la foto y cuando lo he tomado la fotografía me me tiraba que no
+internal: comprendo usted utiliza lo que es actualmente lo que es atlántida móvil verdad okay le consulto porque en este momento bueno actualmente ya existe lo que es una nueva aplicación de lo que es la banca en línea eso se llama atlántida h n en lo que es esta aplicación no es necesario realizar lo que es el que se
+internal: proceso de lo que si ya lo tuvo lo que es anteriormente entonces le da la opción de que usted pueda el token ya este en la misma aplicación o sea maneja lo que es en la misma aplicación entonces para que pudiera realizar lo que es la gestión en esa misma aplicación ya de un solo porque esta es la que se va a estar manejando actualmente la aplicación se llama con
+internal: le menciono atlántida h n si la descarga igual podría realizar lo que es una un reseteo lo que es la contraseña para que le reciba y al momento pues que le va a solicitar lo que es la autorización de lo que es el token solo va a solicitar ya sea lo que es un
+internal: mediante lo que es código o que le soliciten en este caso lo que son datos biométricos para lo que registra lo que es el token y que ella directamente queda en la misma aplicación
+internal: no es necesario realizar lo que es la
+internal: descargar lo que es una nueva aplicación
+external: si ahorita la estoy instalando
+internal: okay entonces le voy a solicitar lo que es un cambio de contraseña
+external: me lo enviaría al correo o
+internal: sí le enviaría lo que es una contraseña temporal para que realice lo que es la
+internal: que realice ingrese lo que es la contraseña temporal y le permita ya utilizar lo que es la cantidad h n
+internal: okay permítame solicitando permítame un momento
+external: yo voy a dejar dejando
+internal: de su usuario de su banca en línea de ceci se recuerda verdad
+internal: el usuario es el mismo solo sería lo que es la contraseña que se en este caso tendría que realizar porque esto tiene esta es diferente a la que ha utilizado anteriormente
+internal: tendría que realizar lo que son cambios
+external: ya
+internal: ahí solo va siguiendo lo que son los pasos para lo que es activar lo que es la nueva aplicación
+external: no porque
+external: es que no puedo entrar en algo que continua continuo
+external: y por qué no tengo
+internal: espera
+internal: okay descargar lo que es la nueva aplicación
+external: si hasta
+internal: okay la contraseña sí esto le va a tardar un poco en llegar esto le va a llegar en unos tres a cinco minutos una vez que le llegue entonces si ingresa lo que es su usuario y la contraseña temporal que le que le llegue luego le da iniciar sesión y ahí le va a indicar en este caso para que realice lo que es el cambio de lo que
+internal: su contraseña luego le va a llevar para que realice lo que es la configuración de lo que es el token en la cual pues como le menciono solo le va a solicitar lo que es la que sea lo que es un código de cuatro dígitos o lo que es su dato biométrico ya sea su o lo que es una huella digital
+external: solamente eso
+internal: sí una vez que ha configurado entonces ya le quedaría en una sola aplicación lo que es todo lo que es la información y ya pues la otra pues ya no sería bueno si ya usted no desea utilizar pues ya porque ya dentro de poco ya no se va a estar utilizando
+external: o sea es que así yo le di a alguien el usuario tengo que decirle que hay otra nueva aplicación
+internal: correcto y existe lo que es una nueva aplicación ya no se puede utilizar ya no se va a utilizar la nueva y pues este ya se quedó para que pueda utilizarla en el dispositivo
+external: previous
+internal: bien alguna otra consulta que yo pueda ayudarle
+external: pues no ya está clarito
+internal: okay muy bien bueno estamos para servirle cualquier consulta o duda estamos a la orden brindarle que es la información para la instalación de nueva aplicación de la entidad h n lo atendió josé cascos siempre estará recibiendo lo que es en su correo una encuesta donde puede llenar y evaluarme como lo atendí que tenga una muy bonita tarde señorita daniela un gusto atenderle gracias por llamar a banco
+external: bueno gracias
+internal: para servirle feliz noche
+internal: me ayuda finalizando la llamada por favor
+es que no puedo entrar en algo que continua, continuo",2026-06-22 11:50:25
+5fbbb241-735c-40cc-99a7-2e566246bebd,e70db78b-1f33-3d78-bca2-60bb9eb13c4e,2026-06-22T02:13:22.332Z,,inbound,,,,49,,,"external: polo
+internal: hola buenas gracias por comunicarse con banco atlántida habla con giorgian flores con quién tengo el gusto
+external: tenía depositar no sé
+external: con josé roberto ferrujino savia
+internal: muy buenas en qué lo podría ayudar josé
+external: fíjese que quería llamar porque necesito hacer una compra en dólares
+external: esta tarjeta
+external: lo voy a hacer la transferencia por paypal
+internal: de acuerdo y está presentando algún inconveniente o qué sucede
+external: no yo yo llamo para que tengan ya conocimiento y no vayan a ser así de que por ejemplo vayan a bloquearlo porque la fuga de
+internal: ajá
+external: la fuga de dinero sea un poco alta porque son siete mil ciento noventa dólares
+internal: está hablando
+internal: entiendo entiendo está bien entonces en ese momento se le va a hacer saber al área de monitoreo que va a haber una transacción de estos montos para que no se haga el bloqueo
+external: sí correcto es que por eso llamo porque de repente denunciado dinero y si usted puede reservar en mi cuenta tengo un negocito entonces me cayó la
+external: un dinero como de doscientos doscientos mil doscientos y fracción para compra de un equipo táctil
+internal: de acuerdo entiendo josé entonces solo veamos me confirma su nombre completo y su identidad
+external: sí josé roberto mande
+internal: y su identidad
+internal: y su identidad
+external: cero siete cero cuatro mil novecientos noventa y ocho cero uno cuatrocientos cuarenta y cinco
+internal: siete mil dólares cerrados serán
+external: no siete mil
+external: ciento noventa dólares
+external: bueno son son digamos di bueno digamos que por los momentos ahorita eso es pero pongámosle que van a hacer unos
+internal: hasta luego
+internal: si
+external: diez mil dólares digamos
+external: porque va a hacer otras compras
+internal: buen día
+internal: de acuerdo ese mismo
+internal: tarjeta de débito listo
+external: sí pero es la que la que voy a utilizar es la es la ya le voy a mandar la tarjeta cuál es ahorita aquí la tengo porque yo no tengo una persona por la cual me giran dinero me pago
+internal: ajá
+external: mensualidad es la setenta veinte
+internal: setenta veinte
+external: si setenta veinte con esta
+internal: sabes que no
+internal: setenta y listo perfecto gracias bien entonces en este momento josé ya se les envió toda la información al área de monitoreo para que puedan estar pendiente y no se haga ningún bloqueo de la tarjeta alguna otra duda
+external: así no solamente solo para llamadas que siempre llamo para ese tipo de cuestiones porque así pues no hay ningún inconveniente que a mi no me bloquean los fondos
+internal: mhm
+internal: perfecto
+internal: movement
+internal: entiendo está bien muchas gracias le recuerdo entonces el llamado fue por estas transacciones que va a hacer le atendió giorgio flores al correo llegará una breve encuesta donde podrá evaluar el servicio muy buenas noches
+external: uh
+external: claro claro
+external: buenas noches gracias
+internal: buenas noches
+internal: que le",2026-06-22 11:50:32
+be451634-faa9-4914-9ee7-262ff110ba66,d6a57e12-0ae3-36ef-b2e1-57534bce16cd,2026-06-22T02:13:27.181Z,,inbound,,,,31,,,"internal: buenas noches por llamar a banco central asesora con quién tengo el gusto
+external: caballero carlos habla luis unidos
+internal: dígame luis cómo le puedo ayudar el día de hoy un gusto
+external: que quiero saber el límite de uno de mis adicionales
+internal: okay vamos a verificar de la tarjeta de crédito adicional
+internal: me confirma por favor su número de identidad primero le voy a realizar las fondos de seguridad para ingresar
+external: cinco cero uno diecinueve siete ocho cero cincuenta dos ochenta y nueve
+internal: okay me lo repite nuevamente que no sé si está susurrando o se escucha demasiado largo porque
+external: no puedo repetir
+internal: okay comprendo me confirma nuevamente el número de identidad por favor
+external: cero cinco cero uno diecinueve siete ocho cero cincuenta y dos ochenta y nueve
+internal: cuál es su fecha de nacimiento luis me confirma día mes y año
+external: setenta y ocho
+internal: cuáles son los últimos cuatro números de su tarjeta de crédito la que usted es titular
+external: que veinte cincuenta y dos
+internal: ahora me indica si usted posee intrafinanciamiento o extra financiamiento activos
+internal: vamos a ver
+internal: tiene una a nombre de lionel y otra aliana verdad
+external: elina
+internal: alina entonces vamos a ver
+internal: que vamos a verificar
+internal: trescientos dólares
+external: cómo hago para que la la suba
+internal: tiene que su directamente puede hacer usted la solicitud directamente desde la aplicación o tendríamos que ingresar una gestión en la cual usted me tendría que mandar una nota manuscrita y todo para hacerle el aumento límite pero le sale más rápido que usted lo haga mediante la aplicación
+external: aplicación en la aplicación a donde
+internal: gestiones de tarjeta
+external: voy a revisar okay okay gracias
+internal: listo lene alguna otra duda consulta luis en la que le pueda ayudar
+external: luis
+internal: perfecto usted nos llamó verdad para poder verificar
+external: gracias",2026-06-22 11:50:36
