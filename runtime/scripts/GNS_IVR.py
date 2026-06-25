@@ -1311,7 +1311,7 @@ def query_client_profiles(config: Config, etiquetas: List[str], logger: logging.
         return {}
     logger.info("Consultando datos de cliente en HANA espejo para %s identificaciones...", len(etiquetas))
     sql_tpl = '''
-        SELECT DISTINCT
+            SELECT DISTINCT
             COALESCE(
                 NULLIF(TRIM(TO_NVARCHAR(cdc.IDENTIFICACION_1)), ''),
                 NULLIF(TRIM(TO_NVARCHAR(cdc.IDENTIFICACION_2)), '')
@@ -1335,12 +1335,34 @@ def query_client_profiles(config: Config, etiquetas: List[str], logger: logging.
             cdc.GENERO,
             cdc.TIPO_SECTOR_ECONOMICO,
             cdc.NIVEL_EDUCATIVO,
-            cdc.FECHA_ULTIMA_ACTUALIZACION
+            cdc.FECHA_ULTIMA_ACTUALIZACION,
+        
+            CASE
+                WHEN cdc.FECHA_ULTIMA_ACTUALIZACION IS NULL THEN '0. No actualizado'
+                WHEN TO_DATE(cdc.FECHA_ULTIMA_ACTUALIZACION, 'YYYYMMDD') >= ADD_MONTHS(CURRENT_DATE, -6)  THEN '1. 0–6 meses'
+                WHEN TO_DATE(cdc.FECHA_ULTIMA_ACTUALIZACION, 'YYYYMMDD') >= ADD_MONTHS(CURRENT_DATE, -12) THEN '2. 6–12 meses'
+                WHEN TO_DATE(cdc.FECHA_ULTIMA_ACTUALIZACION, 'YYYYMMDD') >= ADD_MONTHS(CURRENT_DATE, -36) THEN '3. 1–3 años'
+                WHEN TO_DATE(cdc.FECHA_ULTIMA_ACTUALIZACION, 'YYYYMMDD') >= ADD_MONTHS(CURRENT_DATE, -60) THEN '4. 3–5 años'
+                ELSE '5. >5 años'
+            END AS RANGO_FECHA_ACTUALIZACION,
+        
+            CASE 
+                WHEN LEFT(cdc.FECHA_NACIMIENTO, 4) BETWEEN '2013' AND '2025' THEN 'Alpha (2013 - 2025)'
+                WHEN LEFT(cdc.FECHA_NACIMIENTO, 4) BETWEEN '1997' AND '2012' THEN 'Z (1997 - 2012)'
+                WHEN LEFT(cdc.FECHA_NACIMIENTO, 4) BETWEEN '1981' AND '1996' THEN 'Millennials (1981 - 1996)'
+                WHEN LEFT(cdc.FECHA_NACIMIENTO, 4) BETWEEN '1965' AND '1980' THEN 'X (1965 - 1980)'
+                WHEN LEFT(cdc.FECHA_NACIMIENTO, 4) BETWEEN '1946' AND '1964' THEN 'Baby Boomers (1946 - 1964)'
+                WHEN LEFT(cdc.FECHA_NACIMIENTO, 4) < '1946' THEN 'Silent (<1946)'
+                ELSE 'Desconocida'
+            END AS GENERACION_CLIENTE
+        
         FROM DS_STG.CRM_DIM_CLIENTES cdc
-        WHERE (TRIM(TO_NVARCHAR(cdc.IDENTIFICACION_1)) IN ({placeholders})
-               OR TRIM(TO_NVARCHAR(cdc.IDENTIFICACION_2)) IN ({placeholders}))
+        WHERE (
+            TRIM(TO_NVARCHAR(cdc.IDENTIFICACION_1)) IN ({placeholders})
+            OR TRIM(TO_NVARCHAR(cdc.IDENTIFICACION_2)) IN ({placeholders})
+        )
     '''
-    cols = ["ETIQUETA_EXTERNA", "TEL_CELULAR", "TEL_PRINCIPAL", "DEPARTAMENTO", "ESTADO_CIVIL", "PAIS", "NOMBRE_LEGAL", "PRIMER_NOMBRE", "PRIMER_APELLIDO", "E_MAIL", "SEGMENTO_BANCA", "GENERO", "TIPO_SECTOR_ECONOMICO", "NIVEL_EDUCATIVO", "FECHA_ULTIMA_ACTUALIZACION"]
+    cols = ["ETIQUETA_EXTERNA", "TEL_CELULAR", "TEL_PRINCIPAL", "DEPARTAMENTO", "ESTADO_CIVIL", "PAIS", "NOMBRE_LEGAL", "PRIMER_NOMBRE", "PRIMER_APELLIDO", "E_MAIL", "SEGMENTO_BANCA", "GENERO", "TIPO_SECTOR_ECONOMICO", "NIVEL_EDUCATIVO", "FECHA_ULTIMA_ACTUALIZACION","RANGO_FECHA_ACTUALIZACION","GENERACION_CLIENTE"]
     lookup: Dict[str, Dict[str, Any]] = {}
     conn = hana_connect(config, "read")
     cur = conn.cursor()

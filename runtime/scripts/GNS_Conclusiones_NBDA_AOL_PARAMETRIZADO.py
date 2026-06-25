@@ -14,9 +14,14 @@
 #   - SOPORTE_AOL_
 #
 # Genera un Excel con:
-#   1. Resumen tipo tabla dinámica
-#   2. Conclusiones AOL acumuladas por día/mes
-#   3. Conclusiones NBDA acumuladas por día/mes
+#   1. Data para análisis
+#   2. Resumen tipo tabla dinámica con Conversación media
+#   3. Conclusiones AOL acumuladas por día/mes
+#   4. Conclusiones NBDA acumuladas por día/mes
+#
+# Corrección V3:
+#   La consulta de Genesys se agrupa solo por wrapUpCode, no por queueId,
+#   para evitar duplicar llamadas cuando una conversación pasa por varias colas.
 #
 # Opcionalmente envía correo con el Excel adjunto.
 #
@@ -721,22 +726,150 @@ def get_all_queues(config: Config, token: str, logger: logging.Logger) -> Dict[s
     return results
 
 
+
+# =========================================================
+# CONCLUSIONES PARAMETRIZADAS DENTRO DEL SCRIPT
+# =========================================================
+# Importante:
+#   El reporte SOLO consultará las conclusiones incluidas en estas dos listas.
+#   Ya no filtra por prefijos amplios como NBDA_, CONSULTA_AOL_, GESTIONES_AOL_, etc.
+#   Esto evita traer conclusiones que no corresponden y que inflan el total.
+
+NBDA_WRAPUP_EXACT_NAMES = {
+    "NBDA_PAGINA_WEB_NO_FUNCIONA",
+    "NBDA_NO_APARECE_RECIBO_PAGO",
+    "NBDA_CAMBIO_CORREO_ELECTRÓNICO",
+    "NBDA_SOPORTE_USO_PAGINA_WEB",
+    "NBDA_AGREGAR_CUENTA_FIRMANTE",
+    "NBDA_PAGINA_WEB_APP_NO_FUNCIONA",
+    "NBDA_NO_RECIBE_CODIGO_OTP",
+    "NBDA_TOKEN_SMART_TOKEN_REMITIDO_A_AGENCIA",
+    "NBDA_SOPORTE_USO_BANCA_MOVIL",
+    "NBDA_DESBLOQUEO_USUARIO",
+    "NBDA_SOPORTE_MIGRACIÓN_ATLANTIDA_HN",
+    "NBDA_SOPORTE_APERTURA_CTA_DIGITAL",
+    "NBDA_RETIRO_SIN_TD",
+    "NBDA_REQUIERE_DESLIGAR_TOKEN_SMART_TOKEN",
+    "NBDA_ACTIVACION_DE_USUARIO",
+    "NBDA_INSTALACION_APP_MOVIL",
+    "NBDA_TRANSFERENCIAS_ACH",
+    "NBDA_CABINAS_TELEFONICAS",
+    "NBDA_SOPORTE_CREACION_DE_USUARIO",
+    "NBDA_CONTRASEÑA_TEMPORAL_VENCIDA",
+    "NBDA_CAJA_EMPRESARIAL",
+    "NBDA_SOPORTE_TRANSFERENCIA_INTERNACIONAL",
+    "NBDA_AGREGAR_PRODUCTOS",
+    "NBDA_ACTUALIZACION_DE_DATOS",
+    "NBDA_PROBLEMAS_TECNICOS_DEL_CLIENTE",
+    "NBDA_REQUISITOS_APERTURA",
+    "NBDA_CLIENTE_EN_EXTRANJERO,_NO_RECUERDA_USUAR._EN_EL_EXTRANJE",
+    "NBDA_CLIENTE_EN_EXTRANJERO_NO_RECUERDA_USUAR_EN_EL_EXTRANJE",
+    "NBDA_BLOQUEO_DE_TOKEN",
+    "NBDA_SINCRONIZACION_TOKEN_OFFLINE",
+    "NBDA_APLICACIÓN_PAGO_NO_GENERADO",
+    "NBDA_REVERSIONES_PAGOS",
+    "NBDA_SOPORTE_DE_REMESAS",
+    "NBDA_SOPORTE_REMESAS",
+    "NBDA_CAMBIO_DE_CONTRASEÑA",
+}
+
+AOL_WRAPUP_EXACT_NAMES = {
+    "GESTIONES_AOL_ACTIVACION_DE_USUARIO_AOL",
+    "CONSULTA_AOL_RESOLUCIÓN_GEST_AOL/SMS/DEB_AUTOMÁTICO",
+    "CONSULTAS_RETIRO_SIN_TD_POR_AOL",
+    "CONSULTA_AOL_CAJA_EMPRESARIAL",
+    "CONSULTA_AOL_REQUISITOS_APERTURA_SMS",
+    "SOPORTE_REMESAS_INGRESAR_A_AOL",
+    "GESTIONES_AOL_APROBACION_USUARIO_AOL_PROCESO",
+    "GESTIONES_AOL_SINCRONIZACION_TOKEN/SMART_TOKEN",
+    "CONSULTA_AOL_PAGO_DE_DÉBITO_AUTOMÁTICO",
+    "CONSULTA_AOL_TOKEN/SMART_TOKEN/REMITIDO_A_AGENCIA",
+    "GESTIONES_AOL_PRIVILEGIOS_CUENTAS_SMS_ATLANTIDA",
+    "CONSULTA_AOL_AOL_MOVIL",
+    "GESTIONES_AOL_DESBLOQ/SINCRONIZACIÓN_TOKEN/SMART_TOKEN",
+    "GESTIONES_AOL_REVERSIONES_PAGOS_POR_AOL",
+    "GESTIONES_AOL_CLIENTE_EN_EXTRANJERO,_NO_RECUERDA_USUAR._EN_EL_EXTRANJE",
+    "CONSULTA_AOL_COBRO_DEVOLUCION_DE_TOKEN",
+    "GESTIONES_AOL_APLICACIÓN_PAGO_NO_GENERADO_AOL",
+    "CONSULTA_AOL_TRANSFERENCIAS_ACH",
+    "GESTIONES_AOL_CAMBIO_CORREO_ELECTRÓNICO",
+    "GESTIONES_AOL_AGREGAR_CUENTAS_SMS_ATLANTIDA",
+    "GESTIONES_AOL_NO_APARECE_RECIBO_PAGO_AOL",
+    "GESTIONES_AOL_CAMBIO_DE_PIN_A_TOKEN",
+    "GESTIONES_AOL_PRIVILEGIOS_CTA_FIRMANTE_AOL",
+    "GESTIONES_AOL_REGISTRO_DE_BENEFICIARIO_C__EN_EL_EXTRAN",
+    "GESTIONES_AOL_CAMBIO_DE_TOKEN_A_PIN",
+    "GESTIONES_AOL_REGISTRO_DE_BENEFICIARIO_C._EN_EL_EXTRAN._EN_EL_EXTRANJERO,_NO_RECUERDA_USUAR._EN_EL_EXTRANJE",
+    "CONSULTAS_AOL_REQUISITOS_APERTURA_DEBITOS_AUTOMÁTICOS",
+    "SOPORTE_TÉCNICO_AOL_INSTALACION_APP_AOL_MOVIL",
+    "GESTIONES_AOL_AGREGAR_PRODUCTOS_A_AOL",
+    "CONSULTA_AOL_AOL_LANDING_PAGE",
+    "GESTIONES_AOL_CREACION_DE_TOKEN_C._EN_EL_EXTRANJERO,_NO_RECUERDA_USUAR._EN_EL_EXTRANJE",
+    "CONSULTA_AOL_COBRO_DE_REPOSICION_DE_TOKEN",
+    "CONSULTA_AOL_DESBLOQUEO_USUARIO/CONTRASEÑA_(LANDING)",
+    "GESTIONES_AOL_CREACION_DE_USUARIO_EN_ENTRUST",
+    "GESTIONES_AOL_DESBLOQUEO_DE_SESIONES_ACTIVAS_AOL",
+    "GESTIONES_AOL_CAMBIO_DE_PIN_A_SMART_TOKEN",
+    "CONSULTA_AOL_PAGINA_WEB_NO_FUNCIONA",
+    "GESTIONES_AOL_CAMBIO_DE_TOKEN_A_SMART_TOKEN",
+    "SOPORTE_TÉCNICO_AOL_SOPORTE_USO_AOL",
+    "GESTIONES_AOL_CAMBIO_PORTABILIDAD_SMS_ATLANTIDA",
+    "GESTIONES_AOL_PRIVILEGIOS_A_PRODUCTOS_AOL",
+    "GESTIONES_AOL_BLOQUEO_DE_TOKEN",
+    "CONSULTA_AOL_REQUISITOS_APERTURA_AOL",
+    "GESTIONES_AOL_CAMBIO_DE_CONTRASEÑA",
+    "CONSULTA_AOL_REQUIERE_DESLIGAR_TTOKEN/SMART_TOKEN",
+    "SOPORTE_TÉCNICO_AOL_SOPORTE_PARA_MASE",
+    "GESTIONES_AOL_AGREGAR_CUENTA_FIRMANTE_AOL",
+    "GESTIONES_AOL_CORRECCION_DE_USUARIOS_ENTRUST",
+    "CONSULTA_AOL_SOPORTE_DE_REMESAS_AOL",
+    "SOPORTE_TÉCNICO_AOL_SOPORTE_DEBITOS_AUTOMATICOS",
+    "SOPORTE_TÉCNICO_AOL_INSTALACION_APP_ENTRUST",
+    "CONSULTA_AOL_REQUISITOS_APERTURA_DEBITOS_AUTOMATICOS",
+    "GESTIONES_AOL_CORRECION_NOMBRE/APELLIDO_MASE",
+    "CONSULTA_AOL_ACH_LANDING_PAGE",
+    "CONSULTA_AOL_TRANSFERENCIA_DE_LLAMADA",
+    "CONSULTA_AOL_CANCELAR_AOL/SMS/DÉBITO_AUTOMÁTICO",
+    "GESTIONES_AOL_ACTUALIZACION_DE_DATOS_C._EN_EL_EXTRANJE",
+    "SOPORTE_TÉCNICO_AOL_SOPORTE_P/SINCRONIZAR_TOKENS",
+    "SOPORTE_TÉCNICO_AOL_SOPORTE_USO_SMS_ATLANTIDA",
+}
+
+
+
+def _norm_code_name(value: str) -> str:
+    """Normaliza nombres de wrapup para comparar sin acentos, NBSP, espacios dobles ni diferencias menores."""
+    if not value:
+        return ""
+    import unicodedata
+    text = str(value).replace("\ufeff", "").replace("\xa0", " ").strip().upper()
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    text = " ".join(text.split())
+    return text
+
+
+NBDA_WRAPUP_EXACT_NAMES_NORM = {_norm_code_name(x) for x in NBDA_WRAPUP_EXACT_NAMES}
+AOL_WRAPUP_EXACT_NAMES_NORM = {_norm_code_name(x) for x in AOL_WRAPUP_EXACT_NAMES}
+ALL_WRAPUP_EXACT_NAMES_NORM = NBDA_WRAPUP_EXACT_NAMES_NORM | AOL_WRAPUP_EXACT_NAMES_NORM
+
+
+def seconds_to_mmss(value: Any) -> str:
+    """Convierte segundos a formato mm:ss para reportes ejecutivos."""
+    try:
+        seconds = float(value or 0)
+    except Exception:
+        seconds = 0
+    seconds = int(round(seconds))
+    minutes, secs = divmod(seconds, 60)
+    return f"{minutes:02d}:{secs:02d}"
+
+
 def is_target_wrapup_name(name: str) -> bool:
+    """Valida únicamente contra las conclusiones exactas parametrizadas en el script."""
     if not name:
         return False
-
-    upper_name = name.upper()
-
-    return (
-        upper_name.startswith("NBDA_")
-        or upper_name.startswith("CONSULTA_AOL_")
-        or upper_name.startswith("CONSULTAS_AOL_")
-        or upper_name.startswith("GESTIONES_AOL_")
-        or upper_name.startswith("SOPORTE_AOL_")
-        or upper_name.startswith("SOPORTE_TECNICO_AOL_")
-        or upper_name.startswith("SOPORTE_TÉCNICO_AOL_")
-    )
-
+    return _norm_code_name(name) in ALL_WRAPUP_EXACT_NAMES_NORM
 
 def clean_conclusion_name(name: str) -> str:
     if not name:
@@ -750,6 +883,7 @@ def clean_conclusion_name(name: str) -> str:
         "SOPORTE_TÉCNICO_AOL_",
         "SOPORTE_TECNICO_AOL_",
         "SOPORTE_AOL_",
+        "SOPORTE_REMESAS_",
     ]
 
     result = name
@@ -801,17 +935,18 @@ def build_analytics_body(start_utc: str, end_utc: str, wrapup_ids_chunk: List[st
     """
     Construye el body de /analytics/conversations/aggregates/query.
 
-    Importante:
-    - Genesys no permite filtrar por varios valores en un solo predicate.
-    - Por eso se usa una cláusula OR con predicates individuales por wrapUpCode.
-    - Se consulta por bloques para evitar HTTP 400 por payload/filtro demasiado grande.
+    Corrección importante:
+    - Para cuadrar con el total de Genesys en Rendimiento de conclusión,
+      el agrupamiento debe ser SOLO por wrapUpCode.
+    - No se agrupa por queueId porque una misma conversación puede pasar por
+      varias colas/segmentos y al sumar por cola se inflan los totales.
+    - Se mantiene granularity P1D para poder generar las pestañas diarias.
     """
     return {
         "interval": f"{start_utc}/{end_utc}",
         "granularity": "P1D",
         "groupBy": [
-            "wrapUpCode",
-            "queueId"
+            "wrapUpCode"
         ],
         "metrics": [
             "tHandle",
@@ -857,7 +992,7 @@ def query_conclusion_performance(
     logger: logging.Logger
 ) -> List[Dict[str, Any]]:
 
-    logger.info("Consultando analytics aggregates por wrapUpCode y queueId...")
+    logger.info("Consultando analytics aggregates por wrapUpCode, sin queueId para evitar duplicidad...")
 
     target_wrapup_ids = [
         wrapup_id
@@ -866,6 +1001,19 @@ def query_conclusion_performance(
     ]
 
     logger.info("Wrapup codes objetivo encontrados: %s", len(target_wrapup_ids))
+    logger.info(
+        "Conclusiones parametrizadas en script | AOL: %s | NBDA: %s | Total: %s",
+        len(AOL_WRAPUP_EXACT_NAMES_NORM),
+        len(NBDA_WRAPUP_EXACT_NAMES_NORM),
+        len(ALL_WRAPUP_EXACT_NAMES_NORM),
+    )
+
+    catalog_norm_names = {_norm_code_name(name) for name in wrapup_catalog.values()}
+    missing_from_catalog = sorted(ALL_WRAPUP_EXACT_NAMES_NORM - catalog_norm_names)
+    if missing_from_catalog:
+        logger.warning("Conclusiones parametrizadas no encontradas en catálogo Genesys: %s", len(missing_from_catalog))
+        for missing in missing_from_catalog[:80]:
+            logger.warning("No encontrada en Genesys: %s", missing)
 
     if not target_wrapup_ids:
         logger.warning("No se encontraron códigos de conclusión objetivo.")
@@ -912,16 +1060,17 @@ def query_conclusion_performance(
         for result in results:
             group = result.get("group") or {}
             wrapup_id = group.get("wrapUpCode")
-            queue_id = group.get("queueId")
 
             wrapup_name = wrapup_catalog.get(wrapup_id, "")
-            queue_name = queue_catalog.get(queue_id, "")
 
             if not is_target_wrapup_name(wrapup_name):
                 continue
 
-            if not queue_name:
-                continue
+            # No se usa queueId en esta consulta.
+            # Al agrupar por cola el mismo wrapUpCode puede contarse varias veces
+            # si la conversación pasó por más de una cola/segmento.
+            queue_id = ""
+            queue_name = ""
 
             for item in result.get("data") or []:
                 interval = item.get("interval") or ""
@@ -977,23 +1126,35 @@ def query_conclusion_performance(
 
 def build_summary(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Mantiene el resumen original del script:
-    descripción de conclusión vs AOL / NBDA / porcentajes / total.
+    Resumen ejecutivo por conclusión:
+    - AOL / AOL %
+    - NBDA / NBDA %
+    - Total
+    - Conversación media ponderada por Manejo
+
+    La conversación media se calcula de forma ponderada para no distorsionar
+    conclusiones con poco volumen.
     """
+    columns = [
+        "DESCRIPCIÓN DE LA INTERACCIÓN",
+        "AOL",
+        "AOL %",
+        "NBDA",
+        "NBDA %",
+        "Total",
+        "Conversación media"
+    ]
+
     if df.empty:
-        return pd.DataFrame(
-            columns=[
-                "DESCRIPCIÓN DE LA INTERACCIÓN",
-                "AOL",
-                "AOL %",
-                "NBDA",
-                "NBDA %",
-                "Total"
-            ]
-        )
+        return pd.DataFrame(columns=columns)
+
+    work = df.copy()
+    work["Manejo"] = pd.to_numeric(work.get("Manejo", 0), errors="coerce").fillna(0)
+    work["Conversación media"] = pd.to_numeric(work.get("Conversación media", 0), errors="coerce").fillna(0)
+    work["_talk_weight"] = work["Conversación media"] * work["Manejo"]
 
     pivot = (
-        df.pivot_table(
+        work.pivot_table(
             index="conclusion",
             columns="Banca",
             values="Manejo",
@@ -1009,28 +1170,36 @@ def build_summary(df: pd.DataFrame) -> pd.DataFrame:
     if "NBDA" not in pivot.columns:
         pivot["NBDA"] = 0
 
+    talk = (
+        work.groupby("conclusion", dropna=False)
+        .agg(_talk_weight=("_talk_weight", "sum"), _manejo=("Manejo", "sum"))
+        .reset_index()
+    )
+    talk["Conversación media"] = talk.apply(
+        lambda r: seconds_to_mmss(r["_talk_weight"] / r["_manejo"]) if r["_manejo"] else "00:00",
+        axis=1
+    )
+
     pivot["Total"] = pivot["AOL"] + pivot["NBDA"]
     pivot = pivot[pivot["Total"] > 0].copy()
 
     pivot["AOL %"] = (pivot["AOL"] / pivot["Total"]).fillna(0)
     pivot["NBDA %"] = (pivot["NBDA"] / pivot["Total"]).fillna(0)
 
+    pivot = pivot.merge(talk[["conclusion", "Conversación media"]], on="conclusion", how="left")
+    pivot["Conversación media"] = pivot["Conversación media"].fillna("00:00")
+
     pivot = pivot.rename(columns={"conclusion": "DESCRIPCIÓN DE LA INTERACCIÓN"})
 
-    pivot = pivot[
-        [
-            "DESCRIPCIÓN DE LA INTERACCIÓN",
-            "AOL",
-            "AOL %",
-            "NBDA",
-            "NBDA %",
-            "Total"
-        ]
-    ].sort_values("Total", ascending=False)
+    pivot = pivot[columns].sort_values("Total", ascending=False)
 
     total_aol = pivot["AOL"].sum()
     total_nbda = pivot["NBDA"].sum()
     total_general = pivot["Total"].sum()
+
+    total_talk_weight = work["_talk_weight"].sum()
+    total_manejo = work["Manejo"].sum()
+    total_conversacion_media = seconds_to_mmss(total_talk_weight / total_manejo) if total_manejo else "00:00"
 
     total_row = pd.DataFrame([{
         "DESCRIPCIÓN DE LA INTERACCIÓN": "Total general",
@@ -1038,11 +1207,11 @@ def build_summary(df: pd.DataFrame) -> pd.DataFrame:
         "AOL %": total_aol / total_general if total_general else 0,
         "NBDA": total_nbda,
         "NBDA %": total_nbda / total_general if total_general else 0,
-        "Total": total_general
+        "Total": total_general,
+        "Conversación media": total_conversacion_media
     }])
 
     return pd.concat([pivot, total_row], ignore_index=True)
-
 
 def build_conclusion_daily_matrix(df: pd.DataFrame, banca: str) -> pd.DataFrame:
     """
@@ -1146,29 +1315,43 @@ def create_excel(
     df_aol = build_conclusion_daily_matrix(df_detail, "AOL")
     df_nbda = build_conclusion_daily_matrix(df_detail, "NBDA")
 
+    # Pestaña adicional para análisis: conserva la data transformada desde Genesys.
+    df_data = df_detail.copy()
+    if not df_data.empty:
+        preferred_order = [
+            "Inicio del intervalo", "Fin del intervalo", "Fecha conclusión", "Día", "Mes", "Año",
+            "Banca", "ID de código de conclusión", "Nombre de código de conclusión", "conclusion",
+            "ID de cola", "Nombre de cola", "Manejo", "Manejo medio", "Conversación media",
+            "Retención", "Retención media", "ACW medio"
+        ]
+        existing = [c for c in preferred_order if c in df_data.columns]
+        remaining = [c for c in df_data.columns if c not in existing]
+        df_data = df_data[existing + remaining]
+
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        # Requerimiento: 3 pestañas.
-        # 1) Resumen igual al existente.
-        # 2) Conclusiones AOL acumuladas por día/mes.
-        # 3) Conclusiones NBDA acumuladas por día/mes.
+        # Requerimiento actualizado: agregar Data para análisis.
+        df_data.to_excel(writer, sheet_name="Data", index=False)
         df_summary.to_excel(writer, sheet_name="Resumen", index=False)
         df_aol.to_excel(writer, sheet_name="Conclusiones AOL", index=False)
         df_nbda.to_excel(writer, sheet_name="Conclusiones NBDA", index=False)
 
         wb = writer.book
 
-        for sheet_name in ["Resumen", "Conclusiones AOL", "Conclusiones NBDA"]:
+        for sheet_name in ["Data", "Resumen", "Conclusiones AOL", "Conclusiones NBDA"]:
             _format_excel_sheet(wb[sheet_name])
 
         ws = wb["Resumen"]
 
+        # Formato de porcentaje en columnas AOL % y NBDA %.
+        headers = {ws.cell(row=1, column=col).value: col for col in range(1, ws.max_column + 1)}
         for row in range(2, ws.max_row + 1):
-            ws[f"C{row}"].number_format = "0%"
-            ws[f"E{row}"].number_format = "0%"
+            for header in ["AOL %", "NBDA %"]:
+                col = headers.get(header)
+                if col:
+                    ws.cell(row=row, column=col).number_format = "0%"
 
     logger.info("Excel generado correctamente.")
     return output_path
-
 
 def summary_to_html(df_summary: pd.DataFrame, max_rows: int = 30) -> str:
     if df_summary.empty:
@@ -1388,6 +1571,8 @@ def main() -> int:
         df_detail = pd.DataFrame(detail_rows)
 
         if not df_detail.empty:
+            total_manejo_sin_cola = int(pd.to_numeric(df_detail.get("Manejo", 0), errors="coerce").fillna(0).sum())
+            logger.info("Total Manejo obtenido sin agrupar por cola: %s", total_manejo_sin_cola)
             df_detail = df_detail.sort_values(
                 ["Inicio del intervalo", "Nombre de código de conclusión", "Nombre de cola"],
                 ascending=[True, True, True]

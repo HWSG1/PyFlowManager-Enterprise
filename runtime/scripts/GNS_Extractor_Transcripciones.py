@@ -21,10 +21,11 @@
 #   - No escribe en SAP HANA.
 #   - No hace SELECT a HANA.
 #   - El enriquecimiento de campaña se hace contra Genesys Outbound Contact Lists.
-#   - Requiere fechas obligatorias: DATE o START_DATE/END_DATE.
+#   - Si no se indican fechas, usa DAYS_BACK para extraer últimos N días cerrados.
 #   - No limita el rango máximo; usar filtros para controlar volumen.
-#   - Permite filtros por campaña, lista de contacto, conversationId, usuario y cola.
+#   - Permite filtros por campaña, lista de contacto, conversationId, usuario, cola y conclusión.
 #   - Requiere que Speech and Text Analytics tenga transcripción disponible.
+#   - Siempre devuelve la conclusión original en columnas wrapUpCodeId y conclusion_original.
 # =========================================================
 
 import os
@@ -55,8 +56,10 @@ PYFLOW_PARAMS = {
     "GENESYS_CLIENT_SECRET": {"type": "global", "global_key": "GENESYS_CLIENT_SECRET", "label": "Genesys Client Secret", "required": True, "secret": True},
     "GENESYS_REGION": {"type": "global", "global_key": "GENESYS_REGION", "label": "Genesys Region / Domain", "required": True},
 
+    "DATE": {"type": "date", "label": "Fecha específica local", "required": False},
     "START_DATE": {"type": "date", "label": "Fecha inicial local", "required": False},
     "END_DATE": {"type": "date", "label": "Fecha final local", "required": False},
+    "DAYS_BACK": {"type": "number", "label": "Días hacia atrás si no se indican fechas", "required": False, "default": "30"},
     "GENESYS_TIMEZONE": {"type": "text", "label": "Zona horaria Genesys", "required": True, "default": "America/Tegucigalpa"},
 
     "OUTPUT_MODE": {
@@ -195,6 +198,7 @@ class Config:
     genesys_api_url: str
     genesys_login_url: str
     timezone_name: str
+    days_back: int
     output_mode: str
     conversation_id: str
     user_id: str
@@ -232,6 +236,7 @@ def load_config() -> Config:
         genesys_api_url=genesys_api_url_from_region(region),
         genesys_login_url=genesys_login_url_from_region(region),
         timezone_name=env_str("GENESYS_TIMEZONE", "America/Tegucigalpa"),
+        days_back=env_int("DAYS_BACK", 30),
         output_mode=output_mode,
         conversation_id=env_str("CONVERSATION_ID", ""),
         user_id=env_str("USER_ID", ""),
@@ -286,15 +291,13 @@ def to_utc_z(dt: datetime) -> str:
 
 def parse_dates(args: argparse.Namespace, tz_name: str) -> Tuple[str, str, str]:
     """
-    Fechas obligatorias para evitar ejecuciones accidentales sin rango.
+    Prioridad de fechas:
+    1) DATE: extrae un solo día.
+    2) START_DATE + END_DATE: rango local, END_DATE inclusivo.
+    3) DAYS_BACK: si no se indican fechas, toma los últimos N días cerrados.
 
-    Acepta:
-    - DATE: extrae un solo día.
-    - START_DATE + END_DATE: rango local, END_DATE inclusivo.
-
-    No permite ejecución automática por DAYS_BACK.
-    No limita el rango máximo; el control de volumen debe hacerse con filtros
-    como lista de contacto, campaña, cola, usuario, wrapup o MAX_CONVERSATIONS.
+    Ejemplo DAYS_BACK=30:
+    desde hoy 00:00 menos 30 días hasta hoy 00:00, en la zona horaria configurada.
     """
     tz = ZoneInfo(tz_name)
 
@@ -306,20 +309,29 @@ def parse_dates(args: argparse.Namespace, tz_name: str) -> Tuple[str, str, str]:
 
     if args.start_date or args.end_date:
         if not (args.start_date and args.end_date):
-            raise ValueError("Debe informar START_DATE y END_DATE juntos.")
+            raise ValueError("Debe informar START_DATE y END_DATE juntos, o dejar ambos vacíos para usar DAYS_BACK.")
+
         d1 = parse_local_date(args.start_date)
         d2 = parse_local_date(args.end_date)
         if d2 < d1:
             raise ValueError("La fecha final no puede ser menor que la fecha inicial.")
 
-        # END_DATE es inclusiva en pantalla; para API usamos exclusivo +1 día.
         start_local_dt = datetime(d1.year, d1.month, d1.day, 0, 0, 0, tzinfo=tz)
         end_local_dt = datetime(d2.year, d2.month, d2.day, 0, 0, 0, tzinfo=tz) + timedelta(days=1)
         return to_utc_z(start_local_dt), to_utc_z(end_local_dt), f"Rango local {d1.isoformat()} al {d2.isoformat()}"
 
-    raise ValueError(
-        "Fechas obligatorias: indique DATE o START_DATE + END_DATE. "
-        "No se permite ejecutar sin rango de fechas para evitar extracciones masivas."
+    days_back = env_int("DAYS_BACK", 30)
+    if days_back <= 0:
+        raise ValueError("DAYS_BACK debe ser mayor que cero.")
+
+    today = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0)
+    start_local_dt = today - timedelta(days=days_back)
+    end_local_dt = today
+
+    return (
+        to_utc_z(start_local_dt),
+        to_utc_z(end_local_dt),
+        f"Automático últimos {days_back} días cerrados"
     )
 
 def request_with_retry(method: str, url: str, config: Config, logger: logging.Logger, **kwargs) -> requests.Response:
@@ -711,6 +723,68 @@ def fetch_conversation_details_by_id(config: Config, token: str, conversation_id
     data = response.json() if response.text else {}
     return data
 
+
+def get_wrapup_catalog(config: Config, token: str, logger: logging.Logger) -> Dict[str, str]:
+    """Consulta el catálogo de conclusiones para traducir wrapUpCode ID a nombre."""
+    logger.info("Consultando catálogo de conclusiones para enriquecer la data...")
+    catalog: Dict[str, str] = {}
+    page = 1
+
+    while True:
+        url = f"{config.genesys_api_url}/api/v2/routing/wrapupcodes?pageSize=100&pageNumber={page}"
+        response = request_with_retry("GET", url, config, logger, headers=genesys_headers(token))
+        data = response.json() if response.text else {}
+        entities = data.get("entities") or []
+
+        for item in entities:
+            wrapup_id = str(item.get("id") or "")
+            wrapup_name = str(item.get("name") or "")
+            if wrapup_id:
+                catalog[wrapup_id] = wrapup_name
+
+        page_count = int(data.get("pageCount") or page)
+        logger.info("Catálogo conclusiones página %s/%s | acumulado: %s", page, page_count, len(catalog))
+
+        if page >= page_count or not entities:
+            break
+
+        page += 1
+        time.sleep(config.api_sleep_seconds)
+
+    logger.info("Catálogo de conclusiones cargado: %s", len(catalog))
+    return catalog
+
+
+def extract_wrapup_codes(conversation: Dict[str, Any]) -> List[str]:
+    """Extrae todos los wrapUpCode encontrados en participantes, sesiones y segmentos."""
+    found: List[str] = []
+
+    def add(value: Any) -> None:
+        if value is None:
+            return
+        text = str(value).strip()
+        if text and text not in found:
+            found.append(text)
+
+    for participant in conversation.get("participants") or []:
+        add(participant.get("wrapUpCode"))
+        for session in participant.get("sessions") or []:
+            add(session.get("wrapUpCode"))
+            for segment in session.get("segments") or []:
+                add(segment.get("wrapUpCode"))
+
+    return found
+
+
+def wrapup_names_from_ids(wrapup_ids: List[str], wrapup_catalog: Dict[str, str]) -> str:
+    names: List[str] = []
+    for wrapup_id in wrapup_ids:
+        name = wrapup_catalog.get(wrapup_id, "")
+        value = name or wrapup_id
+        if value and value not in names:
+            names.append(value)
+    return ";".join(names)
+
 def extract_dialer_attributes(conversation: Dict[str, Any]) -> Dict[str, str]:
     result = {"ContactId": "", "ContactListId": "", "CampaignId": ""}
     for participant in conversation.get("participants") or []:
@@ -888,7 +962,7 @@ def main() -> int:
         logger.info("=" * 80)
         logger.info("INICIO EXTRACTOR DE TRANSCRIPCIONES")
         log_params(logger, [
-            "GENESYS_CLIENT_ID", "GENESYS_CLIENT_SECRET", "GENESYS_REGION", "START_DATE", "END_DATE",
+            "GENESYS_CLIENT_ID", "GENESYS_CLIENT_SECRET", "GENESYS_REGION", "DATE", "START_DATE", "END_DATE", "DAYS_BACK",
             "OUTPUT_MODE", "CONVERSATION_ID", "USER_ID", "USER_NAME",
             "QUEUE_ID", "QUEUE_NAME", "CAMPAIGN_ID", "CAMPAIGN_NAME", "CONTACT_LIST_ID", "CONTACT_LIST_NAME",
             "WRAPUP_CODE_ID", "WRAPUP_CODE_NAME", "MAX_CONVERSATIONS", "OUTPUT_CSV"
@@ -900,6 +974,7 @@ def main() -> int:
 
         token = get_access_token(config, logger)
         config = apply_resolved_filters(config, token, logger)
+        wrapup_catalog = get_wrapup_catalog(config, token, logger)
         validate_filter_safety(config, logger)
 
         conversation_ids = split_filter_values(config.conversation_id)
@@ -921,6 +996,8 @@ def main() -> int:
             if not conversation_id:
                 continue
             dialer_attrs = extract_dialer_attributes(conv)
+            wrapup_ids = extract_wrapup_codes(conv)
+            wrapup_names = wrapup_names_from_ids(wrapup_ids, wrapup_catalog)
             communication_ids = extract_communication_ids(conv)
             if not communication_ids:
                 logger.warning("Conversación sin communication/sessionId de voz: %s", conversation_id)
@@ -949,6 +1026,8 @@ def main() -> int:
                         "conversationStart": conv.get("conversationStart", ""),
                         "conversationEnd": conv.get("conversationEnd", ""),
                         "originatingDirection": conv.get("originatingDirection", ""),
+                        "wrapUpCodeId": ";".join(wrapup_ids),
+                        "conclusion_original": wrapup_names,
                         "ContactId": dialer_attrs.get("ContactId", ""),
                         "ContactListId": dialer_attrs.get("ContactListId", ""),
                         "CampaignId": dialer_attrs.get("CampaignId", ""),
