@@ -84,6 +84,7 @@ import sys
 import time
 import argparse
 import logging
+import html
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -121,11 +122,6 @@ PYFLOW_PARAMS = {
         "label": "Genesys Region / Domain",
         "required": True
     },
-    "DATE": {
-        "type": "date",
-        "label": "Fecha específica local",
-        "required": False
-    },
     "START_DATE": {
         "type": "date",
         "label": "Fecha inicial local",
@@ -134,16 +130,6 @@ PYFLOW_PARAMS = {
     "END_DATE": {
         "type": "date",
         "label": "Fecha final local",
-        "required": False
-    },
-    "START_UTC": {
-        "type": "text",
-        "label": "Inicio UTC exacto",
-        "required": False
-    },
-    "END_UTC": {
-        "type": "text",
-        "label": "Fin UTC exacto",
         "required": False
     },
     "AUTO_START_DAY": {
@@ -164,64 +150,28 @@ PYFLOW_PARAMS = {
         "required": False,
         "default": "runtime/exports"
     },
-    "PAGE_SIZE": {
-        "type": "number",
-        "label": "Tamaño página Genesys",
-        "required": False,
-        "default": "100"
-    },
-    "REQUEST_TIMEOUT": {
-        "type": "number",
-        "label": "Timeout HTTP segundos",
-        "required": False,
-        "default": "120"
-    },
-    "API_SLEEP_SECONDS": {
-        "type": "number",
-        "label": "Pausa entre requests",
-        "required": False,
-        "default": "1"
-    },
-    "MAX_RETRIES": {
-        "type": "number",
-        "label": "Reintentos HTTP",
-        "required": False,
-        "default": "5"
-    },
-    "WRAPUP_FILTER_CHUNK_SIZE": {
-        "type": "number",
-        "label": "Cantidad de wrapups por bloque",
-        "required": False,
-        "default": "20"
-    },
-    "SEND_EMAIL": {
+    "CUT_OFF_TIME": {
         "type": "select",
-        "label": "Enviar correo",
+        "label": "Hora de corte",
         "required": True,
-        "options": ["true", "false"],
-        "default": "false"
+        "options": ["9:00 a.m.", "12:00 m.", "3:00 p.m.", "6:00 p.m."],
+        "default": "9:00 a.m."
     },
     "EMAIL_TO": {
-        "type": "text",
-        "label": "Destinatarios Para separados por coma",
+        "type": "tags",
+        "label": "Destinatarios del correo",
         "required": False
     },
     "EMAIL_CC": {
-        "type": "text",
-        "label": "Destinatarios CC separados por coma",
+        "type": "tags",
+        "label": "Copia del correo",
         "required": False
     },
     "EMAIL_SUBJECT": {
         "type": "text",
         "label": "Asunto del correo",
         "required": False,
-        "default": "Reporte de Conclusiones NBDA y AOL"
-    },
-    "EMAIL_BODY_HTML": {
-        "type": "text",
-        "label": "Body HTML del correo",
-        "required": False,
-        "default": ""
+        "default": "Reporte Acumulado de Conclusiones NBDA y AOL"
     },
     "INCLUDE_SUMMARY_TABLE_IN_EMAIL": {
         "type": "select",
@@ -254,36 +204,176 @@ PYFLOW_PARAMS = {
         "global_key": "GRAPH_SENDER_EMAIL",
         "label": "Correo remitente Graph",
         "required": False
-    },
-    "GRAPH_AUTHORITY_URL": {
-        "type": "text",
-        "label": "Microsoft Authority URL",
-        "required": False,
-        "default": "https://login.microsoftonline.com"
-    },
-    "GRAPH_SCOPE": {
-        "type": "text",
-        "label": "Microsoft Graph Scope",
-        "required": False,
-        "default": "https://graph.microsoft.com/.default"
-    },
-    "GRAPH_SAVE_TO_SENT_ITEMS": {
-        "type": "select",
-        "label": "Guardar en enviados",
-        "required": False,
-        "options": ["true", "false"],
-        "default": "true"
-    },
-    "DRY_RUN": {
-        "type": "select",
-        "label": "Modo prueba, genera Excel pero no envía correo",
-        "required": True,
-        "options": ["true", "false"],
-        "default": "false"
     }
 }
 
 LOGGER_NAME = "gns_conclusiones_nbda_aol_pyflow"
+
+DEFAULT_GRAPH_AUTHORITY_URL = "https://login.microsoftonline.com"
+DEFAULT_GRAPH_SCOPE = "https://graph.microsoft.com/.default"
+DEFAULT_GRAPH_SAVE_TO_SENT_ITEMS = True
+DEFAULT_SEND_EMAIL = True
+DEFAULT_DRY_RUN = False
+
+HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Reporte Acumulado NBDA y AOL</title>
+</head>
+<body style="margin: 0; padding: 0; background-color: #f4f5f7; -webkit-text-size-adjust: 100%; -ms-text-size-adjust: 100%;">
+  <table border="0" cellpadding="0" cellspacing="0" width="100%" style="background-color: #f4f5f7; padding: 20px 0;">
+    <tr>
+      <td align="center">
+        <table border="0" cellpadding="0" cellspacing="0" width="100%" style="max-width: 650px; background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 10px rgba(0,0,0,0.05); border: 1px solid #e5e7eb;">
+          <tr>
+            <td style="background-color: #DA282D; padding: 35px 40px; text-align: left;">
+              <table border="0" cellpadding="0" cellspacing="0" width="100%">
+                <tr>
+                  <td>
+                    <p style="margin: 0; font-family: 'Neo Sans Std', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif; font-size: 13px; font-weight: bold; color: #ffccd0; text-transform: uppercase; letter-spacing: 2px;">
+                      Reporte Acumulado
+                    </p>
+                    <h1 style="margin: 5px 0 0 0; font-family: 'Neo Sans Std', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif; font-size: 26px; font-weight: 800; color: #ffffff; line-height: 1.2;">
+                      Conclusiones NBDA y AOL
+                    </h1>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding: 30px 40px 15px 40px;">
+              <p style="margin: 0 0 16px 0; font-family: 'Neo Sans Std', 'Segoe UI', Arial, sans-serif; font-size: 15px; line-height: 1.6; color: #374151;">
+                Buen dia,
+              </p>
+              <p style="margin: 0 0 24px 0; font-family: 'Neo Sans Std', 'Segoe UI', Arial, sans-serif; font-size: 15px; line-height: 1.6; color: #4b5563;">
+                Comparto el detalle de <strong>Conclusiones NBDA y AOL</strong> correspondiente al periodo del <span style="color: #DA282D; font-weight: bold;">{{FECHA_INICIO}}</span> al <span style="color: #DA282D; font-weight: bold;">{{FECHA_FIN}}</span>, con corte de las {{HORA_CORTE}}.
+              </p>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding: 0 40px 20px 40px;">
+              <table border="0" cellpadding="0" cellspacing="0" width="100%">
+                <tr>
+                  <td width="48%" style="background-color: #f9fafb; border-left: 4px solid #DA282D; border-top: 1px solid #e5e7eb; border-right: 1px solid #e5e7eb; border-bottom: 1px solid #e5e7eb; border-radius: 0 6px 6px 0; padding: 16px; text-align: left;">
+                    <span style="font-family: 'Segoe UI', Arial, sans-serif; font-size: 12px; text-transform: uppercase; color: #6b7280; font-weight: 600; letter-spacing: 0.5px;">Total Interacciones</span>
+                    <div style="font-family: 'Neo Sans Std', 'Segoe UI', Arial, sans-serif; font-size: 28px; font-weight: 800; color: #111827; margin-top: 4px;">{{TOTAL_INTERACCIONES}}</div>
+                    <span style="font-family: 'Segoe UI', Arial, sans-serif; font-size: 11px; color: #9ca3af;">Periodo consolidado</span>
+                  </td>
+                  <td width="4%"></td>
+                  <td width="48%" style="background-color: #f9fafb; border-left: 4px solid #374151; border-top: 1px solid #e5e7eb; border-right: 1px solid #e5e7eb; border-bottom: 1px solid #e5e7eb; border-radius: 0 6px 6px 0; padding: 16px; text-align: left;">
+                    <span style="font-family: 'Segoe UI', Arial, sans-serif; font-size: 12px; text-transform: uppercase; color: #6b7280; font-weight: 600; letter-spacing: 0.5px;">Cobertura Top 10</span>
+                    <div style="font-family: 'Neo Sans Std', 'Segoe UI', Arial, sans-serif; font-size: 28px; font-weight: 800; color: #374151; margin-top: 4px;">{{COBERTURA_PORCENTAJE}}</div>
+                    <span style="font-family: 'Segoe UI', Arial, sans-serif; font-size: 11px; color: #9ca3af;">{{COBERTURA_INTERACCIONES}}</span>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding: 0 40px 25px 40px;">
+              <table border="0" cellpadding="0" cellspacing="0" width="100%" style="background-color: #f9fafb; border: 1px solid #e5e7eb; border-radius: 6px; padding: 18px;">
+                <tr>
+                  <td colspan="3" style="padding-bottom: 10px;">
+                    <span style="font-family: 'Segoe UI', Arial, sans-serif; font-size: 11px; text-transform: uppercase; color: #6b7280; font-weight: 700; letter-spacing: 0.8px;">Distribucion General de Canales</span>
+                  </td>
+                </tr>
+                <tr>
+                  <td width="45%" align="left" style="font-family: 'Segoe UI', Arial, sans-serif; font-size: 13px; color: #111827;">
+                    <span style="display: inline-block; width: 8px; height: 8px; background-color: #DA282D; border-radius: 50%; margin-right: 6px;"></span>
+                    <strong>AOL:</strong> {{TOTAL_AOL}} <span style="color: #6b7280; font-size: 11px;">({{PCT_AOL}})</span>
+                  </td>
+                  <td width="10%" align="center" style="font-family: 'Neo Sans Std', Arial, sans-serif; font-size: 11px; font-weight: bold; color: #9ca3af;">
+                    VS
+                  </td>
+                  <td width="45%" align="right" style="font-family: 'Segoe UI', Arial, sans-serif; font-size: 13px; color: #111827;">
+                    <strong>NBDA:</strong> {{TOTAL_NBDA}} <span style="color: #6b7280; font-size: 11px;">({{PCT_NBDA}})</span>
+                    <span style="display: inline-block; width: 8px; height: 8px; background-color: #374151; border-radius: 50%; margin-left: 6px;"></span>
+                  </td>
+                </tr>
+                <tr>
+                  <td colspan="3" style="padding-top: 12px;">
+                    <table border="0" cellpadding="0" cellspacing="0" width="100%" style="height: 10px; border-radius: 5px; overflow: hidden; background-color: #e5e7eb;">
+                      <tr>
+                        <td width="{{PCT_AOL}}" style="background-color: #DA282D; height: 10px; border-radius: 5px 0 0 5px;"></td>
+                        <td width="{{PCT_NBDA}}" style="background-color: #374151; height: 10px; border-radius: 0 5px 5px 0;"></td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding: 10px 40px 0 40px;">
+              <table border="0" cellpadding="0" cellspacing="0" width="100%">
+                <tr>
+                  <td style="border-bottom: 2px solid #DA282D; padding-bottom: 8px;">
+                    <h2 style="margin: 0; font-family: 'Neo Sans Std', 'Segoe UI', Arial, sans-serif; font-size: 16px; font-weight: bold; color: #111827; text-transform: uppercase; letter-spacing: 1px;">
+                      Top 10 Interacciones Principales
+                    </h2>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding: 15px 40px 30px 40px;">
+              <table border="0" cellpadding="0" cellspacing="0" width="100%" style="border-collapse: collapse;">
+                <thead>
+                  <tr style="background-color: #374151;">
+                    <th align="center" width="5%" style="padding: 12px 8px; font-family: 'Segoe UI', Arial, sans-serif; font-size: 11px; font-weight: bold; color: #ffffff; text-transform: uppercase; border-radius: 4px 0 0 0;">#</th>
+                    <th align="left" width="35%" style="padding: 12px 10px; font-family: 'Segoe UI', Arial, sans-serif; font-size: 11px; font-weight: bold; color: #ffffff; text-transform: uppercase;">Descripcion de la Interaccion</th>
+                    <th align="center" width="15%" style="padding: 12px 8px; font-family: 'Segoe UI', Arial, sans-serif; font-size: 11px; font-weight: bold; color: #ffffff; text-transform: uppercase;">AOL</th>
+                    <th align="center" width="15%" style="padding: 12px 8px; font-family: 'Segoe UI', Arial, sans-serif; font-size: 11px; font-weight: bold; color: #ffffff; text-transform: uppercase;">NBDA</th>
+                    <th align="center" width="16%" style="padding: 12px 8px; font-family: 'Segoe UI', Arial, sans-serif; font-size: 11px; font-weight: bold; color: #ffffff; text-transform: uppercase;">Conversacion Media</th>
+                    <th align="center" width="14%" style="padding: 12px 10px; font-family: 'Segoe UI', Arial, sans-serif; font-size: 11px; font-weight: bold; color: #ffffff; text-transform: uppercase; border-radius: 0 4px 0 0;">Total</th>
+                  </tr>
+                </thead>
+                <tbody>
+{{TABLE_ROWS}}
+                </tbody>
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding: 0 40px 30px 40px;">
+              <table border="0" cellpadding="0" cellspacing="0" width="100%" style="background-color: #f3f4f6; border-radius: 6px;">
+                <tr>
+                  <td style="padding: 15px 20px; font-family: 'Segoe UI', Arial, sans-serif; font-size: 14px; font-weight: bold; color: #374151;">
+                    TOTAL GENERAL CANALES (AOL + NBDA)
+                  </td>
+                  <td align="right" style="padding: 15px 20px; font-family: 'Neo Sans Std', Arial, sans-serif; font-size: 18px; font-weight: 800; color: #DA282D;">
+                    {{TOTAL_INTERACCIONES}}
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding: 0 40px 35px 40px; border-top: 1px solid #f3f4f6;">
+              <p style="margin: 25px 0 0 0; font-family: 'Neo Sans Std', 'Segoe UI', Arial, sans-serif; font-size: 14px; color: #4b5563; line-height: 1.5;">
+                Saludos cordiales,<br>
+                <strong style="color: #111827;">{{FIRMA}}</strong>
+              </p>
+            </td>
+          </tr>
+          <tr>
+            <td style="background-color: #f9fafb; padding: 20px 40px; text-align: center; border-top: 1px solid #e5e7eb;">
+              <p style="margin: 0; font-family: 'Segoe UI', Arial, sans-serif; font-size: 11px; color: #9ca3af; line-height: 1.4;">
+                Este reporte ha sido generado automaticamente por Estrategia y Gestión Contact Center.<br>
+                &copy; 2026.
+              </p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>"""
 
 
 def _clean_env_value(value: Any, default: Optional[str] = None) -> Optional[str]:
@@ -324,6 +414,27 @@ def env_bool(name: str, default: bool = False) -> bool:
     if not value:
         return default
     return value in ("1", "true", "yes", "y", "si", "sí")
+
+
+def split_recipients(value: Any) -> List[str]:
+    if value is None:
+        return []
+
+    text = str(value).strip()
+    if not text or text.lower() in ("null", "none", "undefined"):
+        return []
+
+    if text.startswith("[") and text.endswith("]"):
+        try:
+            import json
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+        except Exception:
+            pass
+
+    normalized = text.replace(";", ",").replace("\n", ",")
+    return [item.strip() for item in normalized.split(",") if item.strip()]
 
 
 def normalize_genesys_domain(value: str) -> str:
@@ -395,9 +506,9 @@ def load_config() -> Config:
         graph_client_id=env_str("GRAPH_CLIENT_ID", ""),
         graph_client_secret=env_str("GRAPH_CLIENT_SECRET", ""),
         graph_sender_email=env_str("GRAPH_SENDER_EMAIL", ""),
-        graph_authority_url=env_str("GRAPH_AUTHORITY_URL", "https://login.microsoftonline.com").rstrip("/"),
-        graph_scope=env_str("GRAPH_SCOPE", "https://graph.microsoft.com/.default"),
-        graph_save_to_sent_items=env_bool("GRAPH_SAVE_TO_SENT_ITEMS", True),
+        graph_authority_url=DEFAULT_GRAPH_AUTHORITY_URL,
+        graph_scope=DEFAULT_GRAPH_SCOPE,
+        graph_save_to_sent_items=DEFAULT_GRAPH_SAVE_TO_SENT_ITEMS,
     )
 
 
@@ -1353,23 +1464,154 @@ def create_excel(
     logger.info("Excel generado correctamente.")
     return output_path
 
-def summary_to_html(df_summary: pd.DataFrame, max_rows: int = 30) -> str:
+def format_int(value: Any) -> str:
+    try:
+        return f"{int(float(value)):,}"
+    except Exception:
+        return "0"
+
+
+def format_pct(value: Any, decimals: int = 1) -> str:
+    try:
+        return f"{float(value) * 100:.{decimals}f}%"
+    except Exception:
+        return f"{0:.{decimals}f}%"
+
+
+def pct_from_counts(part: float, total: float, decimals: int = 1) -> str:
+    if not total:
+        return f"{0:.{decimals}f}%"
+    return f"{(part / total) * 100:.{decimals}f}%"
+
+
+def build_top10_table_rows(df_summary: pd.DataFrame, include_table: bool = True) -> str:
+    if not include_table:
+        return """
+                    <tr>
+                      <td colspan="6" align="center" style="padding: 22px 12px; font-family: 'Segoe UI', Arial, sans-serif; font-size: 13px; color: #6b7280; background-color: #f9fafb;">
+                        Tabla resumen no incluida para esta ejecución.
+                      </td>
+                    </tr>
+"""
+
     if df_summary.empty:
-        return "<p>No se encontraron datos para el período consultado.</p>"
+        return """
+                    <tr>
+                      <td colspan="6" align="center" style="padding: 22px 12px; font-family: 'Segoe UI', Arial, sans-serif; font-size: 13px; color: #6b7280; background-color: #f9fafb;">
+                        No se encontraron registros para el periodo seleccionado.
+                      </td>
+                    </tr>
+"""
 
-    df = df_summary.copy()
+    body_rows = (
+        df_summary[df_summary["DESCRIPCIÓN DE LA INTERACCIÓN"] != "Total general"]
+        .copy()
+        .sort_values("Total", ascending=False)
+        .head(10)
+    )
 
-    total_row = df[df["DESCRIPCIÓN DE LA INTERACCIÓN"] == "Total general"]
-    body_rows = df[df["DESCRIPCIÓN DE LA INTERACCIÓN"] != "Total general"].head(max_rows)
-    df_email = pd.concat([body_rows, total_row], ignore_index=True)
+    if body_rows.empty:
+        return """
+                    <tr>
+                      <td colspan="6" align="center" style="padding: 22px 12px; font-family: 'Segoe UI', Arial, sans-serif; font-size: 13px; color: #6b7280; background-color: #f9fafb;">
+                        No se encontraron registros para el periodo seleccionado.
+                      </td>
+                    </tr>
+"""
 
-    for col in ["AOL %", "NBDA %"]:
-        df_email[col] = df_email[col].apply(lambda x: f"{x:.0%}" if pd.notnull(x) else "0%")
+    rows: List[str] = []
+    for pos, (_, row) in enumerate(body_rows.iterrows(), start=1):
+        bg_color = "background-color: #fdfdfd;" if pos % 2 == 0 else ""
+        num_color = "color: #DA282D;" if pos == 1 else "color: #4b5563;"
+        desc = html.escape(str(row.get("DESCRIPCIÓN DE LA INTERACCIÓN", "")))
+        aol = int(float(row.get("AOL", 0) or 0))
+        nbda = int(float(row.get("NBDA", 0) or 0))
+        total = int(float(row.get("Total", 0) or 0))
+        aol_pct = format_pct(row.get("AOL %", 0))
+        nbda_pct = format_pct(row.get("NBDA %", 0))
+        media = html.escape(str(row.get("Conversación media", "00:00") or "00:00"))
 
-    for col in ["AOL", "NBDA", "Total"]:
-        df_email[col] = df_email[col].apply(lambda x: f"{int(x):,}".replace(",", ","))
+        aol_cell = (
+            f'<span style="font-weight: bold; color: #111827;">{format_int(aol)}</span><br>'
+            f'<span style="font-size: 10px; color: #9ca3af;">({aol_pct})</span>'
+            if aol > 0
+            else '<span>0</span><br><span style="font-size: 10px; color: #cbd5e1;">(0.0%)</span>'
+        )
+        nbda_cell = (
+            f'<span style="font-weight: bold; color: #111827;">{format_int(nbda)}</span><br>'
+            f'<span style="font-size: 10px; color: #9ca3af;">({nbda_pct})</span>'
+            if nbda > 0
+            else '<span>0</span><br><span style="font-size: 10px; color: #cbd5e1;">(0.0%)</span>'
+        )
 
-    return df_email.to_html(index=False, border=0, justify="center")
+        rows.append(f"""                    <tr style="border-bottom: 1px solid #e5e7eb; {bg_color}">
+                      <td align="center" style="padding: 12px 8px; font-family: 'Neo Sans Std', Arial, sans-serif; font-size: 13px; font-weight: bold; {num_color}">{pos}</td>
+                      <td align="left" style="padding: 12px 10px; font-family: 'Segoe UI', Arial, sans-serif; font-size: 13px; color: #111827; font-weight: 500;">{desc}</td>
+                      <td align="center" style="padding: 12px 8px; font-family: 'Segoe UI', Arial, sans-serif; font-size: 12px; color: #4b5563;">{aol_cell}</td>
+                      <td align="center" style="padding: 12px 8px; font-family: 'Segoe UI', Arial, sans-serif; font-size: 12px; color: #4b5563;">{nbda_cell}</td>
+                      <td align="center" style="padding: 12px 8px; font-family: 'Segoe UI', Arial, sans-serif; font-size: 13px; color: #4b5563; font-weight: bold;">{media}</td>
+                      <td align="center" style="padding: 12px 10px; font-family: 'Neo Sans Std', Arial, sans-serif; font-size: 14px; font-weight: bold; color: #111827; background-color: #f9fafb;">{format_int(total)}</td>
+                    </tr>""")
+
+    return "\n".join(rows)
+
+
+def build_email_metrics(df_summary: pd.DataFrame, include_table: bool) -> Dict[str, str]:
+    total_row = pd.DataFrame()
+    if not df_summary.empty:
+        total_row = df_summary[df_summary["DESCRIPCIÓN DE LA INTERACCIÓN"] == "Total general"]
+
+    if not total_row.empty:
+        total_aol = float(total_row.iloc[0].get("AOL", 0) or 0)
+        total_nbda = float(total_row.iloc[0].get("NBDA", 0) or 0)
+        total_general = float(total_row.iloc[0].get("Total", 0) or 0)
+    else:
+        total_aol = 0.0
+        total_nbda = 0.0
+        total_general = 0.0
+
+    body_rows = pd.DataFrame()
+    if not df_summary.empty:
+        body_rows = (
+            df_summary[df_summary["DESCRIPCIÓN DE LA INTERACCIÓN"] != "Total general"]
+            .copy()
+            .sort_values("Total", ascending=False)
+            .head(10)
+        )
+
+    top10_total = float(pd.to_numeric(body_rows.get("Total", 0), errors="coerce").fillna(0).sum()) if not body_rows.empty else 0.0
+
+    return {
+        "TOTAL_INTERACCIONES": format_int(total_general),
+        "COBERTURA_PORCENTAJE": pct_from_counts(top10_total, total_general),
+        "COBERTURA_INTERACCIONES": f"{format_int(top10_total)} interacciones del Top 10",
+        "TOTAL_AOL": format_int(total_aol),
+        "PCT_AOL": pct_from_counts(total_aol, total_general),
+        "TOTAL_NBDA": format_int(total_nbda),
+        "PCT_NBDA": pct_from_counts(total_nbda, total_general),
+        "TABLE_ROWS": build_top10_table_rows(df_summary, include_table=include_table),
+        "FIRMA": env_str("EMAIL_SIGNATURE", "Odair Umanzor"),
+    }
+
+
+def render_email_html(
+    df_summary: pd.DataFrame,
+    start_local: datetime,
+    end_local: datetime,
+    cut_off_time: str,
+    include_table: bool
+) -> str:
+    values = build_email_metrics(df_summary, include_table=include_table)
+    values.update({
+        "FECHA_INICIO": start_local.strftime("%d/%m/%Y %H:%M"),
+        "FECHA_FIN": end_local.strftime("%d/%m/%Y %H:%M"),
+        "HORA_CORTE": cut_off_time,
+    })
+
+    rendered = HTML_TEMPLATE
+    for key, value in values.items():
+        rendered = rendered.replace(f"{{{{{key}}}}}", str(value))
+    return rendered
 
 
 def get_graph_access_token(config: Config, logger: logging.Logger) -> str:
@@ -1510,16 +1752,15 @@ def main() -> int:
     parser.add_argument("--end-utc", default=env_str("END_UTC", ""), help="Fecha UTC final exacta.")
 
     parser.add_argument("--send-email", action="store_true", help="Envía correo con Excel adjunto.")
-    parser.add_argument("--to", default=env_str("EMAIL_TO", ""), help="Destinatarios separados por coma.")
-    parser.add_argument("--cc", default=env_str("EMAIL_CC", ""), help="CC separados por coma.")
+    parser.add_argument("--to", default=env_str("EMAIL_TO", ""), help="Destinatarios del correo.")
+    parser.add_argument("--cc", default=env_str("EMAIL_CC", ""), help="CC del correo.")
     parser.add_argument("--subject", default=env_str("EMAIL_SUBJECT", ""), help="Asunto del correo.")
     parser.add_argument("--dry-run", action="store_true", help="Genera Excel pero no envía correo.")
+    parser.add_argument("--cut-off-time", default=env_str("CUT_OFF_TIME", "9:00 a.m."), help="Hora de corte del reporte.")
 
     args = parser.parse_args()
-    if env_bool("SEND_EMAIL", False):
-        args.send_email = True
-    if env_bool("DRY_RUN", False):
-        args.dry_run = True
+    args.send_email = DEFAULT_SEND_EMAIL
+    args.dry_run = DEFAULT_DRY_RUN
 
     logger = setup_logger()
     start_time = time.time()
@@ -1541,10 +1782,9 @@ def main() -> int:
         log_params(logger, [
             "GENESYS_CLIENT_ID", "GENESYS_CLIENT_SECRET", "GENESYS_REGION",
             "DATE", "START_DATE", "END_DATE", "START_UTC", "END_UTC", "AUTO_START_DAY",
-            "GENESYS_TIMEZONE", "OUTPUT_DIR", "SEND_EMAIL", "EMAIL_TO", "EMAIL_CC",
-            "EMAIL_SUBJECT", "INCLUDE_SUMMARY_TABLE_IN_EMAIL", "WRAPUP_FILTER_CHUNK_SIZE", "GRAPH_TENANT_ID", "GRAPH_CLIENT_ID",
-            "GRAPH_CLIENT_SECRET", "GRAPH_SENDER_EMAIL", "GRAPH_AUTHORITY_URL", "GRAPH_SCOPE",
-            "GRAPH_SAVE_TO_SENT_ITEMS", "DRY_RUN"
+            "GENESYS_TIMEZONE", "OUTPUT_DIR", "CUT_OFF_TIME", "EMAIL_TO", "EMAIL_CC",
+            "EMAIL_SUBJECT", "INCLUDE_SUMMARY_TABLE_IN_EMAIL", "GRAPH_TENANT_ID", "GRAPH_CLIENT_ID",
+            "GRAPH_CLIENT_SECRET", "GRAPH_SENDER_EMAIL"
         ])
         logger.info("Modo fecha: %s", date_mode)
         logger.info("Inicio UTC: %s", start_utc)
@@ -1591,59 +1831,46 @@ def main() -> int:
         )
 
         if args.send_email and not args.dry_run:
-            if not args.to:
-                raise ValueError("Para enviar correo debe indicar --to.")
+            to_recipients = split_recipients(args.to)
+            cc_recipients = split_recipients(args.cc)
 
-            to_recipients = [x.strip() for x in args.to.split(",") if x.strip()]
-            cc_recipients = [x.strip() for x in args.cc.split(",") if x.strip()]
+            if not to_recipients:
+                logger.warning(
+                    "Correo no enviado: no hay destinatarios configurados en EMAIL_TO. "
+                    "El Excel fue generado correctamente."
+                )
+            else:
+                include_summary_table = env_bool("INCLUDE_SUMMARY_TABLE_IN_EMAIL", True)
+                cut_off_time = env_str("CUT_OFF_TIME", args.cut_off_time or "9:00 a.m.")
+                subject_base = args.subject.strip() or "Reporte Acumulado de Conclusiones NBDA y AOL"
+                subject = f"{subject_base} - Corte {cut_off_time}"
+                body_html = render_email_html(
+                    df_summary,
+                    start_local,
+                    end_local,
+                    cut_off_time,
+                    include_table=include_summary_table
+                )
 
-            subject = args.subject.strip() or "Reporte de Conclusiones NBDA y AOL"
-
-            corte = end_local.strftime("%I:%M %p").lower().replace("am", "a.m.").replace("pm", "p.m.")
-            periodo = f"{start_local.strftime('%d/%m/%Y %H:%M')} al {end_local.strftime('%d/%m/%Y %H:%M')}"
-            tabla_resumen = summary_to_html(df_summary) if env_bool("INCLUDE_SUMMARY_TABLE_IN_EMAIL", True) else ""
-
-            body_template = env_str("EMAIL_BODY_HTML", "")
-            if not body_template:
-                body_template = """
-                <html>
-                    <body>
-                        <p>Buen día,</p>
-
-                        <p>
-                            Comparto el detalle de Conclusiones NBDA y AOL
-                            correspondiente al período <b>{periodo}</b>, con corte de las <b>{corte}</b>.
-                        </p>
-
-                        {tabla_resumen}
-
-                        <p>Saludos cordiales,</p>
-                    </body>
-                </html>
-                """
-
-            body_html = body_template.format(
-                corte=corte,
-                periodo=periodo,
-                start_date=start_local.strftime("%d/%m/%Y"),
-                end_date=end_local.strftime("%d/%m/%Y"),
-                archivo=output_path.name if output_path else "",
-                filas_detalle=len(detail_rows),
-                tabla_resumen=tabla_resumen,
-            )
-
-            send_email_with_attachment(
-                config,
-                to_recipients,
-                cc_recipients,
-                subject,
-                body_html,
-                output_path,
-                logger
-            )
+                try:
+                    send_email_with_attachment(
+                        config,
+                        to_recipients,
+                        cc_recipients,
+                        subject,
+                        body_html,
+                        output_path,
+                        logger
+                    )
+                except Exception as email_exc:
+                    logger.exception(
+                        "Error enviando correo por Microsoft Graph. "
+                        "El Excel ya fue generado y se conserva disponible: %s",
+                        email_exc
+                    )
 
         elif args.send_email and args.dry_run:
-            logger.warning("DRY RUN activo. No se enviará correo.")
+            logger.warning("DRY RUN interno activo. No se enviará correo.")
 
     except Exception as exc:
         errors.append(str(exc))
