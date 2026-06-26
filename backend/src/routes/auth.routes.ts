@@ -2,6 +2,7 @@ import { Router } from 'express';
 import crypto from 'crypto';
 import { getPool, sql } from '../db/sql';
 import { auditLogin, hashPassword, requireAuth, signToken, verifyPassword } from '../services/security.service';
+import { ensureUserPasswordPolicyColumns } from '../services/userSchema.service';
 
 const router = Router();
 
@@ -21,12 +22,14 @@ router.post('/login', async (req, res, next) => {
     if (!username) return res.status(400).json({ message: 'Usuario requerido.' });
 
     const pool = await getPool();
+    await ensureUserPasswordPolicyColumns(pool);
 
     const result = await pool.request()
       .input('username', sql.NVarChar(150), username)
       .query(`
         SELECT
             u.*,
+            ISNULL(u.must_change_password, 0) AS must_change_password,
             ISNULL(roles.roles, '') AS roles
         FROM dbo.Users u
         OUTER APPLY (
@@ -50,19 +53,6 @@ router.post('/login', async (req, res, next) => {
       ? verifyPassword(String(password || ''), user.password_hash || '')
       : false;
 
-    console.log('LOGIN DEBUG:', {
-      usernameRecibido: username,
-      userExiste: !!user,
-      userId: user?.id,
-      userUsername: user?.username,
-      userEmail: user?.email,
-      isActiveDb: user?.is_active,
-      isActiveCalculado: isActive,
-      hashDb: user?.password_hash,
-      passwordRecibido: password,
-      isPasswordValid
-    });
-
     if (!user) {
       return res.status(401).json({ message: 'Usuario no encontrado.' });
     }
@@ -80,6 +70,9 @@ router.post('/login', async (req, res, next) => {
     }
 
     await auditLogin(user.id, username, 'local', true, req);
+    await pool.request()
+      .input('id', sql.Int, user.id)
+      .query('UPDATE dbo.Users SET last_login = GETDATE() WHERE id = @id');
 
     const token = signToken({
       id: user.id,
@@ -88,6 +81,7 @@ router.post('/login', async (req, res, next) => {
       name: user.display_name,
       roles: user.roles || '',
       theme: user.theme_key,
+      must_change_password: !!user.must_change_password,
       is_super_admin: String(user.roles || '').includes('Super Administrador')
     });
 
@@ -99,8 +93,10 @@ router.post('/login', async (req, res, next) => {
         email: user.email,
         name: user.display_name,
         roles: user.roles || '',
-        theme: user.theme_key
-      }
+        theme: user.theme_key,
+        mustChangePassword: !!user.must_change_password
+      },
+      mustChangePassword: !!user.must_change_password
     });
   } catch (err) {
     next(err);
@@ -108,6 +104,52 @@ router.post('/login', async (req, res, next) => {
 });
 
 router.get('/me', requireAuth, async (req, res) => res.json({ user: (req as any).user }));
+
+router.post('/change-password', requireAuth, async (req, res, next) => {
+  try {
+    const user = (req as any).user;
+    const { currentPassword, newPassword } = req.body || {};
+    const nextPassword = String(newPassword || '');
+
+    if (nextPassword.length < 8) {
+      return res.status(400).json({ message: 'La nueva contraseña debe tener al menos 8 caracteres.' });
+    }
+
+    const pool = await getPool();
+    await ensureUserPasswordPolicyColumns(pool);
+    const row = await pool.request()
+      .input('id', sql.Int, user.id)
+      .query('SELECT TOP 1 id, password_hash FROM dbo.Users WHERE id = @id AND is_active = 1');
+
+    const dbUser = row.recordset[0];
+    if (!dbUser) return res.status(404).json({ message: 'Usuario no encontrado.' });
+
+    if (!verifyPassword(String(currentPassword || ''), dbUser.password_hash || '')) {
+      return res.status(400).json({ message: 'La contraseña actual no es correcta.' });
+    }
+
+    await pool.request()
+      .input('id', sql.Int, user.id)
+      .input('password_hash', sql.NVarChar(sql.MAX), hashPassword(nextPassword))
+      .query(`
+        UPDATE dbo.Users
+        SET
+          password_hash = @password_hash,
+          must_change_password = 0,
+          updated_at = GETDATE()
+        WHERE id = @id
+      `);
+
+    const token = signToken({
+      ...user,
+      must_change_password: false
+    });
+
+    res.json({ ok: true, token, user: { ...user, mustChangePassword: false, must_change_password: false } });
+  } catch (err) {
+    next(err);
+  }
+});
 
 router.post('/forgot-password', async (req, res, next) => {
   try {
@@ -135,7 +177,8 @@ router.post('/reset-password', async (req, res, next) => {
     const pool = await getPool();
     const row = await pool.request().input('token_hash', sql.NVarChar(128), tokenHash).query(`SELECT TOP 1 * FROM dbo.PasswordResetTokens WHERE token_hash=@token_hash AND used_at IS NULL AND expires_at > GETDATE()`);
     if (!row.recordset.length) return res.status(400).json({ message: 'Token inválido o expirado.' });
-    await pool.request().input('id', sql.Int, row.recordset[0].user_id).input('password_hash', sql.NVarChar(sql.MAX), hashPassword(password)).query(`UPDATE dbo.Users SET password_hash=@password_hash, updated_at=GETDATE() WHERE id=@id`);
+    await ensureUserPasswordPolicyColumns(pool);
+    await pool.request().input('id', sql.Int, row.recordset[0].user_id).input('password_hash', sql.NVarChar(sql.MAX), hashPassword(password)).query(`UPDATE dbo.Users SET password_hash=@password_hash, must_change_password=0, updated_at=GETDATE() WHERE id=@id`);
     await pool.request().input('id', sql.Int, row.recordset[0].id).query(`UPDATE dbo.PasswordResetTokens SET used_at=GETDATE() WHERE id=@id`);
     res.json({ ok: true });
   } catch (err) { next(err); }

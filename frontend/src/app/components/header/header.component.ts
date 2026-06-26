@@ -57,6 +57,7 @@ import { FormsModule } from '@angular/forms';
             <p class="text-xs font-semibold text-slate-200">{{ auth.user()?.name || auth.user()?.username }}</p>
             <p class="text-[10px] text-slate-400">{{ auth.user()?.roles || 'Usuario' }}</p>
           </div>
+          <button (click)="auth.showChangePasswordModal.set(true)" class="text-xs text-slate-400 hover:text-white">Cambiar contraseña</button>
           <button (click)="auth.logout()" class="text-xs text-slate-400 hover:text-white">Salir</button>
         </div>
       </div>

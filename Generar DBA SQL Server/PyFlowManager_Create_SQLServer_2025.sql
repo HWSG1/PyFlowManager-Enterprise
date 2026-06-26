@@ -128,6 +128,7 @@ CREATE TABLE [dbo].[Users](
 	[last_login] [datetime2](0) NULL,
 	[theme_key] [nvarchar](100) NULL,
 	[preferred_theme] [nvarchar](100) NULL,
+	[must_change_password] [bit] NOT NULL,
  CONSTRAINT [PK_Users] PRIMARY KEY CLUSTERED 
 (
 	[id] ASC
@@ -1064,6 +1065,8 @@ GO
 ALTER TABLE [dbo].[Users] ADD  CONSTRAINT [DF_Users_is_active]  DEFAULT ((1)) FOR [is_active]
 GO
 ALTER TABLE [dbo].[Users] ADD  CONSTRAINT [DF_Users_created_at]  DEFAULT (sysutcdatetime()) FOR [created_at]
+GO
+ALTER TABLE [dbo].[Users] ADD  CONSTRAINT [DF_Users_must_change_password]  DEFAULT ((0)) FOR [must_change_password]
 GO
 ALTER TABLE [dbo].[ExecutionFiles]  WITH CHECK ADD  CONSTRAINT [FK_ExecutionFiles_Executions] FOREIGN KEY([execution_id])
 REFERENCES [dbo].[ScriptExecutions] ([id])

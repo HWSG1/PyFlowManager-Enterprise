@@ -7,6 +7,8 @@ import { environment } from '../../environments/environment';
 export class AuthService {
   token = signal<string | null>(localStorage.getItem('pyflow_token'));
   user = signal<any>(JSON.parse(localStorage.getItem('pyflow_user') || 'null'));
+  mustChangePassword = signal(!!this.user()?.mustChangePassword);
+  showChangePasswordModal = signal(false);
   loading = signal(false);
 
   constructor(private http: HttpClient, private themes: ThemeService) {
@@ -25,11 +27,17 @@ export class AuthService {
   completeLogin(res: any) {
     this.loading.set(false);
     if (!res?.token) return;
+    const user = {
+      ...res.user,
+      mustChangePassword: !!(res.mustChangePassword || res.user?.mustChangePassword)
+    };
     localStorage.setItem('pyflow_token', res.token);
-    localStorage.setItem('pyflow_user', JSON.stringify(res.user));
+    localStorage.setItem('pyflow_user', JSON.stringify(user));
     this.token.set(res.token);
-    this.user.set(res.user);
-    if (res.user?.theme) this.themes.setTheme(res.user.theme, false);
+    this.user.set(user);
+    this.mustChangePassword.set(user.mustChangePassword);
+    this.showChangePasswordModal.set(user.mustChangePassword);
+    if (user?.theme) this.themes.setTheme(user.theme, false);
   }
 
   logout() {
@@ -37,6 +45,8 @@ export class AuthService {
     localStorage.removeItem('pyflow_user');
     this.token.set(null);
     this.user.set(null);
+    this.mustChangePassword.set(false);
+    this.showChangePasswordModal.set(false);
   }
 
   forgotPassword(email: string, channel = 'email') {
@@ -45,5 +55,30 @@ export class AuthService {
 
   resetPassword(token: string, password: string) {
     return this.http.post<any>(`${environment.apiUrl}/auth/reset-password`, { token, password });
+  }
+
+  changePassword(currentPassword: string, newPassword: string) {
+    return this.http.post<any>(
+      `${environment.apiUrl}/auth/change-password`,
+      { currentPassword, newPassword },
+      { headers: this.authHeaders() }
+    );
+  }
+
+  completePasswordChange(res: any) {
+    if (res?.token) {
+      localStorage.setItem('pyflow_token', res.token);
+      this.token.set(res.token);
+    }
+
+    const nextUser = {
+      ...(this.user() || {}),
+      ...(res?.user || {}),
+      mustChangePassword: false
+    };
+    localStorage.setItem('pyflow_user', JSON.stringify(nextUser));
+    this.user.set(nextUser);
+    this.mustChangePassword.set(false);
+    this.showChangePasswordModal.set(false);
   }
 }

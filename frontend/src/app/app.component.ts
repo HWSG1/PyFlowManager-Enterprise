@@ -12,6 +12,7 @@ import { ImportModalComponent } from './components/import-modal/import-modal.com
 import { ToastComponent } from './components/toast/toast.component';
 import { LoginComponent } from './components/login/login.component';
 import { UsersComponent } from './components/users/users.component';
+import { ChangePasswordComponent } from './components/change-password/change-password.component';
 import { AuthService } from './services/auth.service';
 import { PyflowService } from './services/pyflow.service';
 
@@ -31,7 +32,8 @@ import { PyflowService } from './services/pyflow.service';
     ImportModalComponent,
     ToastComponent,
     LoginComponent,
-    UsersComponent
+    UsersComponent,
+    ChangePasswordComponent
   ],
   template: `
     @if (!auth.isAuthenticated()) {
@@ -57,6 +59,7 @@ import { PyflowService } from './services/pyflow.service';
       </div>
 
       <app-import-modal />
+      <app-change-password />
       <app-toast />
     </div>
     }

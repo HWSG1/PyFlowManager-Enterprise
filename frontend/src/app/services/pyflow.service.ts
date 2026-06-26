@@ -567,12 +567,20 @@ export class PyflowService {
     return this.http.get(`${this.apiUrl}/users`, { headers: this.authHeaders() });
   }
 
+  getRoles() {
+    return this.http.get<any[]>(`${this.apiUrl}/users/roles`, { headers: this.authHeaders() });
+  }
+
   createUser(payload: any) {
     return this.http.post(`${this.apiUrl}/users`, payload, { headers: this.authHeaders() });
   }
 
   updateUser(id: number, payload: any) {
     return this.http.put(`${this.apiUrl}/users/${id}`, payload, { headers: this.authHeaders() });
+  }
+
+  resetUserPassword(id: number, password: string) {
+    return this.http.post(`${this.apiUrl}/users/${id}/password`, { password }, { headers: this.authHeaders() });
   }
 
   startAutoRefresh() {
