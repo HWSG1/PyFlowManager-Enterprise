@@ -41,7 +41,8 @@ PYFLOW_PARAMS = {
     "CHUNK_DAYS": {"type": "number", "label": "Días por bloque para crear Jobs", "required": False, "default": "30"},
     "PAGE_SIZE": {"type": "number", "label": "Tamaño de página resultados Job", "required": False, "default": "1000"},
     "JOB_WAIT_SECONDS": {"type": "number", "label": "Segundos entre validaciones del Job", "required": False, "default": "10"},
-    "MAX_WAIT_MINUTES": {"type": "number", "label": "Tiempo máximo de espera por Job", "required": False, "default": "60"}
+    "MAX_WAIT_MINUTES": {"type": "number", "label": "Tiempo máximo de espera por Job", "required": False, "default": "60"},
+    "REQUEST_TIMEOUT_SECONDS": {"type": "number", "label": "Timeout HTTP segundos", "required": False, "default": "240"}
 }
 import argparse
 import base64
@@ -106,6 +107,11 @@ def env_or_default(name: str, default: str = "") -> str:
     return clean_value(os.getenv(name, default))
 
 
+def pyflow_progress(value: int) -> None:
+    value = max(0, min(100, int(value)))
+    print(f"PYFLOW_PROGRESS={value}", flush=True)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Reporte de llamadas por División para troncal Genesys Cloud.")
     parser.add_argument("--GENESYS_CLIENT_ID", default=env_or_default("GENESYS_CLIENT_ID"))
@@ -122,6 +128,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--PAGE_SIZE", default=env_or_default("PAGE_SIZE", "1000"))
     parser.add_argument("--JOB_WAIT_SECONDS", default=env_or_default("JOB_WAIT_SECONDS", "10"))
     parser.add_argument("--MAX_WAIT_MINUTES", default=env_or_default("MAX_WAIT_MINUTES", "60"))
+    parser.add_argument("--REQUEST_TIMEOUT_SECONDS", default=env_or_default("REQUEST_TIMEOUT_SECONDS", "240"))
     return parser.parse_args()
 
 
@@ -190,11 +197,12 @@ def normalize_phone(value: Any) -> str:
 # =============================================================================
 
 class GenesysClient:
-    def __init__(self, client_id: str, client_secret: str, region: str, max_retries: int = 6):
+    def __init__(self, client_id: str, client_secret: str, region: str, max_retries: int = 6, request_timeout: int = 240):
         self.client_id = clean_value(client_id)
         self.client_secret = clean_value(client_secret)
         self.login_base, self.api_base = normalize_region(region)
         self.max_retries = max_retries
+        self.request_timeout = max(60, int(request_timeout or 240))
         self.token = ""
         self.session = requests.Session()
 
@@ -226,8 +234,24 @@ class GenesysClient:
 
     def request(self, method: str, path: str, **kwargs) -> Any:
         url = path if path.startswith("http") else f"{self.api_base}{path}"
+        last_error: Optional[Exception] = None
         for attempt in range(1, self.max_retries + 1):
-            resp = self.session.request(method, url, timeout=120, **kwargs)
+            try:
+                resp = self.session.request(method, url, timeout=self.request_timeout, **kwargs)
+            except requests.RequestException as exc:
+                last_error = exc
+                sleep_s = min(90, 5 * attempt)
+                log.warning(
+                    "API %s %s falló por conexión/timeout. Reintento %s/%s en %ss. Detalle: %s",
+                    method,
+                    path,
+                    attempt,
+                    self.max_retries,
+                    sleep_s,
+                    exc
+                )
+                time.sleep(sleep_s)
+                continue
 
             if resp.status_code in (429, 500, 502, 503, 504):
                 retry_after = resp.headers.get("Retry-After")
@@ -252,7 +276,7 @@ class GenesysClient:
                 return None
             return resp.json()
 
-        raise RuntimeError(f"No fue posible completar API {method} {path} después de {self.max_retries} reintentos.")
+        raise RuntimeError(f"No fue posible completar API {method} {path} después de {self.max_retries} reintentos. Último error: {last_error}")
 
     def get_all_pages(self, path: str, key: str = "entities", page_size: int = 100) -> List[Dict[str, Any]]:
         page_number = 1
@@ -638,20 +662,47 @@ def resolve_division_for_conversation(conversation: Dict[str, Any], lookup: Gene
     return "Sin División", "not_found", ""
 
 
-def create_conversations_job(gc: GenesysClient, interval: str) -> str:
+def create_conversations_job(
+    gc: GenesysClient,
+    interval: str,
+    trunk_numbers: Optional[Set[str]] = None,
+    filter_mode: str = "AUTO"
+) -> str:
     """Crea un Analytics Conversation Details Job para un intervalo."""
+    segment_filters: List[Dict[str, Any]] = [
+        {
+            "type": "and",
+            "predicates": [
+                {"dimension": "mediaType", "value": "voice"}
+            ]
+        }
+    ]
+
+    # Si el usuario configura DNIS/ANI, se filtra desde Genesys antes de descargar.
+    # Esto evita traer todo el universo de llamadas para luego descartarlo localmente.
+    mode = clean_value(filter_mode).upper()
+    if trunk_numbers and mode in {"AUTO", "DNIS"}:
+        number_predicates = [
+            {"dimension": dimension, "value": number, "operator": "matches"}
+            for number in sorted(trunk_numbers)
+            for dimension in ("dnis", "ani")
+            if clean_value(number)
+        ]
+        if number_predicates:
+            segment_filters.append({
+                "type": "or",
+                "predicates": number_predicates
+            })
+            log.info(
+                "Job Analytics usará prefiltro DNIS/ANI con %s número(s). Esto reduce la descarga.",
+                len(trunk_numbers)
+            )
+
     body = {
         "interval": interval,
         "order": "asc",
         "orderBy": "conversationStart",
-        "segmentFilters": [
-            {
-                "type": "and",
-                "predicates": [
-                    {"dimension": "mediaType", "value": "voice"}
-                ]
-            }
-        ]
+        "segmentFilters": segment_filters
     }
     data = gc.request("POST", "/api/v2/analytics/conversations/details/jobs", json=body)
     job_id = clean_value((data or {}).get("jobId") or (data or {}).get("id"))
@@ -685,36 +736,62 @@ def wait_for_job(gc: GenesysClient, job_id: str, wait_seconds: int, max_wait_min
     raise RuntimeError(f"Job {job_id} no finalizó en {max_wait_minutes} minutos. Último estado: {json.dumps(last_status, ensure_ascii=False)[:1200]}")
 
 
-def iter_job_results(gc: GenesysClient, job_id: str, page_size: int) -> Iterable[Dict[str, Any]]:
-    """Descarga resultados del Job. Soporta cursor y pageNumber por compatibilidad."""
+def iter_job_result_pages(gc: GenesysClient, job_id: str, page_size: int) -> Iterable[Tuple[int, List[Dict[str, Any]], Dict[str, Any]]]:
+    """Descarga resultados del Job por páginas. Soporta cursor y pageNumber por compatibilidad."""
     cursor = ""
     page_number = 1
     seen_cursors: Set[str] = set()
+    total_downloaded = 0
     while True:
         if cursor:
             path = f"/api/v2/analytics/conversations/details/jobs/{job_id}/results?pageSize={page_size}&cursor={cursor}"
         else:
             path = f"/api/v2/analytics/conversations/details/jobs/{job_id}/results?pageSize={page_size}&pageNumber={page_number}"
+        started_at = time.time()
         data = gc.request("GET", path) or {}
         conversations = data.get("conversations") or data.get("entities") or data.get("results") or []
         if not conversations:
+            log.info(
+                "Job %s | descarga finalizada | página %s sin registros | acumulado descargado: %s",
+                job_id,
+                page_number,
+                total_downloaded
+            )
             break
-        for conv in conversations:
-            yield conv
 
+        total_downloaded += len(conversations)
+        page_count = data.get("pageCount") or 0
         next_cursor = clean_value(data.get("cursor") or data.get("nextCursor") or data.get("nextPage") or data.get("after"))
+        log.info(
+            "Job %s | página %s%s descargada en %.1fs | registros página: %s | acumulado: %s | cursor: %s",
+            job_id,
+            page_number,
+            f"/{page_count}" if page_count else "",
+            time.time() - started_at,
+            len(conversations),
+            total_downloaded,
+            "sí" if next_cursor else "no"
+        )
+        yield page_number, conversations, data
+
         # Evitar loops si la API devuelve el mismo cursor.
         if next_cursor and next_cursor not in seen_cursors:
             seen_cursors.add(next_cursor)
             cursor = next_cursor
+            page_number += 1
             continue
 
-        page_count = data.get("pageCount") or 0
         if page_count and page_number >= int(page_count):
             break
         if not page_count and len(conversations) < page_size:
             break
         page_number += 1
+
+
+def iter_job_results(gc: GenesysClient, job_id: str, page_size: int) -> Iterable[Dict[str, Any]]:
+    for _, conversations, _ in iter_job_result_pages(gc, job_id, page_size):
+        for conv in conversations:
+            yield conv
 
 
 def extract_conversations_for_range_job(
@@ -729,53 +806,88 @@ def extract_conversations_for_range_job(
     page_size: int,
     job_wait_seconds: int,
     max_wait_minutes: int,
+    progress_start: int = 10,
+    progress_end: int = 85,
 ) -> List[Dict[str, Any]]:
     interval = iso_interval(start_day, end_day_exclusive)
     rows: List[Dict[str, Any]] = []
     total_checked = 0
+    started_at = time.time()
 
     log.info("Creando Job Analytics para intervalo: %s", interval)
-    job_id = create_conversations_job(gc, interval)
+    job_id = create_conversations_job(gc, interval, trunk_numbers=trunk_numbers, filter_mode=filter_mode)
     log.info("Job creado: %s", job_id)
+    pyflow_progress(progress_start)
     wait_for_job(gc, job_id, job_wait_seconds, max_wait_minutes)
 
     log.info("Descargando resultados del Job: %s", job_id)
-    for conv in iter_job_results(gc, job_id, page_size):
-        total_checked += 1
-        matched, match_method = conversation_contains_trunk(conv, trunk_name, trunk_numbers, trunk_edge_ids, filter_mode)
-        if not matched:
-            continue
+    for page_number, conversations, data in iter_job_result_pages(gc, job_id, page_size):
+        page_started_at = time.time()
+        page_matched = 0
+        page_count = int(data.get("pageCount") or 0)
 
-        division, division_source, source_name = resolve_division_for_conversation(conv, lookup)
-        conv_id = conv.get("conversationId") or conv.get("id")
-        vals = collect_session_values(conv)
-        direction = "; ".join(sorted(vals.get("directions", set())))
-        ani = "; ".join(sorted(vals.get("anis", set())))
-        dnis = "; ".join(sorted(vals.get("dniss", set())))
-        edge_ids = "; ".join(sorted(vals.get("edge_ids", set())))
-        peer_ids = "; ".join(sorted(vals.get("peer_ids", set())))
-        providers = "; ".join(sorted(vals.get("providers", set())))
+        if page_count:
+            page_progress = progress_start + int(((page_number / max(page_count, 1)) * (progress_end - progress_start)))
+            pyflow_progress(page_progress)
 
-        rows.append({
-            "conversationId": conv_id,
-            "conversationStart": conv.get("conversationStart"),
-            "conversationEnd": conv.get("conversationEnd"),
-            "division": division,
-            "division_source": division_source,
-            "source_name": source_name,
-            "direction": direction,
-            "ani": ani,
-            "dnis": dnis,
-            "trunk_name": trunk_name,
-            "match_method": match_method,
-            "edge_ids": edge_ids,
-            "peer_ids": peer_ids,
-            "providers": providers,
-            "job_id": job_id,
-            "interval": interval
-        })
+        for conv in conversations:
+            total_checked += 1
+            matched, match_method = conversation_contains_trunk(conv, trunk_name, trunk_numbers, trunk_edge_ids, filter_mode)
+            if not matched:
+                continue
 
-    log.info("Job %s | intervalo %s | revisadas: %s | asociadas: %s", job_id, interval, total_checked, len(rows))
+            division, division_source, source_name = resolve_division_for_conversation(conv, lookup)
+            conv_id = conv.get("conversationId") or conv.get("id")
+            vals = collect_session_values(conv)
+            direction = "; ".join(sorted(vals.get("directions", set())))
+            ani = "; ".join(sorted(vals.get("anis", set())))
+            dnis = "; ".join(sorted(vals.get("dniss", set())))
+            edge_ids = "; ".join(sorted(vals.get("edge_ids", set())))
+            peer_ids = "; ".join(sorted(vals.get("peer_ids", set())))
+            providers = "; ".join(sorted(vals.get("providers", set())))
+
+            rows.append({
+                "conversationId": conv_id,
+                "conversationStart": conv.get("conversationStart"),
+                "conversationEnd": conv.get("conversationEnd"),
+                "division": division,
+                "division_source": division_source,
+                "source_name": source_name,
+                "direction": direction,
+                "ani": ani,
+                "dnis": dnis,
+                "trunk_name": trunk_name,
+                "match_method": match_method,
+                "edge_ids": edge_ids,
+                "peer_ids": peer_ids,
+                "providers": providers,
+                "job_id": job_id,
+                "interval": interval
+            })
+            page_matched += 1
+
+        elapsed = time.time() - page_started_at
+        rate = len(conversations) / elapsed if elapsed > 0 else 0
+        log.info(
+            "Job %s | página %s procesada | revisadas página: %s | asociadas página: %s | revisadas total: %s | asociadas total: %s | %.0f conv/s",
+            job_id,
+            page_number,
+            len(conversations),
+            page_matched,
+            total_checked,
+            len(rows),
+            rate
+        )
+
+    log.info(
+        "Job %s | intervalo %s | revisadas: %s | asociadas: %s | duración bloque: %.1f minutos",
+        job_id,
+        interval,
+        total_checked,
+        len(rows),
+        (time.time() - started_at) / 60
+    )
+    pyflow_progress(progress_end)
     return rows
 
 
@@ -1050,6 +1162,12 @@ def main() -> int:
         max_wait_minutes = 60
     max_wait_minutes = max(5, min(max_wait_minutes, 240))
 
+    try:
+        request_timeout = int(clean_value(args.REQUEST_TIMEOUT_SECONDS) or "240")
+    except Exception:
+        request_timeout = 240
+    request_timeout = max(60, min(request_timeout, 900))
+
     trunk_name = clean_value(args.TRUNK_NAME)
     trunk_numbers = split_numbers(args.TRUNK_NUMBERS)
     export_detail = clean_value(args.EXPORT_DETAIL).upper() in {"SI", "SÍ", "YES", "TRUE", "1"}
@@ -1065,6 +1183,7 @@ def main() -> int:
     log.info("- PAGE_SIZE: %s", page_size)
     log.info("- JOB_WAIT_SECONDS: %s", job_wait_seconds)
     log.info("- MAX_WAIT_MINUTES: %s", max_wait_minutes)
+    log.info("- REQUEST_TIMEOUT_SECONDS: %s", request_timeout)
     log.info("- TRUNK_NUMBERS configurados: %s", len(trunk_numbers))
     log.info("- FILTER_MODE: %s", filter_mode)
     log.info("- EXPORT_DETAIL: %s", "SI" if export_detail else "NO")
@@ -1073,12 +1192,15 @@ def main() -> int:
     gc = GenesysClient(
         client_id=args.GENESYS_CLIENT_ID,
         client_secret=args.GENESYS_CLIENT_SECRET,
-        region=args.GENESYS_REGION
+        region=args.GENESYS_REGION,
+        request_timeout=request_timeout
     )
+    pyflow_progress(2)
     gc.authenticate()
 
     lookup = GenesysLookup(gc)
     lookup.load_divisions()
+    pyflow_progress(5)
 
     trunk_rows, trunk_edge_ids, trunk_note = list_trunks(gc, trunk_name) if trunk_name else ([], set(), "Sin TRUNK_NAME: no se consultó coincidencia específica de trunks; el reporte puede traer todo.")
     log.info("%s", trunk_note)
@@ -1096,9 +1218,20 @@ def main() -> int:
         effective_mode = filter_mode
     log.info("- MODO EFECTIVO: %s", effective_mode)
 
+    chunks_to_run = list(daterange_chunks(start_day, end_exclusive, chunk_days))
+    log.info("Bloques a consultar: %s", len(chunks_to_run))
+
     all_rows: List[Dict[str, Any]] = []
-    for chunk_start, chunk_end in daterange_chunks(start_day, end_exclusive, chunk_days):
-        log.info("Consultando bloque: %s a %s", chunk_start, chunk_end - timedelta(days=1))
+    for chunk_index, (chunk_start, chunk_end) in enumerate(chunks_to_run, start=1):
+        block_progress_start = 5 + int(((chunk_index - 1) / max(len(chunks_to_run), 1)) * 85)
+        block_progress_end = 5 + int((chunk_index / max(len(chunks_to_run), 1)) * 85)
+        log.info(
+            "Consultando bloque %s/%s: %s a %s",
+            chunk_index,
+            len(chunks_to_run),
+            chunk_start,
+            chunk_end - timedelta(days=1)
+        )
         rows = extract_conversations_for_range_job(
             gc=gc,
             lookup=lookup,
@@ -1110,9 +1243,18 @@ def main() -> int:
             filter_mode=effective_mode,
             page_size=page_size,
             job_wait_seconds=job_wait_seconds,
-            max_wait_minutes=max_wait_minutes
+            max_wait_minutes=max_wait_minutes,
+            progress_start=block_progress_start,
+            progress_end=block_progress_end
         )
         all_rows.extend(rows)
+        log.info(
+            "Bloque %s/%s completado | asociadas bloque: %s | acumulado asociadas: %s",
+            chunk_index,
+            len(chunks_to_run),
+            len(rows),
+            len(all_rows)
+        )
 
     # Deduplicación final
     unique = {}
@@ -1123,6 +1265,7 @@ def main() -> int:
     final_rows = list(unique.values())
 
     log.info("Conversaciones únicas identificadas: %s", len(final_rows))
+    pyflow_progress(92)
 
     report_path = export_excel(
         rows=final_rows,
@@ -1139,6 +1282,7 @@ def main() -> int:
     )
 
     log.info("Reporte generado correctamente: %s", report_path.resolve())
+    pyflow_progress(100)
     log.info("=" * 90)
     log.info("FIN REPORTE TRUNK / DIVISIONES")
     log.info("=" * 90)
