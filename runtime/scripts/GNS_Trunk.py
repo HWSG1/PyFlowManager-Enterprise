@@ -37,7 +37,7 @@ PYFLOW_PARAMS = {
     "TRUNK_NUMBERS": {"type": "text", "label": "DNIS/ANI asociados a la troncal (opcional)", "required": False, "default": "", "description": "Números separados por coma. Si se deja vacío, se usará modo aproximado por Edge cuando exista TRUNK_NAME; si TRUNK_NAME también está vacío, trae todo."},
     "OUTPUT_DIR": {"type": "text", "label": "Carpeta de salida del Excel", "required": False, "default": "exports"},
     "EXPORT_DETAIL": {"type": "select", "label": "Exportar detalle", "required": True, "options": ["NO", "SI"], "default": "NO"},
-    "FILTER_MODE": {"type": "select", "label": "Modo de filtro", "required": True, "options": ["AUTO", "DNIS", "EDGE", "TODO"], "default": "AUTO"},
+    "FILTER_MODE": {"type": "select", "label": "Modo de filtro", "required": True, "options": ["AUTO", "DNIS", "EDGE", "TODO"], "default": "AUTO", "description": "AUTO usa DNIS/ANI si se configuran. Si no hay DNIS/ANI, trae llamadas de voz para evitar reportes vacios; EDGE queda disponible solo si se selecciona manualmente."},
     "CHUNK_DAYS": {"type": "number", "label": "Días por bloque para crear Jobs", "required": False, "default": "30"},
     "PAGE_SIZE": {"type": "number", "label": "Tamaño de página resultados Job", "required": False, "default": "1000"},
     "JOB_WAIT_SECONDS": {"type": "number", "label": "Segundos entre validaciones del Job", "required": False, "default": "10"},
@@ -1078,8 +1078,25 @@ def export_excel(
         {"parametro": "end_date", "valor": str(end_date_inclusive)},
         {"parametro": "fecha_generacion", "valor": datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
         {"parametro": "total_conversaciones_identificadas", "valor": len(detail_df.drop_duplicates(subset=["conversationId"])) if not detail_df.empty else 0},
-        {"parametro": "nota", "valor": "Generado usando Analytics Conversation Details Jobs. DNIS/ANI es exacto. EDGE es aproximado porque un Edge puede tener varias troncales. Si TRUNK_NAME y TRUNK_NUMBERS están vacíos, el reporte trae todas las llamadas."}
+        {"parametro": "nota", "valor": "Generado usando Analytics Conversation Details Jobs. DNIS/ANI es el filtro recomendado para troncales. EDGE depende de datos que Genesys no siempre expone en conversation details; por eso AUTO solo usa EDGE si se selecciona manualmente."}
     ])
+
+    diagnostico_df = pd.DataFrame()
+    if detail_df.empty:
+        diagnostico_df = pd.DataFrame([
+            {
+                "tipo": "Sin conversaciones asociadas",
+                "detalle": (
+                    "El Job de Genesys pudo ejecutarse, pero ninguna conversacion paso el filtro aplicado. "
+                    "Si se requiere una troncal exacta, configure TRUNK_NUMBERS con los DNIS/ANI reales. "
+                    "Si desea validar volumen general por division, use FILTER_MODE=TODO o AUTO sin TRUNK_NUMBERS."
+                )
+            },
+            {"tipo": "Modo aplicado", "detalle": filter_mode},
+            {"tipo": "TRUNK_NAME", "detalle": trunk_name if clean_value(trunk_name) else "TODAS"},
+            {"tipo": "TRUNK_NUMBERS configurados", "detalle": len(trunk_numbers)},
+            {"tipo": "Edge IDs detectados", "detalle": len(trunk_edge_ids)},
+        ])
 
     with pd.ExcelWriter(file_path, engine="openpyxl") as writer:
         # Hoja principal solicitada: detalle por mes y división
@@ -1091,6 +1108,8 @@ def export_excel(
         parametros_df.to_excel(writer, index=False, sheet_name="Parametros")
         trunk_df.to_excel(writer, index=False, sheet_name="Trunks")
         dnis_df.to_excel(writer, index=False, sheet_name="Numeros")
+        if not diagnostico_df.empty:
+            diagnostico_df.to_excel(writer, index=False, sheet_name="Diagnostico")
 
         for sheet, df, table in [
             ("Resumen_Mensual", summary_month_df, "tblResumenMensual"),
@@ -1102,6 +1121,10 @@ def export_excel(
         ]:
             autosize_excel(writer, sheet, df)
             add_excel_table(writer, sheet, df, table)
+
+        if not diagnostico_df.empty:
+            autosize_excel(writer, "Diagnostico", diagnostico_df)
+            add_excel_table(writer, "Diagnostico", diagnostico_df, "tblDiagnostico")
 
         if export_detail:
             detail_export = detail_df.copy()
@@ -1207,13 +1230,14 @@ def main() -> int:
     if filter_mode == "AUTO":
         if trunk_numbers:
             effective_mode = "DNIS"
-        elif trunk_name and trunk_edge_ids:
-            effective_mode = "EDGE"
         elif not trunk_name and not trunk_numbers:
             effective_mode = "TODO"
         else:
             effective_mode = "TODO"
-            log.warning("No se encontraron edgeIds para la troncal y no hay DNIS/ANI; se traerán todas las llamadas.")
+            log.warning(
+                "AUTO no usara EDGE porque Genesys no siempre expone edgeId en conversation details. "
+                "Se traeran llamadas de voz. Para filtrar troncal exacta, configure TRUNK_NUMBERS con DNIS/ANI."
+            )
     else:
         effective_mode = filter_mode
     log.info("- MODO EFECTIVO: %s", effective_mode)
