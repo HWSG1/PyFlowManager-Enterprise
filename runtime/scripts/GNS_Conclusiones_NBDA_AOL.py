@@ -85,6 +85,7 @@ import time
 import argparse
 import logging
 import html
+import re
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -94,6 +95,11 @@ from pathlib import Path
 import base64
 import requests
 import pandas as pd
+
+try:
+    from hdbcli import dbapi
+except Exception:
+    dbapi = None
 
 
 # =========================================================
@@ -179,6 +185,56 @@ PYFLOW_PARAMS = {
         "required": True,
         "options": ["true", "false"],
         "default": "true"
+    },
+    "INCLUDE_CLIENT_ANALYSIS": {
+        "type": "select",
+        "label": "Incluir recurrencia, ubicacion y demografia",
+        "required": True,
+        "options": ["true", "false"],
+        "default": "true"
+    },
+    "HPR_HOST_ESPEJO": {
+        "type": "global",
+        "global_key": "HPR_HOST_ESPEJO",
+        "label": "SAP HANA Host espejo lectura",
+        "required": False
+    },
+    "HPR_PORT": {
+        "type": "global",
+        "global_key": "HPR_PORT",
+        "label": "SAP HANA Port",
+        "required": False
+    },
+    "HPR_USER": {
+        "type": "global",
+        "global_key": "HPR_USER",
+        "label": "SAP HANA User",
+        "required": False
+    },
+    "HPR_PASSWORD": {
+        "type": "global",
+        "global_key": "HPR_PASSWORD",
+        "label": "SAP HANA Password",
+        "required": False,
+        "secret": True
+    },
+    "HANA_CLIENT_SCHEMA": {
+        "type": "text",
+        "label": "Esquema HANA datos cliente",
+        "required": False,
+        "default": "DS_STG"
+    },
+    "HANA_CLIENT_TABLE": {
+        "type": "text",
+        "label": "Tabla HANA datos cliente",
+        "required": False,
+        "default": "CRM_DIM_CLIENTES"
+    },
+    "DETAIL_PAGE_SIZE": {
+        "type": "number",
+        "label": "Tamano pagina detalle Genesys",
+        "required": False,
+        "default": "100"
     },
     "GRAPH_TENANT_ID": {
         "type": "global",
@@ -304,6 +360,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                   </td>
                 </tr>
               </table>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding: 10px 40px 0 40px;">
+{{CLIENT_EXECUTIVE_BLOCK}}
             </td>
           </tr>
           <tr>
@@ -480,6 +541,13 @@ class Config:
     max_retries: int
     page_size: int
     output_dir: str
+    detail_page_size: int
+    hana_read_host: str
+    hana_port: int
+    hana_user: str
+    hana_password: str
+    hana_client_schema: str
+    hana_client_table: str
     graph_tenant_id: str
     graph_client_id: str
     graph_client_secret: str
@@ -502,6 +570,13 @@ def load_config() -> Config:
         max_retries=env_int("MAX_RETRIES", 5),
         page_size=env_int("PAGE_SIZE", 100),
         output_dir=env_str("OUTPUT_DIR", "runtime/exports"),
+        detail_page_size=env_int("DETAIL_PAGE_SIZE", 100),
+        hana_read_host=env_str("HPR_HOST_ESPEJO", ""),
+        hana_port=env_int("HPR_PORT", 30015),
+        hana_user=env_str("HPR_USER", ""),
+        hana_password=env_str("HPR_PASSWORD", ""),
+        hana_client_schema=env_str("HANA_CLIENT_SCHEMA", "DS_STG"),
+        hana_client_table=env_str("HANA_CLIENT_TABLE", "CRM_DIM_CLIENTES"),
         graph_tenant_id=env_str("GRAPH_TENANT_ID", ""),
         graph_client_id=env_str("GRAPH_CLIENT_ID", ""),
         graph_client_secret=env_str("GRAPH_CLIENT_SECRET", ""),
@@ -1235,6 +1310,449 @@ def query_conclusion_performance(
     logger.info("Filas analytics transformadas: %s", len(rows))
     return rows
 
+
+def normalize_dni(value: Any) -> str:
+    text = "" if value is None else str(value).strip()
+    if not text or text.lower() in ("null", "none", "undefined", "nan"):
+        return ""
+    return re.sub(r"[\s\-.]+", "", text)
+
+
+def validate_identifier(value: str) -> None:
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(value or "")):
+        raise ValueError(f"Identificador SQL invalido: {value!r}")
+
+
+def hana_read_connect(config: Config):
+    if dbapi is None:
+        raise RuntimeError("No esta instalado hdbcli. Instala hdbcli para consultar SAP HANA.")
+
+    missing = [
+        name for name, value in {
+            "HPR_HOST_ESPEJO": config.hana_read_host,
+            "HPR_USER": config.hana_user,
+            "HPR_PASSWORD": config.hana_password,
+        }.items()
+        if not str(value or "").strip()
+    ]
+    if missing:
+        raise ValueError("Faltan variables globales de SAP HANA espejo: " + ", ".join(missing))
+
+    return dbapi.connect(
+        address=config.hana_read_host,
+        port=config.hana_port,
+        user=config.hana_user,
+        password=config.hana_password
+    )
+
+
+def extract_external_tag(conversation: Dict[str, Any]) -> str:
+    candidates = [conversation.get("externalTag"), conversation.get("externalContactId")]
+    for participant in conversation.get("participants") or []:
+        attrs = participant.get("attributes") or {}
+        for key in (
+            "ETIQUETA_EXTERNA", "Etiqueta_Externa", "etiqueta_externa",
+            "DNI", "dni", "IDENTIFICACION", "identificacion",
+            "documento", "DOCUMENTO", "customerId", "CustomerId"
+        ):
+            candidates.append(attrs.get(key))
+
+    for candidate in candidates:
+        cleaned = normalize_dni(candidate)
+        if cleaned:
+            return cleaned
+    return ""
+
+
+def get_last_target_wrapup_for_conversation(
+    conversation: Dict[str, Any],
+    wrapup_catalog: Dict[str, str]
+) -> Tuple[str, str, str]:
+    found: List[Tuple[str, str, str]] = []
+    for participant in conversation.get("participants") or []:
+        for session in participant.get("sessions") or []:
+            if str(session.get("mediaType") or "").lower() not in ("", "voice"):
+                continue
+            for segment in session.get("segments") or []:
+                wrapup_id = segment.get("wrapUpCode") or ""
+                wrapup_name = wrapup_catalog.get(wrapup_id, wrapup_id)
+                if wrapup_id and is_target_wrapup_name(wrapup_name):
+                    found.append((
+                        segment.get("segmentEnd") or segment.get("segmentStart") or "",
+                        wrapup_id,
+                        wrapup_name
+                    ))
+
+    if not found:
+        return "", "", ""
+    found.sort(key=lambda item: item[0])
+    _, wrapup_id, wrapup_name = found[-1]
+    return wrapup_id, wrapup_name, clean_conclusion_name(wrapup_name)
+
+
+def utc_to_local_display(value: Any, tz_name: str) -> str:
+    if not value:
+        return ""
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(ZoneInfo(tz_name)).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return str(value)
+
+
+def query_conclusion_call_details(
+    config: Config,
+    token: str,
+    start_utc: str,
+    end_utc: str,
+    wrapup_catalog: Dict[str, str],
+    logger: logging.Logger
+) -> pd.DataFrame:
+    target_wrapup_ids = [
+        wrapup_id
+        for wrapup_id, wrapup_name in wrapup_catalog.items()
+        if is_target_wrapup_name(wrapup_name)
+    ]
+    columns = [
+        "conversationId", "conversationStart", "conversationEnd", "Fecha",
+        "wrapUpCode", "Nombre de conclusion", "conclusion", "Banca",
+        "externalTag", "Estado externalTag"
+    ]
+    if not target_wrapup_ids:
+        logger.warning("Detalle clientes omitido: no hay wrapups objetivo.")
+        return pd.DataFrame(columns=columns)
+
+    jobs_url = f"{config.genesys_region_base_url}/api/v2/analytics/conversations/details/jobs"
+    page_size = max(25, min(int(config.detail_page_size or 100), 500))
+    wrapup_chunks = chunks(target_wrapup_ids, env_int("WRAPUP_DETAIL_CHUNK_SIZE", 20))
+    poll_seconds = env_int("DETAIL_JOB_POLL_SECONDS", 10)
+    max_poll_attempts = env_int("DETAIL_JOB_MAX_POLL_ATTEMPTS", 120)
+    rows: List[Dict[str, Any]] = []
+
+    logger.info("Creando Details Job de Genesys para detalle de conversaciones...")
+    for chunk_number, wrapup_chunk in enumerate(wrapup_chunks, start=1):
+        body = {
+            "interval": f"{start_utc}/{end_utc}",
+            "order": "asc",
+            "orderBy": "conversationStart",
+            "segmentFilters": [
+                {
+                    "type": "and",
+                    "predicates": [
+                        {
+                            "type": "dimension",
+                            "dimension": "mediaType",
+                            "operator": "matches",
+                            "value": "voice"
+                        }
+                    ],
+                    "clauses": [
+                        {
+                            "type": "or",
+                            "predicates": [
+                                {
+                                    "type": "dimension",
+                                    "dimension": "wrapUpCode",
+                                    "operator": "matches",
+                                    "value": wrapup_id
+                                }
+                                for wrapup_id in wrapup_chunk
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }
+
+        logger.info(
+            "Job creado: solicitando bloque %s/%s | wrapups: %s",
+            chunk_number,
+            len(wrapup_chunks),
+            len(wrapup_chunk)
+        )
+        create_response = request_with_retries(
+            "POST",
+            jobs_url,
+            config,
+            logger,
+            headers=genesys_headers(token),
+            json=body
+        )
+        job_payload = create_response.json() or {}
+        job_id = job_payload.get("jobId") or job_payload.get("id")
+        if not job_id:
+            raise RuntimeError(f"Genesys no devolvio jobId. Respuesta: {str(job_payload)[:1000]}")
+
+        logger.info("Job creado: %s", job_id)
+        status_url = f"{jobs_url}/{job_id}"
+        state = ""
+        for attempt in range(1, max_poll_attempts + 1):
+            logger.info("Esperando resultados del job %s | intento %s/%s", job_id, attempt, max_poll_attempts)
+            status_response = request_with_retries(
+                "GET",
+                status_url,
+                config,
+                logger,
+                headers=genesys_headers(token)
+            )
+            status_payload = status_response.json() or {}
+            state = str(status_payload.get("state") or status_payload.get("status") or "").upper()
+            logger.info("Job %s | estado: %s", job_id, state)
+            if state in ("FULFILLED", "COMPLETED", "COMPLETE", "FINISHED", "SUCCEEDED"):
+                break
+            if state in ("FAILED", "ERROR", "CANCELLED", "CANCELED", "EXPIRED"):
+                raise RuntimeError(f"Details Job fallo. jobId={job_id} estado={state} respuesta={str(status_payload)[:1200]}")
+            time.sleep(poll_seconds)
+        else:
+            raise TimeoutError(f"Details Job no finalizo. jobId={job_id} ultimo_estado={state}")
+
+        results_url = f"{jobs_url}/{job_id}/results"
+        cursor = ""
+        page = 1
+        while True:
+            params: Dict[str, Any] = {"pageSize": page_size}
+            if cursor:
+                params["cursor"] = cursor
+
+            result_response = request_with_retries(
+                "GET",
+                results_url,
+                config,
+                logger,
+                headers=genesys_headers(token),
+                params=params
+            )
+            result_payload = result_response.json() or {}
+            conversations = result_payload.get("conversations") or result_payload.get("entities") or result_payload.get("results") or []
+            if not conversations:
+                break
+
+            for conversation in conversations:
+                wrapup_id, wrapup_name, conclusion = get_last_target_wrapup_for_conversation(conversation, wrapup_catalog)
+                if not wrapup_id:
+                    continue
+                external_tag = extract_external_tag(conversation)
+                rows.append({
+                    "conversationId": conversation.get("conversationId") or conversation.get("id") or "",
+                    "conversationStart": conversation.get("conversationStart") or "",
+                    "conversationEnd": conversation.get("conversationEnd") or "",
+                    "Fecha": utc_to_local_display(conversation.get("conversationStart"), config.timezone_name),
+                    "wrapUpCode": wrapup_id,
+                    "Nombre de conclusion": wrapup_name,
+                    "conclusion": conclusion,
+                    "Banca": get_banca(wrapup_name),
+                    "externalTag": external_tag,
+                    "Estado externalTag": "Con DNI" if external_tag else "Sin DNI / externalTag"
+                })
+
+            logger.info(
+                "Paginas leidas | job %s | pagina %s | conversaciones: %s | acumulado: %s",
+                job_id,
+                page,
+                len(conversations),
+                len(rows)
+            )
+            cursor = result_payload.get("cursor") or result_payload.get("nextCursor") or ""
+            if not cursor:
+                break
+            page += 1
+            time.sleep(config.api_sleep_seconds)
+
+    df = pd.DataFrame(rows, columns=columns)
+    if not df.empty:
+        df = df.drop_duplicates(subset=["conversationId"], keep="last")
+    logger.info("Conversaciones obtenidas: %s", len(df))
+    logger.info("Registros con externalTag: %s", 0 if df.empty else int(df["externalTag"].astype(str).str.strip().ne("").sum()))
+    return df
+
+
+DEMOGRAPHIC_COLUMNS = [
+    "PAIS", "DEPARTAMENTO", "ESTADO_CIVIL", "GENERO", "SEGMENTO_BANCA",
+    "TIPO_SECTOR_ECONOMICO", "NIVEL_EDUCATIVO", "NUMERO_DEPENDIENTES",
+    "PROFESION", "FECHA_ULTIMA_ACTUALIZACION", "RANGO_FECHA_ACTUALIZACION",
+    "GENERACION_CLIENTE"
+]
+
+
+def query_client_demographics(config: Config, external_tags: List[str], logger: logging.Logger) -> pd.DataFrame:
+    etiquetas = sorted({normalize_dni(value) for value in external_tags if normalize_dni(value)})
+    columns = ["ETIQUETA_EXTERNA"] + DEMOGRAPHIC_COLUMNS
+    if not etiquetas:
+        logger.warning("HANA no consultado: no hay externalTag para cruzar.")
+        return pd.DataFrame(columns=columns)
+
+    validate_identifier(config.hana_client_schema)
+    validate_identifier(config.hana_client_table)
+    logger.info("Consultando HANA espejo para %s clientes...", len(etiquetas))
+
+    select_cols = """
+        cdc.PAIS,
+        cdc.DEPARTAMENTO,
+        cdc.ESTADO_CIVIL,
+        cdc.GENERO,
+        CASE
+            WHEN cdc.SEGMENTO_BANCA = 'SEGMENTO PERSONAS' THEN 'Personas'
+            WHEN cdc.SEGMENTO_BANCA = 'SEGMENTO PYME' THEN 'PYME'
+            WHEN cdc.SEGMENTO_BANCA = 'SEGMENTO COMERCIAL' THEN 'Comercial'
+            WHEN cdc.SEGMENTO_BANCA = 'SEGMENTO CORPORATIVA' THEN 'Corporativa'
+            ELSE COALESCE(cdc.SEGMENTO_BANCA, 'Sin dato')
+        END AS SEGMENTO_BANCA,
+        cdc.TIPO_SECTOR_ECONOMICO,
+        cdc.NIVEL_EDUCATIVO,
+        cdc.NUMERO_DEPENDIENTES,
+        cdc.PROFESION,
+        cdc.FECHA_ULTIMA_ACTUALIZACION,
+        CASE
+            WHEN cdc.FECHA_ULTIMA_ACTUALIZACION IS NULL THEN '0. No actualizado'
+            WHEN cdc.FECHA_ULTIMA_ACTUALIZACION >= ADD_MONTHS(CURRENT_DATE, -6) THEN '1. 0-6 meses'
+            WHEN cdc.FECHA_ULTIMA_ACTUALIZACION >= ADD_MONTHS(CURRENT_DATE, -12) THEN '2. 6-12 meses'
+            WHEN cdc.FECHA_ULTIMA_ACTUALIZACION >= ADD_MONTHS(CURRENT_DATE, -36) THEN '3. 1-3 anos'
+            WHEN cdc.FECHA_ULTIMA_ACTUALIZACION >= ADD_MONTHS(CURRENT_DATE, -60) THEN '4. 3-5 anos'
+            ELSE '5. >5 anos'
+        END AS RANGO_FECHA_ACTUALIZACION,
+        CASE
+            WHEN LEFT(TO_NVARCHAR(cdc.FECHA_NACIMIENTO), 4) BETWEEN '2013' AND '2025' THEN 'Alpha (2013 - 2025)'
+            WHEN LEFT(TO_NVARCHAR(cdc.FECHA_NACIMIENTO), 4) BETWEEN '1997' AND '2012' THEN 'Z (1997 - 2012)'
+            WHEN LEFT(TO_NVARCHAR(cdc.FECHA_NACIMIENTO), 4) BETWEEN '1981' AND '1996' THEN 'Millennials (1981 - 1996)'
+            WHEN LEFT(TO_NVARCHAR(cdc.FECHA_NACIMIENTO), 4) BETWEEN '1965' AND '1980' THEN 'X (1965 - 1980)'
+            WHEN LEFT(TO_NVARCHAR(cdc.FECHA_NACIMIENTO), 4) BETWEEN '1946' AND '1964' THEN 'Baby Boomers (1946 - 1964)'
+            WHEN LEFT(TO_NVARCHAR(cdc.FECHA_NACIMIENTO), 4) < '1946' THEN 'Silent (<1946)'
+            ELSE 'Desconocida'
+        END AS GENERACION_CLIENTE
+    """
+
+    parts = [
+        f"""
+        SELECT DISTINCT TRIM(TO_NVARCHAR(cdc.IDENTIFICACION_{idx})) AS ETIQUETA_EXTERNA,
+               {select_cols}
+        FROM {config.hana_client_schema}.{config.hana_client_table} cdc
+        WHERE cdc.IDENTIFICACION_{idx} IS NOT NULL
+          AND TRIM(TO_NVARCHAR(cdc.IDENTIFICACION_{idx})) IN ({{placeholders}})
+        """
+        for idx in (1, 2, 3)
+    ]
+    sql_template = " UNION ALL ".join(parts)
+
+    rows: List[Dict[str, Any]] = []
+    conn = hana_read_connect(config)
+    cur = conn.cursor()
+    try:
+        for batch in chunks(etiquetas, 500):
+            placeholders = ", ".join(["?"] * len(batch))
+            params: List[str] = []
+            for _ in range(3):
+                params.extend(batch)
+            cur.execute(sql_template.format(placeholders=placeholders), params)
+            for row in cur.fetchall():
+                rows.append(dict(zip(columns, row)))
+    finally:
+        cur.close()
+        conn.close()
+
+    df = pd.DataFrame(rows, columns=columns)
+    if not df.empty:
+        df["ETIQUETA_EXTERNA"] = df["ETIQUETA_EXTERNA"].map(normalize_dni)
+        df = df.drop_duplicates(subset=["ETIQUETA_EXTERNA"], keep="first")
+    logger.info("Clientes encontrados en HANA: %s", len(df))
+    return df
+
+
+def _volume_pct_table(df: pd.DataFrame, field: str, label: str) -> pd.DataFrame:
+    columns = [label, "Llamadas", "%"]
+    if df.empty or field not in df.columns:
+        return pd.DataFrame(columns=columns)
+    work = df.copy()
+    work[field] = work[field].fillna("Sin dato").replace("", "Sin dato")
+    total = max(int(work["conversationId"].nunique()), 1)
+    out = (
+        work.groupby(field, dropna=False)
+        .agg(Llamadas=("conversationId", "nunique"))
+        .reset_index()
+        .rename(columns={field: label})
+        .sort_values("Llamadas", ascending=False)
+    )
+    out["%"] = out["Llamadas"] / total
+    return out[columns]
+
+
+def build_client_analysis(
+    df_calls: pd.DataFrame,
+    df_demo: pd.DataFrame
+) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, pd.DataFrame], Dict[str, pd.DataFrame]]:
+    detail_columns = [
+        "conversationId", "Fecha", "conversationStart", "conversationEnd", "wrapUpCode",
+        "Nombre de conclusion", "conclusion", "Banca", "externalTag", "Estado externalTag",
+        "Estado HANA"
+    ] + DEMOGRAPHIC_COLUMNS
+
+    if df_calls.empty:
+        empty_detail = pd.DataFrame(columns=detail_columns)
+        return empty_detail, pd.DataFrame(), {}, {}
+
+    detail = df_calls.copy()
+    detail["externalTag"] = detail["externalTag"].map(normalize_dni)
+    if not df_demo.empty:
+        detail = detail.merge(df_demo, left_on="externalTag", right_on="ETIQUETA_EXTERNA", how="left")
+    else:
+        detail["ETIQUETA_EXTERNA"] = ""
+
+    for col in DEMOGRAPHIC_COLUMNS:
+        if col not in detail.columns:
+            detail[col] = ""
+        detail[col] = detail[col].fillna("No encontrado en HANA").replace("", "No encontrado en HANA")
+
+    detail["Estado HANA"] = detail.apply(
+        lambda row: "Sin DNI / externalTag"
+        if not normalize_dni(row.get("externalTag"))
+        else ("Encontrado en HANA" if normalize_dni(row.get("ETIQUETA_EXTERNA")) else "No encontrado en HANA"),
+        axis=1
+    )
+    for col in detail_columns:
+        if col not in detail.columns:
+            detail[col] = ""
+    detail = detail[detail_columns]
+
+    known = detail[detail["externalTag"].astype(str).str.strip().ne("")].copy()
+    recurrence_rows: List[Dict[str, Any]] = []
+    if not known.empty:
+        per_client = (
+            known.groupby(["conclusion", "externalTag"], dropna=False)
+            .agg(consultas=("conversationId", "nunique"))
+            .reset_index()
+        )
+        for conclusion, group in per_client.groupby("conclusion", dropna=False):
+            calls_total = int(known.loc[known["conclusion"] == conclusion, "conversationId"].nunique())
+            unique_clients = int(group["externalTag"].nunique())
+            c1 = int((group["consultas"] == 1).sum())
+            c2 = int((group["consultas"] == 2).sum())
+            c3 = int((group["consultas"] == 3).sum())
+            c4 = int((group["consultas"] >= 4).sum())
+            recurrent = c2 + c3 + c4
+            recurrence_rows.append({
+                "Conclusión": conclusion,
+                "Clientes únicos": unique_clients,
+                "Llamadas totales": calls_total,
+                "1 consulta": c1,
+                "2 consultas": c2,
+                "3 consultas": c3,
+                "4+ consultas": c4,
+                "% recurrentes": recurrent / unique_clients if unique_clients else 0
+            })
+
+    recurrence = pd.DataFrame(recurrence_rows)
+    if not recurrence.empty:
+        recurrence = recurrence.sort_values(["% recurrentes", "Llamadas totales"], ascending=[False, False])
+
+    location_tables = {
+        "Por PAIS": _volume_pct_table(detail, "PAIS", "PAIS"),
+        "Por DEPARTAMENTO": _volume_pct_table(detail, "DEPARTAMENTO", "DEPARTAMENTO")
+    }
+    demographic_tables = {
+        field: _volume_pct_table(detail, field, field)
+        for field in ["GENERACION_CLIENTE", "GENERO", "RANGO_FECHA_ACTUALIZACION", "SEGMENTO_BANCA", "ESTADO_CIVIL"]
+    }
+    return detail, recurrence, location_tables, demographic_tables
+
+
 def build_summary(df: pd.DataFrame) -> pd.DataFrame:
     """
     Resumen ejecutivo por conclusión:
@@ -1413,11 +1931,28 @@ def _format_excel_sheet(ws) -> None:
         ws.column_dimensions[col_letter].width = min(max_length + 2, 55)
 
 
+def _write_sectioned_tables(writer: pd.ExcelWriter, sheet_name: str, tables: Dict[str, pd.DataFrame]) -> None:
+    worksheet = writer.book.create_sheet(sheet_name)
+    row = 0
+    for title, table in tables.items():
+        worksheet.cell(row=row + 1, column=1, value=title)
+        row += 1
+        safe_table = table if table is not None else pd.DataFrame()
+        if safe_table.empty:
+            safe_table = pd.DataFrame([{"Mensaje": "Sin datos para el periodo"}])
+        safe_table.to_excel(writer, sheet_name=sheet_name, startrow=row, index=False)
+        row += len(safe_table) + 3
+
+
 def create_excel(
     df_detail: pd.DataFrame,
     df_summary: pd.DataFrame,
     output_path: Path,
-    logger: logging.Logger
+    logger: logging.Logger,
+    df_client_detail: Optional[pd.DataFrame] = None,
+    df_recurrence: Optional[pd.DataFrame] = None,
+    location_tables: Optional[Dict[str, pd.DataFrame]] = None,
+    demographic_tables: Optional[Dict[str, pd.DataFrame]] = None
 ) -> Path:
 
     logger.info("Generando Excel: %s", output_path)
@@ -1445,10 +1980,18 @@ def create_excel(
         df_summary.to_excel(writer, sheet_name="Resumen", index=False)
         df_aol.to_excel(writer, sheet_name="Conclusiones AOL", index=False)
         df_nbda.to_excel(writer, sheet_name="Conclusiones NBDA", index=False)
+        if df_client_detail is not None:
+            df_client_detail.to_excel(writer, sheet_name="Detalle Clientes", index=False)
+        if df_recurrence is not None:
+            df_recurrence.to_excel(writer, sheet_name="Recurrencia", index=False)
+        if location_tables is not None:
+            _write_sectioned_tables(writer, "Ubicación", location_tables)
+        if demographic_tables is not None:
+            _write_sectioned_tables(writer, "Demografía", demographic_tables)
 
         wb = writer.book
 
-        for sheet_name in ["Data", "Resumen", "Conclusiones AOL", "Conclusiones NBDA"]:
+        for sheet_name in list(wb.sheetnames):
             _format_excel_sheet(wb[sheet_name])
 
         ws = wb["Resumen"]
@@ -1556,7 +2099,109 @@ def build_top10_table_rows(df_summary: pd.DataFrame, include_table: bool = True)
     return "\n".join(rows)
 
 
-def build_email_metrics(df_summary: pd.DataFrame, include_table: bool) -> Dict[str, str]:
+def _mini_metric_rows(df: Optional[pd.DataFrame], label_col: str, value_col: str = "Llamadas", max_rows: int = 5) -> str:
+    if df is None or df.empty or label_col not in df.columns:
+        return "<tr><td colspan='2' style='padding:6px 0;color:#9ca3af;font-size:12px;'>Sin datos disponibles</td></tr>"
+    rows: List[str] = []
+    work = df.copy().head(max_rows)
+    for _, item in work.iterrows():
+        label = html.escape(str(item.get(label_col, "Sin dato") or "Sin dato"))
+        value = format_int(item.get(value_col, 0))
+        pct = ""
+        if "%" in item:
+            pct = f" <span style='color:#9ca3af;font-size:11px;'>({format_pct(item.get('%', 0))})</span>"
+        rows.append(
+            "<tr>"
+            f"<td style='padding:5px 0;font-family:Segoe UI,Arial,sans-serif;font-size:12px;color:#374151;'>{label}</td>"
+            f"<td align='right' style='padding:5px 0;font-family:Segoe UI,Arial,sans-serif;font-size:12px;color:#111827;font-weight:bold;'>{value}{pct}</td>"
+            "</tr>"
+        )
+    return "\n".join(rows)
+
+
+def build_client_executive_email_block(
+    df_client_detail: Optional[pd.DataFrame],
+    df_recurrence: Optional[pd.DataFrame],
+    location_tables: Optional[Dict[str, pd.DataFrame]],
+    demographic_tables: Optional[Dict[str, pd.DataFrame]]
+) -> str:
+    if df_client_detail is None:
+        return ""
+
+    total_calls = int(df_client_detail["conversationId"].nunique()) if not df_client_detail.empty and "conversationId" in df_client_detail.columns else 0
+    identified = pd.DataFrame()
+    if not df_client_detail.empty and "externalTag" in df_client_detail.columns:
+        identified = df_client_detail[df_client_detail["externalTag"].astype(str).str.strip().ne("")]
+    unique_clients = int(identified["externalTag"].nunique()) if not identified.empty else 0
+
+    recurrent_clients = 0
+    recurrent_pct = 0.0
+    if not identified.empty:
+        per_client = identified.groupby("externalTag")["conversationId"].nunique()
+        recurrent_clients = int((per_client > 1).sum())
+        recurrent_pct = recurrent_clients / unique_clients if unique_clients else 0.0
+
+    top_recurrence = pd.DataFrame()
+    if df_recurrence is not None and not df_recurrence.empty:
+        top_recurrence = df_recurrence.sort_values(["% recurrentes", "Llamadas totales"], ascending=[False, False]).head(5)
+        top_recurrence = top_recurrence.rename(columns={"Conclusión": "Conclusion", "Llamadas totales": "Llamadas"})
+
+    dept_table = (location_tables or {}).get("Por DEPARTAMENTO", pd.DataFrame())
+    gen_table = (demographic_tables or {}).get("GENERACION_CLIENTE", pd.DataFrame())
+    gender_table = (demographic_tables or {}).get("GENERO", pd.DataFrame())
+
+    return f"""
+              <table border="0" cellpadding="0" cellspacing="0" width="100%" style="background-color:#fff7f7;border:1px solid #fecaca;border-radius:6px;margin-bottom:20px;">
+                <tr>
+                  <td colspan="3" style="padding:16px 16px 8px 16px;font-family:Segoe UI,Arial,sans-serif;">
+                    <strong style="font-size:15px;color:#111827;">Resumen ejecutivo de clientes</strong>
+                    <div style="font-size:12px;color:#6b7280;margin-top:3px;">Recurrencia, ubicacion y demografia identificada con externalTag y HANA espejo.</div>
+                  </td>
+                </tr>
+                <tr>
+                  <td width="33%" style="padding:12px 16px;font-family:Segoe UI,Arial,sans-serif;border-top:1px solid #fee2e2;">
+                    <span style="font-size:11px;color:#6b7280;text-transform:uppercase;">Llamadas analizadas</span><br>
+                    <strong style="font-size:22px;color:#111827;">{format_int(total_calls)}</strong>
+                  </td>
+                  <td width="33%" style="padding:12px 16px;font-family:Segoe UI,Arial,sans-serif;border-top:1px solid #fee2e2;">
+                    <span style="font-size:11px;color:#6b7280;text-transform:uppercase;">Clientes unicos</span><br>
+                    <strong style="font-size:22px;color:#111827;">{format_int(unique_clients)}</strong>
+                  </td>
+                  <td width="34%" style="padding:12px 16px;font-family:Segoe UI,Arial,sans-serif;border-top:1px solid #fee2e2;">
+                    <span style="font-size:11px;color:#6b7280;text-transform:uppercase;">Clientes recurrentes</span><br>
+                    <strong style="font-size:22px;color:#DA282D;">{format_pct(recurrent_pct)}</strong>
+                    <span style="font-size:11px;color:#6b7280;">({format_int(recurrent_clients)})</span>
+                  </td>
+                </tr>
+                <tr>
+                  <td valign="top" style="padding:10px 16px 16px 16px;font-family:Segoe UI,Arial,sans-serif;">
+                    <strong style="font-size:12px;color:#111827;">Top recurrencia</strong>
+                    <table width="100%" cellpadding="0" cellspacing="0">{_mini_metric_rows(top_recurrence, "Conclusion", "Llamadas")}</table>
+                  </td>
+                  <td valign="top" style="padding:10px 16px 16px 16px;font-family:Segoe UI,Arial,sans-serif;">
+                    <strong style="font-size:12px;color:#111827;">Top departamentos</strong>
+                    <table width="100%" cellpadding="0" cellspacing="0">{_mini_metric_rows(dept_table, "DEPARTAMENTO")}</table>
+                  </td>
+                  <td valign="top" style="padding:10px 16px 16px 16px;font-family:Segoe UI,Arial,sans-serif;">
+                    <strong style="font-size:12px;color:#111827;">Generacion</strong>
+                    <table width="100%" cellpadding="0" cellspacing="0">{_mini_metric_rows(gen_table, "GENERACION_CLIENTE")}</table>
+                    <div style="height:8px;"></div>
+                    <strong style="font-size:12px;color:#111827;">Genero</strong>
+                    <table width="100%" cellpadding="0" cellspacing="0">{_mini_metric_rows(gender_table, "GENERO")}</table>
+                  </td>
+                </tr>
+              </table>
+"""
+
+
+def build_email_metrics(
+    df_summary: pd.DataFrame,
+    include_table: bool,
+    df_client_detail: Optional[pd.DataFrame] = None,
+    df_recurrence: Optional[pd.DataFrame] = None,
+    location_tables: Optional[Dict[str, pd.DataFrame]] = None,
+    demographic_tables: Optional[Dict[str, pd.DataFrame]] = None
+) -> Dict[str, str]:
     total_row = pd.DataFrame()
     if not df_summary.empty:
         total_row = df_summary[df_summary["DESCRIPCIÓN DE LA INTERACCIÓN"] == "Total general"]
@@ -1590,6 +2235,12 @@ def build_email_metrics(df_summary: pd.DataFrame, include_table: bool) -> Dict[s
         "TOTAL_NBDA": format_int(total_nbda),
         "PCT_NBDA": pct_from_counts(total_nbda, total_general),
         "TABLE_ROWS": build_top10_table_rows(df_summary, include_table=include_table),
+        "CLIENT_EXECUTIVE_BLOCK": build_client_executive_email_block(
+            df_client_detail,
+            df_recurrence,
+            location_tables,
+            demographic_tables
+        ),
         "FIRMA": env_str("EMAIL_SIGNATURE", "Odair Umanzor"),
     }
 
@@ -1599,9 +2250,20 @@ def render_email_html(
     start_local: datetime,
     end_local: datetime,
     cut_off_time: str,
-    include_table: bool
+    include_table: bool,
+    df_client_detail: Optional[pd.DataFrame] = None,
+    df_recurrence: Optional[pd.DataFrame] = None,
+    location_tables: Optional[Dict[str, pd.DataFrame]] = None,
+    demographic_tables: Optional[Dict[str, pd.DataFrame]] = None
 ) -> str:
-    values = build_email_metrics(df_summary, include_table=include_table)
+    values = build_email_metrics(
+        df_summary,
+        include_table=include_table,
+        df_client_detail=df_client_detail,
+        df_recurrence=df_recurrence,
+        location_tables=location_tables,
+        demographic_tables=demographic_tables
+    )
     values.update({
         "FECHA_INICIO": start_local.strftime("%d/%m/%Y %H:%M"),
         "FECHA_FIN": end_local.strftime("%d/%m/%Y %H:%M"),
@@ -1768,6 +2430,10 @@ def main() -> int:
     errors: List[str] = []
     detail_rows: List[Dict[str, Any]] = []
     output_path: Optional[Path] = None
+    df_client_detail: Optional[pd.DataFrame] = None
+    df_recurrence: Optional[pd.DataFrame] = None
+    location_tables: Optional[Dict[str, pd.DataFrame]] = None
+    demographic_tables: Optional[Dict[str, pd.DataFrame]] = None
 
     try:
         config = load_config()
@@ -1784,7 +2450,9 @@ def main() -> int:
             "DATE", "START_DATE", "END_DATE", "START_UTC", "END_UTC", "AUTO_START_DAY",
             "GENESYS_TIMEZONE", "OUTPUT_DIR", "CUT_OFF_TIME", "EMAIL_TO", "EMAIL_CC",
             "EMAIL_SUBJECT", "INCLUDE_SUMMARY_TABLE_IN_EMAIL", "GRAPH_TENANT_ID", "GRAPH_CLIENT_ID",
-            "GRAPH_CLIENT_SECRET", "GRAPH_SENDER_EMAIL"
+            "GRAPH_CLIENT_SECRET", "GRAPH_SENDER_EMAIL", "INCLUDE_CLIENT_ANALYSIS",
+            "HPR_HOST_ESPEJO", "HPR_PORT", "HPR_USER", "HPR_PASSWORD",
+            "HANA_CLIENT_SCHEMA", "HANA_CLIENT_TABLE", "DETAIL_PAGE_SIZE"
         ])
         logger.info("Modo fecha: %s", date_mode)
         logger.info("Inicio UTC: %s", start_utc)
@@ -1820,6 +2488,41 @@ def main() -> int:
 
         df_summary = build_summary(df_detail)
 
+        if env_bool("INCLUDE_CLIENT_ANALYSIS", True):
+            try:
+                df_calls = query_conclusion_call_details(
+                    config,
+                    token,
+                    start_utc,
+                    end_utc,
+                    wrapup_catalog,
+                    logger
+                )
+                external_tags = df_calls.get("externalTag", pd.Series(dtype=str)).dropna().astype(str).tolist() if not df_calls.empty else []
+                try:
+                    df_demo = query_client_demographics(config, external_tags, logger)
+                except Exception as hana_exc:
+                    logger.exception(
+                        "No se pudo consultar HANA espejo. El reporte continuara sin demografia: %s",
+                        hana_exc
+                    )
+                    df_demo = pd.DataFrame(columns=["ETIQUETA_EXTERNA"] + DEMOGRAPHIC_COLUMNS)
+
+                df_client_detail, df_recurrence, location_tables, demographic_tables = build_client_analysis(df_calls, df_demo)
+                logger.info("Detalle Clientes generado: %s filas", 0 if df_client_detail is None else len(df_client_detail))
+                logger.info("Recurrencia generada: %s filas", 0 if df_recurrence is None else len(df_recurrence))
+            except Exception as detail_exc:
+                logger.exception(
+                    "No se pudo construir recurrencia/ubicacion/demografia. El reporte base continuara: %s",
+                    detail_exc
+                )
+                df_client_detail = pd.DataFrame()
+                df_recurrence = pd.DataFrame()
+                location_tables = {}
+                demographic_tables = {}
+        else:
+            logger.info("Analisis de clientes omitido por parametro INCLUDE_CLIENT_ANALYSIS=false.")
+
         timestamp = datetime.now(ZoneInfo(config.timezone_name)).strftime("%Y%m%d_%H%M%S")
         output_path = Path(config.output_dir) / f"Reporte_Conclusiones_NBDA_AOL_{timestamp}.xlsx"
 
@@ -1827,7 +2530,11 @@ def main() -> int:
             df_detail,
             df_summary,
             output_path,
-            logger
+            logger,
+            df_client_detail=df_client_detail,
+            df_recurrence=df_recurrence,
+            location_tables=location_tables,
+            demographic_tables=demographic_tables
         )
 
         if args.send_email and not args.dry_run:
@@ -1849,7 +2556,11 @@ def main() -> int:
                     start_local,
                     end_local,
                     cut_off_time,
-                    include_table=include_summary_table
+                    include_table=include_summary_table,
+                    df_client_detail=df_client_detail,
+                    df_recurrence=df_recurrence,
+                    location_tables=location_tables,
+                    demographic_tables=demographic_tables
                 )
 
                 try:
