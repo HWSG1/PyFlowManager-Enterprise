@@ -571,7 +571,7 @@ def load_config() -> Config:
         page_size=env_int("PAGE_SIZE", 100),
         output_dir=env_str("OUTPUT_DIR", "runtime/exports"),
         detail_page_size=env_int("DETAIL_PAGE_SIZE", 100),
-        hana_read_host=env_str("HPR_HOST_ESPEJO", ""),
+        hana_read_host=env_str("HPR_HOST_ESPEJO", env_str("HPR_HOST", "")),
         hana_port=env_int("HPR_PORT", 30015),
         hana_user=env_str("HPR_USER", ""),
         hana_password=env_str("HPR_PASSWORD", ""),
@@ -1566,9 +1566,10 @@ def query_conclusion_call_details(
 
 
 DEMOGRAPHIC_COLUMNS = [
-    "PAIS", "DEPARTAMENTO", "ESTADO_CIVIL", "GENERO", "SEGMENTO_BANCA",
-    "TIPO_SECTOR_ECONOMICO", "NIVEL_EDUCATIVO", "NUMERO_DEPENDIENTES",
-    "PROFESION", "FECHA_ULTIMA_ACTUALIZACION", "RANGO_FECHA_ACTUALIZACION",
+    "TEL_CELULAR", "TEL_PRINCIPAL", "DEPARTAMENTO", "ESTADO_CIVIL", "PAIS",
+    "NOMBRE_LEGAL", "PRIMER_NOMBRE", "PRIMER_APELLIDO", "E_MAIL",
+    "SEGMENTO_BANCA", "GENERO", "TIPO_SECTOR_ECONOMICO", "NIVEL_EDUCATIVO",
+    "FECHA_ULTIMA_ACTUALIZACION", "RANGO_FECHA_ACTUALIZACION",
     "GENERACION_CLIENTE"
 ]
 
@@ -1585,21 +1586,25 @@ def query_client_demographics(config: Config, external_tags: List[str], logger: 
     logger.info("Consultando HANA espejo para %s clientes...", len(etiquetas))
 
     select_cols = """
-        cdc.PAIS,
+        cdc.TEL_CELULAR,
+        cdc.TEL_PRINCIPAL,
         cdc.DEPARTAMENTO,
         cdc.ESTADO_CIVIL,
-        cdc.GENERO,
+        cdc.PAIS,
+        cdc.NOMBRE_LEGAL,
+        SUBSTRING_REGEXPR('^[^ ]+' IN TRIM(cdc.NOMBRE_LEGAL)) AS PRIMER_NOMBRE,
+        SUBSTRING_REGEXPR('[^ ]+$' IN TRIM(cdc.NOMBRE_LEGAL)) AS PRIMER_APELLIDO,
+        cdc.E_MAIL,
         CASE
             WHEN cdc.SEGMENTO_BANCA = 'SEGMENTO PERSONAS' THEN 'Personas'
             WHEN cdc.SEGMENTO_BANCA = 'SEGMENTO PYME' THEN 'PYME'
             WHEN cdc.SEGMENTO_BANCA = 'SEGMENTO COMERCIAL' THEN 'Comercial'
             WHEN cdc.SEGMENTO_BANCA = 'SEGMENTO CORPORATIVA' THEN 'Corporativa'
-            ELSE COALESCE(cdc.SEGMENTO_BANCA, 'Sin dato')
+            ELSE 'Otros'
         END AS SEGMENTO_BANCA,
+        cdc.GENERO,
         cdc.TIPO_SECTOR_ECONOMICO,
         cdc.NIVEL_EDUCATIVO,
-        cdc.NUMERO_DEPENDIENTES,
-        cdc.PROFESION,
         cdc.FECHA_ULTIMA_ACTUALIZACION,
         CASE
             WHEN cdc.FECHA_ULTIMA_ACTUALIZACION IS NULL THEN '0. No actualizado'
@@ -1622,11 +1627,13 @@ def query_client_demographics(config: Config, external_tags: List[str], logger: 
 
     parts = [
         f"""
-        SELECT DISTINCT TRIM(TO_NVARCHAR(cdc.IDENTIFICACION_{idx})) AS ETIQUETA_EXTERNA,
+        SELECT DISTINCT TRIM(cdc.IDENTIFICACION_{idx}) AS ETIQUETA_EXTERNA,
                {select_cols}
         FROM {config.hana_client_schema}.{config.hana_client_table} cdc
         WHERE cdc.IDENTIFICACION_{idx} IS NOT NULL
-          AND TRIM(TO_NVARCHAR(cdc.IDENTIFICACION_{idx})) IN ({{placeholders}})
+          AND TRIM(cdc.IDENTIFICACION_{idx}) <> ''
+          AND cdc.E_MAIL IS NOT NULL
+          AND TRIM(cdc.IDENTIFICACION_{idx}) IN ({{placeholders}})
         """
         for idx in (1, 2, 3)
     ]
