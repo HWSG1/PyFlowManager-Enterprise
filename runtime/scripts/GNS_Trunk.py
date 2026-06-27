@@ -89,6 +89,10 @@ def setup_logging() -> logging.Logger:
 
 log = setup_logging()
 
+EXCEL_MAX_ROWS = 1_048_576
+EXCEL_MAX_DATA_ROWS = EXCEL_MAX_ROWS - 1
+LOCAL_TIMEZONE = timezone(timedelta(hours=-6), "America/Tegucigalpa")
+
 
 # =============================================================================
 # Utilidades de parámetros
@@ -172,9 +176,28 @@ def daterange_chunks(start: date, end_exclusive: date, chunk_days: int) -> Itera
 
 
 def iso_interval(start_day: date, end_day_exclusive: date) -> str:
-    start_dt = datetime.combine(start_day, datetime.min.time(), tzinfo=timezone.utc)
-    end_dt = datetime.combine(end_day_exclusive, datetime.min.time(), tzinfo=timezone.utc)
+    start_dt = datetime.combine(start_day, datetime.min.time(), tzinfo=LOCAL_TIMEZONE).astimezone(timezone.utc)
+    end_dt = datetime.combine(end_day_exclusive, datetime.min.time(), tzinfo=LOCAL_TIMEZONE).astimezone(timezone.utc)
     return f"{start_dt.isoformat().replace('+00:00', 'Z')}/{end_dt.isoformat().replace('+00:00', 'Z')}"
+
+
+def interval_bounds_utc(start_day: date, end_day_exclusive: date) -> Tuple[datetime, datetime]:
+    start_dt = datetime.combine(start_day, datetime.min.time(), tzinfo=LOCAL_TIMEZONE).astimezone(timezone.utc)
+    end_dt = datetime.combine(end_day_exclusive, datetime.min.time(), tzinfo=LOCAL_TIMEZONE).astimezone(timezone.utc)
+    return start_dt, end_dt
+
+
+def parse_genesys_datetime(value: Any) -> Optional[datetime]:
+    text = clean_value(value)
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def split_numbers(value: str) -> Set[str]:
@@ -810,8 +833,11 @@ def extract_conversations_for_range_job(
     progress_end: int = 85,
 ) -> List[Dict[str, Any]]:
     interval = iso_interval(start_day, end_day_exclusive)
+    interval_start_utc, interval_end_utc = interval_bounds_utc(start_day, end_day_exclusive)
     rows: List[Dict[str, Any]] = []
     total_checked = 0
+    skipped_no_date = 0
+    skipped_out_of_range = 0
     started_at = time.time()
 
     log.info("Creando Job Analytics para intervalo: %s", interval)
@@ -832,6 +858,14 @@ def extract_conversations_for_range_job(
 
         for conv in conversations:
             total_checked += 1
+            conv_start = parse_genesys_datetime(conv.get("conversationStart"))
+            if conv_start is None:
+                skipped_no_date += 1
+                continue
+            if conv_start < interval_start_utc or conv_start >= interval_end_utc:
+                skipped_out_of_range += 1
+                continue
+
             matched, match_method = conversation_contains_trunk(conv, trunk_name, trunk_numbers, trunk_edge_ids, filter_mode)
             if not matched:
                 continue
@@ -880,11 +914,13 @@ def extract_conversations_for_range_job(
         )
 
     log.info(
-        "Job %s | intervalo %s | revisadas: %s | asociadas: %s | duración bloque: %.1f minutos",
+        "Job %s | intervalo %s | revisadas: %s | asociadas: %s | sin fecha: %s | fuera de rango: %s | duracion bloque: %.1f minutos",
         job_id,
         interval,
         total_checked,
         len(rows),
+        skipped_no_date,
+        skipped_out_of_range,
         (time.time() - started_at) / 60
     )
     pyflow_progress(progress_end)
@@ -933,7 +969,7 @@ def enrich_month_columns(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     out = df.copy()
-    dt = pd.to_datetime(out.get("conversationStart"), errors="coerce", utc=True)
+    dt = pd.to_datetime(out.get("conversationStart"), errors="coerce", utc=True).dt.tz_convert(LOCAL_TIMEZONE)
     out["anio"] = dt.dt.year.fillna(0).astype(int)
     out["mes_num"] = dt.dt.month.fillna(0).astype(int)
     out["mes"] = out["mes_num"].map(MONTHS_ES).fillna("Sin fecha")
@@ -1081,9 +1117,9 @@ def export_excel(
         {"parametro": "nota", "valor": "Generado usando Analytics Conversation Details Jobs. DNIS/ANI es el filtro recomendado para troncales. EDGE depende de datos que Genesys no siempre expone en conversation details; por eso AUTO solo usa EDGE si se selecciona manualmente."}
     ])
 
-    diagnostico_df = pd.DataFrame()
+    diagnostico_rows: List[Dict[str, Any]] = []
     if detail_df.empty:
-        diagnostico_df = pd.DataFrame([
+        diagnostico_rows.extend([
             {
                 "tipo": "Sin conversaciones asociadas",
                 "detalle": (
@@ -1097,6 +1133,21 @@ def export_excel(
             {"tipo": "TRUNK_NUMBERS configurados", "detalle": len(trunk_numbers)},
             {"tipo": "Edge IDs detectados", "detalle": len(trunk_edge_ids)},
         ])
+
+    detail_exceeds_excel_limit = export_detail and len(detail_df) > EXCEL_MAX_DATA_ROWS
+    if detail_exceeds_excel_limit:
+        warning_msg = (
+            f"El detalle tiene {len(detail_df):,} filas y Excel solo permite "
+            f"{EXCEL_MAX_DATA_ROWS:,} filas de datos por hoja. Se omitira la hoja Detalle "
+            "y se generaran solo las hojas agrupadas."
+        )
+        log.warning(warning_msg)
+        diagnostico_rows.append({
+            "tipo": "Detalle omitido",
+            "detalle": warning_msg
+        })
+
+    diagnostico_df = pd.DataFrame(diagnostico_rows)
 
     with pd.ExcelWriter(file_path, engine="openpyxl") as writer:
         # Hoja principal solicitada: detalle por mes y división
@@ -1126,7 +1177,7 @@ def export_excel(
             autosize_excel(writer, "Diagnostico", diagnostico_df)
             add_excel_table(writer, "Diagnostico", diagnostico_df, "tblDiagnostico")
 
-        if export_detail:
+        if export_detail and not detail_exceeds_excel_limit:
             detail_export = detail_df.copy()
             if detail_export.empty:
                 detail_export = pd.DataFrame(columns=[
