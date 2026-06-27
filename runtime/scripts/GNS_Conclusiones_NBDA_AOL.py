@@ -1708,12 +1708,12 @@ def build_client_analysis(
     for col in DEMOGRAPHIC_COLUMNS:
         if col not in detail.columns:
             detail[col] = ""
-        detail[col] = detail[col].fillna("No encontrado en HANA").replace("", "No encontrado en HANA")
+        detail[col] = detail[col].fillna("No encontrado").replace("", "No encontrado").replace("No encontrado en HANA", "No encontrado")
 
     detail["Estado HANA"] = detail.apply(
         lambda row: "Sin DNI / externalTag"
         if not normalize_dni(row.get("externalTag"))
-        else ("Encontrado en HANA" if normalize_dni(row.get("ETIQUETA_EXTERNA")) else "No encontrado en HANA"),
+        else ("Encontrado en HANA" if normalize_dni(row.get("ETIQUETA_EXTERNA")) else "No encontrado"),
         axis=1
     )
     for col in detail_columns:
@@ -2378,13 +2378,13 @@ def build_client_executive_email_block(
     return f"""
               <table border="0" cellpadding="0" cellspacing="0" width="100%" style="background-color:#f8fafc;border-top:1px solid #e2e8f0;border-bottom:1px solid #e2e8f0;margin:0 0 20px 0;">
                 <tr>
-                  <td colspan="3" style="padding:18px 0 12px 0;font-family:Segoe UI,Arial,sans-serif;">
+                  <td colspan="3" style="padding:18px 22px 12px 22px;font-family:Segoe UI,Arial,sans-serif;">
                     <div style="font-size:16px;font-weight:800;color:#0f172a;line-height:1.2;">Resumen Ejecutivo de Clientes</div>
                     <div style="font-size:12px;color:#475569;margin-top:4px;">Recurrencia, ubicacion y demografia del periodo analizado.</div>
                   </td>
                 </tr>
                 <tr>
-                  <td width="33%" style="padding:10px 12px 14px 0;font-family:Segoe UI,Arial,sans-serif;border-top:1px solid #e2e8f0;">
+                  <td width="33%" style="padding:10px 12px 14px 22px;font-family:Segoe UI,Arial,sans-serif;border-top:1px solid #e2e8f0;">
                     <div style="font-size:10px;color:#475569;text-transform:uppercase;font-weight:700;letter-spacing:.4px;">Llamadas analizadas</div>
                     <div style="font-size:26px;color:#0f172a;font-weight:800;line-height:1.1;">{format_int(total_calls)}</div>
                     <table width="40" cellpadding="0" cellspacing="0"><tr><td style="height:3px;background-color:#475569;font-size:0;">&nbsp;</td></tr></table>
@@ -2394,28 +2394,28 @@ def build_client_executive_email_block(
                     <div style="font-size:26px;color:#0f172a;font-weight:800;line-height:1.1;">{format_int(unique_clients)}</div>
                     <table width="40" cellpadding="0" cellspacing="0"><tr><td style="height:3px;background-color:#475569;font-size:0;">&nbsp;</td></tr></table>
                   </td>
-                  <td width="34%" style="padding:10px 0 14px 12px;font-family:Segoe UI,Arial,sans-serif;border-top:1px solid #e2e8f0;">
+                  <td width="34%" style="padding:10px 22px 14px 12px;font-family:Segoe UI,Arial,sans-serif;border-top:1px solid #e2e8f0;">
                     <div style="font-size:10px;color:#475569;text-transform:uppercase;font-weight:700;letter-spacing:.4px;">Clientes recurrentes</div>
                     <div style="font-size:26px;color:#DA282D;font-weight:800;line-height:1.1;">{format_pct(recurrent_pct)} <span style="font-size:12px;color:#64748b;font-weight:500;">({format_int(recurrent_clients)})</span></div>
                     <table width="40" cellpadding="0" cellspacing="0"><tr><td style="height:3px;background-color:#DA282D;font-size:0;">&nbsp;</td></tr></table>
                   </td>
                 </tr>
                 <tr>
-                  <td valign="top" width="50%" colspan="2" style="padding:16px 24px 8px 0;border-top:1px solid #e2e8f0;">
+                  <td valign="top" width="50%" colspan="2" style="padding:16px 24px 8px 22px;border-top:1px solid #e2e8f0;">
                     <div style="font-family:Segoe UI,Arial,sans-serif;font-size:12px;font-weight:800;color:#0f172a;text-transform:uppercase;border-bottom:2px solid #DA282D;padding-bottom:5px;">Top recurrencia</div>
                     <table width="100%" cellpadding="0" cellspacing="0">{_email_rows_with_bars(top_recurrence, "Conclusion", "Llamadas", bar_color="#DA282D")}</table>
                   </td>
-                  <td valign="top" width="50%" style="padding:16px 0 8px 24px;border-top:1px solid #e2e8f0;">
+                  <td valign="top" width="50%" style="padding:16px 22px 8px 24px;border-top:1px solid #e2e8f0;">
                     <div style="font-family:Segoe UI,Arial,sans-serif;font-size:12px;font-weight:800;color:#0f172a;text-transform:uppercase;border-bottom:2px solid #475569;padding-bottom:5px;">Top departamentos</div>
                     <table width="100%" cellpadding="0" cellspacing="0">{_email_rows_with_bars(dept_table, "DEPARTAMENTO", bar_color="#475569")}</table>
                   </td>
                 </tr>
                 <tr>
-                  <td valign="top" width="50%" colspan="2" style="padding:14px 24px 18px 0;border-top:1px solid #e2e8f0;">
+                  <td valign="top" width="50%" colspan="2" style="padding:14px 24px 18px 22px;border-top:1px solid #e2e8f0;">
                     <div style="font-family:Segoe UI,Arial,sans-serif;font-size:12px;font-weight:800;color:#0f172a;text-transform:uppercase;border-bottom:2px solid #475569;padding-bottom:5px;">Generacion</div>
                     <table width="100%" cellpadding="0" cellspacing="0">{_email_rows_with_bars(gen_table, "GENERACION_CLIENTE", bar_color="#475569")}</table>
                   </td>
-                  <td valign="top" width="50%" style="padding:14px 0 18px 24px;border-top:1px solid #e2e8f0;">
+                  <td valign="top" width="50%" style="padding:14px 22px 18px 24px;border-top:1px solid #e2e8f0;">
                     <div style="font-family:Segoe UI,Arial,sans-serif;font-size:12px;font-weight:800;color:#0f172a;text-transform:uppercase;border-bottom:2px solid #475569;padding-bottom:5px;">Genero</div>
                     <table width="100%" cellpadding="0" cellspacing="0">{_email_rows_with_bars(gender_table, "GENERO", bar_color="#DA282D")}</table>
                   </td>
