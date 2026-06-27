@@ -1055,7 +1055,10 @@ def is_target_wrapup_name(name: str) -> bool:
     """Valida únicamente contra las conclusiones exactas parametrizadas en el script."""
     if not name:
         return False
-    return _norm_code_name(name) in ALL_WRAPUP_EXACT_NAMES_NORM
+    norm_name = _norm_code_name(name)
+    if norm_name not in ALL_WRAPUP_EXACT_NAMES_NORM:
+        return False
+    return norm_name.startswith("NBDA_") or "_AOL" in norm_name or "AOL_" in norm_name or norm_name.endswith("_AOL")
 
 def clean_conclusion_name(name: str) -> str:
     if not name:
@@ -1747,7 +1750,16 @@ def build_client_analysis(
 
     recurrence = pd.DataFrame(recurrence_rows)
     if not recurrence.empty:
-        recurrence = recurrence.sort_values(["% recurrentes", "Llamadas totales"], ascending=[False, False])
+        recurrence["_clientes recurrentes"] = (
+            pd.to_numeric(recurrence["2 consultas"], errors="coerce").fillna(0)
+            + pd.to_numeric(recurrence["3 consultas"], errors="coerce").fillna(0)
+            + pd.to_numeric(recurrence["4+ consultas"], errors="coerce").fillna(0)
+        )
+        recurrence = (
+            recurrence
+            .sort_values(["_clientes recurrentes", "Llamadas totales"], ascending=[False, False])
+            .drop(columns=["_clientes recurrentes"])
+        )
 
     location_tables = {
         "Por PAIS": _volume_pct_table(detail, "PAIS", "PAIS"),
@@ -1923,8 +1935,32 @@ def build_conclusion_daily_matrix(df: pd.DataFrame, banca: str) -> pd.DataFrame:
 
 
 def _format_excel_sheet(ws) -> None:
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
+    header_fill = PatternFill("solid", fgColor="DA282D")
+    header_font = Font(color="FFFFFF", bold=True)
+    title_fill = PatternFill("solid", fgColor="F8E7E8")
+    title_font = Font(color="111827", bold=True)
+    thin_side = Side(style="thin", color="E5E7EB")
+    border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
+
+    def row_non_empty_count(row_idx: int) -> int:
+        return sum(1 for cell in ws[row_idx] if cell.value not in (None, ""))
+
+    header_rows = {1}
+    for row_idx in range(1, ws.max_row + 1):
+        if row_non_empty_count(row_idx) == 1 and row_idx < ws.max_row and row_non_empty_count(row_idx + 1) > 1:
+            header_rows.add(row_idx + 1)
+            for cell in ws[row_idx]:
+                if cell.value not in (None, ""):
+                    cell.fill = title_fill
+                    cell.font = title_font
+                    cell.alignment = Alignment(horizontal="left")
+
+    if ws.max_row >= 1 and ws.max_column >= 1:
+        ws.auto_filter.ref = ws.dimensions
 
     for col_cells in ws.columns:
         max_length = 0
@@ -1934,12 +1970,37 @@ def _format_excel_sheet(ws) -> None:
             value = cell.value
             if value is not None:
                 max_length = max(max_length, len(str(value)))
+            cell.border = border
+            cell.alignment = Alignment(vertical="center")
+            if cell.row in header_rows and value not in (None, ""):
+                cell.fill = header_fill
+                cell.font = header_font
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+            if isinstance(value, (int, float)) and cell.row not in header_rows:
+                header_value = ""
+                for header_row in sorted(header_rows, reverse=True):
+                    if header_row < cell.row:
+                        header_value = str(ws.cell(row=header_row, column=cell.column).value or "")
+                        break
+                if "%" in header_value:
+                    cell.number_format = "0.0%"
+                else:
+                    cell.number_format = "#,##0"
 
         ws.column_dimensions[col_letter].width = min(max_length + 2, 55)
+
+    for row in ws.iter_rows(min_row=2):
+        first_value = str(row[0].value or "").strip().lower()
+        if first_value in {"total general", "total"} or "total general" in first_value:
+            for cell in row:
+                cell.font = Font(bold=True)
 
 
 def _write_sectioned_tables(writer: pd.ExcelWriter, sheet_name: str, tables: Dict[str, pd.DataFrame]) -> None:
     worksheet = writer.book.create_sheet(sheet_name)
+    if not tables:
+        pd.DataFrame([{"Mensaje": "Sin datos para el periodo"}]).to_excel(writer, sheet_name=sheet_name, index=False)
+        return
     row = 0
     for title, table in tables.items():
         worksheet.cell(row=row + 1, column=1, value=title)
@@ -1951,7 +2012,7 @@ def _write_sectioned_tables(writer: pd.ExcelWriter, sheet_name: str, tables: Dic
         row += len(safe_table) + 3
 
 
-def create_excel(
+def _create_excel_legacy_unused(
     df_detail: pd.DataFrame,
     df_summary: pd.DataFrame,
     output_path: Path,
@@ -2013,6 +2074,45 @@ def create_excel(
 
     logger.info("Excel generado correctamente.")
     return output_path
+
+
+def create_excel(
+    df_detail: pd.DataFrame,
+    df_summary: pd.DataFrame,
+    output_path: Path,
+    logger: logging.Logger,
+    df_client_detail: Optional[pd.DataFrame] = None,
+    df_recurrence: Optional[pd.DataFrame] = None,
+    location_tables: Optional[Dict[str, pd.DataFrame]] = None,
+    demographic_tables: Optional[Dict[str, pd.DataFrame]] = None
+) -> Path:
+    logger.info("Generando Excel: %s", output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        df_summary.to_excel(writer, sheet_name="Resumen", index=False)
+        safe_recurrence = df_recurrence if df_recurrence is not None else pd.DataFrame()
+        safe_recurrence.to_excel(writer, sheet_name="Recurrencia", index=False)
+        _write_sectioned_tables(writer, "Ubicación", location_tables or {})
+        _write_sectioned_tables(writer, "Demografía", demographic_tables or {})
+
+        wb = writer.book
+        for sheet_name in list(wb.sheetnames):
+            _format_excel_sheet(wb[sheet_name])
+
+        for sheet_name in ["Resumen", "Recurrencia"]:
+            if sheet_name not in wb.sheetnames:
+                continue
+            ws = wb[sheet_name]
+            headers = {ws.cell(row=1, column=col).value: col for col in range(1, ws.max_column + 1)}
+            for row in range(2, ws.max_row + 1):
+                for header, col in headers.items():
+                    if header and "%" in str(header):
+                        ws.cell(row=row, column=col).number_format = "0.0%"
+
+    logger.info("Excel generado correctamente.")
+    return output_path
+
 
 def format_int(value: Any) -> str:
     try:
@@ -2195,6 +2295,129 @@ def build_client_executive_email_block(
                     <div style="height:8px;"></div>
                     <strong style="font-size:12px;color:#111827;">Genero</strong>
                     <table width="100%" cellpadding="0" cellspacing="0">{_mini_metric_rows(gender_table, "GENERO")}</table>
+                  </td>
+                </tr>
+              </table>
+"""
+
+def _email_rows_with_bars(df: Optional[pd.DataFrame], label_col: str, value_col: str = "Llamadas", max_rows: int = 5, bar_color: str = "#475569") -> str:
+    if df is None or df.empty or label_col not in df.columns:
+        return "<tr><td colspan='2' style='padding:8px 0;font-family:Segoe UI,Arial,sans-serif;font-size:12px;color:#94a3b8;'>Sin datos disponibles</td></tr>"
+
+    work = df.copy().head(max_rows)
+    max_value = float(pd.to_numeric(work.get(value_col, 0), errors="coerce").fillna(0).max() or 1)
+    rows: List[str] = []
+    for _, item in work.iterrows():
+        label = html.escape(str(item.get(label_col, "Sin dato") or "Sin dato"))
+        value = float(pd.to_numeric(pd.Series([item.get(value_col, 0)]), errors="coerce").fillna(0).iloc[0])
+        pct_value = item.get("%", None)
+        pct_text = f" ({format_pct(pct_value)})" if pct_value is not None and str(pct_value) != "nan" else ""
+        width = max(3, min(100, int((value / max_value) * 100))) if max_value else 3
+        rows.append(f"""
+                      <tr>
+                        <td style="padding:4px 0 1px 0;font-family:Segoe UI,Arial,sans-serif;font-size:11px;color:#334155;line-height:1.25;">{label}</td>
+                        <td align="right" style="padding:4px 0 1px 8px;font-family:Segoe UI,Arial,sans-serif;font-size:11px;color:#0f172a;font-weight:bold;white-space:nowrap;">{format_int(value)}<span style="font-weight:normal;color:#64748b;font-size:10px;">{pct_text}</span></td>
+                      </tr>
+                      <tr>
+                        <td colspan="2" style="padding:0 0 6px 0;">
+                          <table border="0" cellpadding="0" cellspacing="0" width="100%" style="height:4px;background-color:#e2e8f0;">
+                            <tr>
+                              <td width="{width}%" style="height:4px;background-color:{bar_color};font-size:0;line-height:0;">&nbsp;</td>
+                              <td width="{100 - width}%" style="height:4px;background-color:#e2e8f0;font-size:0;line-height:0;">&nbsp;</td>
+                            </tr>
+                          </table>
+                        </td>
+                      </tr>""")
+    return "\n".join(rows)
+
+
+def build_client_executive_email_block(
+    df_client_detail: Optional[pd.DataFrame],
+    df_recurrence: Optional[pd.DataFrame],
+    location_tables: Optional[Dict[str, pd.DataFrame]],
+    demographic_tables: Optional[Dict[str, pd.DataFrame]]
+) -> str:
+    if df_client_detail is None:
+        return ""
+
+    total_calls = int(df_client_detail["conversationId"].nunique()) if not df_client_detail.empty and "conversationId" in df_client_detail.columns else 0
+    identified = pd.DataFrame()
+    if not df_client_detail.empty and "externalTag" in df_client_detail.columns:
+        identified = df_client_detail[df_client_detail["externalTag"].astype(str).str.strip().ne("")]
+    unique_clients = int(identified["externalTag"].nunique()) if not identified.empty else 0
+
+    recurrent_clients = 0
+    recurrent_pct = 0.0
+    if not identified.empty:
+        per_client = identified.groupby("externalTag")["conversationId"].nunique()
+        recurrent_clients = int((per_client > 1).sum())
+        recurrent_pct = recurrent_clients / unique_clients if unique_clients else 0.0
+
+    top_recurrence = pd.DataFrame()
+    if df_recurrence is not None and not df_recurrence.empty:
+        top_recurrence = df_recurrence.copy()
+        top_recurrence["_clientes_recurrentes"] = (
+            pd.to_numeric(top_recurrence.get("2 consultas", 0), errors="coerce").fillna(0)
+            + pd.to_numeric(top_recurrence.get("3 consultas", 0), errors="coerce").fillna(0)
+            + pd.to_numeric(top_recurrence.get("4+ consultas", 0), errors="coerce").fillna(0)
+        )
+        top_recurrence = (
+            top_recurrence
+            .sort_values(["_clientes_recurrentes", "Llamadas totales"], ascending=[False, False])
+            .head(5)
+            .rename(columns={"Conclusión": "Conclusion", "ConclusiÃ³n": "Conclusion", "Llamadas totales": "Llamadas"})
+        )
+        if "%" not in top_recurrence.columns and "Llamadas" in top_recurrence.columns:
+            total = max(float(pd.to_numeric(top_recurrence["Llamadas"], errors="coerce").fillna(0).sum()), 1)
+            top_recurrence["%"] = pd.to_numeric(top_recurrence["Llamadas"], errors="coerce").fillna(0) / total
+
+    dept_table = (location_tables or {}).get("Por DEPARTAMENTO", pd.DataFrame())
+    gen_table = (demographic_tables or {}).get("GENERACION_CLIENTE", pd.DataFrame())
+    gender_table = (demographic_tables or {}).get("GENERO", pd.DataFrame())
+
+    return f"""
+              <table border="0" cellpadding="0" cellspacing="0" width="100%" style="background-color:#f8fafc;border-top:1px solid #e2e8f0;border-bottom:1px solid #e2e8f0;margin:0 0 20px 0;">
+                <tr>
+                  <td colspan="3" style="padding:18px 0 12px 0;font-family:Segoe UI,Arial,sans-serif;">
+                    <div style="font-size:16px;font-weight:800;color:#0f172a;line-height:1.2;">Resumen Ejecutivo de Clientes</div>
+                    <div style="font-size:12px;color:#475569;margin-top:4px;">Recurrencia, ubicacion y demografia del periodo analizado.</div>
+                  </td>
+                </tr>
+                <tr>
+                  <td width="33%" style="padding:10px 12px 14px 0;font-family:Segoe UI,Arial,sans-serif;border-top:1px solid #e2e8f0;">
+                    <div style="font-size:10px;color:#475569;text-transform:uppercase;font-weight:700;letter-spacing:.4px;">Llamadas analizadas</div>
+                    <div style="font-size:26px;color:#0f172a;font-weight:800;line-height:1.1;">{format_int(total_calls)}</div>
+                    <table width="40" cellpadding="0" cellspacing="0"><tr><td style="height:3px;background-color:#475569;font-size:0;">&nbsp;</td></tr></table>
+                  </td>
+                  <td width="33%" style="padding:10px 12px 14px 12px;font-family:Segoe UI,Arial,sans-serif;border-top:1px solid #e2e8f0;">
+                    <div style="font-size:10px;color:#475569;text-transform:uppercase;font-weight:700;letter-spacing:.4px;">Clientes unicos</div>
+                    <div style="font-size:26px;color:#0f172a;font-weight:800;line-height:1.1;">{format_int(unique_clients)}</div>
+                    <table width="40" cellpadding="0" cellspacing="0"><tr><td style="height:3px;background-color:#475569;font-size:0;">&nbsp;</td></tr></table>
+                  </td>
+                  <td width="34%" style="padding:10px 0 14px 12px;font-family:Segoe UI,Arial,sans-serif;border-top:1px solid #e2e8f0;">
+                    <div style="font-size:10px;color:#475569;text-transform:uppercase;font-weight:700;letter-spacing:.4px;">Clientes recurrentes</div>
+                    <div style="font-size:26px;color:#DA282D;font-weight:800;line-height:1.1;">{format_pct(recurrent_pct)} <span style="font-size:12px;color:#64748b;font-weight:500;">({format_int(recurrent_clients)})</span></div>
+                    <table width="40" cellpadding="0" cellspacing="0"><tr><td style="height:3px;background-color:#DA282D;font-size:0;">&nbsp;</td></tr></table>
+                  </td>
+                </tr>
+                <tr>
+                  <td valign="top" width="50%" colspan="2" style="padding:16px 24px 8px 0;border-top:1px solid #e2e8f0;">
+                    <div style="font-family:Segoe UI,Arial,sans-serif;font-size:12px;font-weight:800;color:#0f172a;text-transform:uppercase;border-bottom:2px solid #DA282D;padding-bottom:5px;">Top recurrencia</div>
+                    <table width="100%" cellpadding="0" cellspacing="0">{_email_rows_with_bars(top_recurrence, "Conclusion", "Llamadas", bar_color="#DA282D")}</table>
+                  </td>
+                  <td valign="top" width="50%" style="padding:16px 0 8px 24px;border-top:1px solid #e2e8f0;">
+                    <div style="font-family:Segoe UI,Arial,sans-serif;font-size:12px;font-weight:800;color:#0f172a;text-transform:uppercase;border-bottom:2px solid #475569;padding-bottom:5px;">Top departamentos</div>
+                    <table width="100%" cellpadding="0" cellspacing="0">{_email_rows_with_bars(dept_table, "DEPARTAMENTO", bar_color="#475569")}</table>
+                  </td>
+                </tr>
+                <tr>
+                  <td valign="top" width="50%" colspan="2" style="padding:14px 24px 18px 0;border-top:1px solid #e2e8f0;">
+                    <div style="font-family:Segoe UI,Arial,sans-serif;font-size:12px;font-weight:800;color:#0f172a;text-transform:uppercase;border-bottom:2px solid #475569;padding-bottom:5px;">Generacion</div>
+                    <table width="100%" cellpadding="0" cellspacing="0">{_email_rows_with_bars(gen_table, "GENERACION_CLIENTE", bar_color="#475569")}</table>
+                  </td>
+                  <td valign="top" width="50%" style="padding:14px 0 18px 24px;border-top:1px solid #e2e8f0;">
+                    <div style="font-family:Segoe UI,Arial,sans-serif;font-size:12px;font-weight:800;color:#0f172a;text-transform:uppercase;border-bottom:2px solid #475569;padding-bottom:5px;">Genero</div>
+                    <table width="100%" cellpadding="0" cellspacing="0">{_email_rows_with_bars(gender_table, "GENERO", bar_color="#DA282D")}</table>
                   </td>
                 </tr>
               </table>
