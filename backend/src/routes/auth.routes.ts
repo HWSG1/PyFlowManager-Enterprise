@@ -6,6 +6,12 @@ import { ensureUserPasswordPolicyColumns } from '../services/userSchema.service'
 
 const router = Router();
 
+function toBoolean(value: any): boolean {
+  if (value === true || value === 1) return true;
+  const text = String(value ?? '').trim().toLowerCase();
+  return text === '1' || text === 'true' || text === 'yes' || text === 'si' || text === 'sí';
+}
+
 router.post('/login', async (req, res, next) => {
   try {
     const { username, password, provider = 'local' } = req.body || {};
@@ -74,6 +80,8 @@ router.post('/login', async (req, res, next) => {
       .input('id', sql.Int, user.id)
       .query('UPDATE dbo.Users SET last_login = GETDATE() WHERE id = @id');
 
+    const mustChangePassword = toBoolean(user.must_change_password);
+
     const token = signToken({
       id: user.id,
       username: user.username,
@@ -81,7 +89,7 @@ router.post('/login', async (req, res, next) => {
       name: user.display_name,
       roles: user.roles || '',
       theme: user.theme_key,
-      must_change_password: !!user.must_change_password,
+      must_change_password: mustChangePassword,
       is_super_admin: String(user.roles || '').includes('Super Administrador')
     });
 
@@ -94,9 +102,9 @@ router.post('/login', async (req, res, next) => {
         name: user.display_name,
         roles: user.roles || '',
         theme: user.theme_key,
-        mustChangePassword: !!user.must_change_password
+        mustChangePassword
       },
-      mustChangePassword: !!user.must_change_password
+      mustChangePassword
     });
   } catch (err) {
     next(err);

@@ -27,6 +27,13 @@ function toBit(value: any, defaultValue = true) {
   return value === true || value === 1 || value === '1' || value === 'true' || value === 'ACTIVE';
 }
 
+function toBoolean(value: any, defaultValue = false) {
+  if (value === undefined || value === null || value === '') return defaultValue;
+  if (value === true || value === 1) return true;
+  const text = String(value).trim().toLowerCase();
+  return text === '1' || text === 'true' || text === 'yes' || text === 'si' || text === 'sí';
+}
+
 router.get('/', async (_req, res, next) => {
   try {
     const pool = await getPool();
@@ -163,7 +170,7 @@ router.put('/:id', requirePermission('users.manage'), async (req, res, next) => 
       .input('is_active', sql.Bit, toBit(b.is_active, true))
       .input('auth_provider', sql.NVarChar(50), authProvider)
       .input('theme_key', sql.NVarChar(80), b.theme_key || 'dark-blue')
-      .input('must_change_password', sql.Bit, b.must_change_password ? 1 : 0)
+      .input('must_change_password', sql.Bit, toBoolean(b.must_change_password) ? 1 : 0)
       .query(`
         UPDATE dbo.Users
         SET
@@ -186,7 +193,7 @@ router.put('/:id', requirePermission('users.manage'), async (req, res, next) => 
       is_active: b.is_active,
       auth_provider: authProvider,
       theme_key: b.theme_key,
-      must_change_password: !!b.must_change_password,
+      must_change_password: toBoolean(b.must_change_password),
       role_ids: roleIds
     });
     res.json({ ok: true });

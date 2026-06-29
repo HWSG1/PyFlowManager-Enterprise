@@ -212,7 +212,7 @@ export class UsersComponent implements OnInit {
     this.form = {
       ...user,
       is_active: this.isActive(user),
-      must_change_password: !!user.must_change_password,
+      must_change_password: this.toBoolean(user.must_change_password),
       role_ids: this.parseRoleIds(user.role_ids)
     };
   }
@@ -267,6 +267,12 @@ export class UsersComponent implements OnInit {
 
   isActive(user: any) {
     return user?.is_active === true || user?.is_active === 1 || user?.is_active === '1' || user?.is_active === 'true';
+  }
+
+  toBoolean(value: any) {
+    if (value === true || value === 1) return true;
+    const text = String(value ?? '').trim().toLowerCase();
+    return text === '1' || text === 'true' || text === 'yes' || text === 'si' || text === 'sí';
   }
 
   labelAuth(value: string) {

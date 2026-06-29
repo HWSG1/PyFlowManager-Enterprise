@@ -7,7 +7,7 @@ import { environment } from '../../environments/environment';
 export class AuthService {
   token = signal<string | null>(localStorage.getItem('pyflow_token'));
   user = signal<any>(JSON.parse(localStorage.getItem('pyflow_user') || 'null'));
-  mustChangePassword = signal(!!this.user()?.mustChangePassword);
+  mustChangePassword = signal(this.toBoolean(this.user()?.mustChangePassword));
   showChangePasswordModal = signal(false);
   loading = signal(false);
 
@@ -19,6 +19,12 @@ export class AuthService {
   isAuthenticated() { return !!this.token(); }
   authHeaders() { return { Authorization: `Bearer ${this.token() || ''}` }; }
 
+  private toBoolean(value: any): boolean {
+    if (value === true || value === 1) return true;
+    const text = String(value ?? '').trim().toLowerCase();
+    return text === '1' || text === 'true' || text === 'yes' || text === 'si' || text === 'sí';
+  }
+
   login(username: string, password: string, provider = 'local') {
     this.loading.set(true);
     return this.http.post<any>(`${environment.apiUrl}/auth/login`, { username, password, provider });
@@ -29,7 +35,7 @@ export class AuthService {
     if (!res?.token) return;
     const user = {
       ...res.user,
-      mustChangePassword: !!(res.mustChangePassword || res.user?.mustChangePassword)
+      mustChangePassword: this.toBoolean(res.mustChangePassword ?? res.user?.mustChangePassword)
     };
     localStorage.setItem('pyflow_token', res.token);
     localStorage.setItem('pyflow_user', JSON.stringify(user));
