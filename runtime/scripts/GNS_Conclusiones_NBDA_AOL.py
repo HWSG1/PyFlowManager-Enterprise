@@ -1687,7 +1687,7 @@ def _volume_pct_table(df: pd.DataFrame, field: str, label: str) -> pd.DataFrame:
 def build_client_analysis(
     df_calls: pd.DataFrame,
     df_demo: pd.DataFrame
-) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, pd.DataFrame], Dict[str, pd.DataFrame]]:
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict[str, pd.DataFrame], Dict[str, pd.DataFrame]]:
     detail_columns = [
         "conversationId", "Fecha", "conversationStart", "conversationEnd", "wrapUpCode",
         "Nombre de conclusion", "conclusion", "Banca", "externalTag", "Estado externalTag",
@@ -1696,7 +1696,7 @@ def build_client_analysis(
 
     if df_calls.empty:
         empty_detail = pd.DataFrame(columns=detail_columns)
-        return empty_detail, pd.DataFrame(), {}, {}
+        return empty_detail, pd.DataFrame(), pd.DataFrame(), {}, {}
 
     detail = df_calls.copy()
     detail["externalTag"] = detail["externalTag"].map(normalize_dni)
@@ -1721,34 +1721,65 @@ def build_client_analysis(
             detail[col] = ""
     detail = detail[detail_columns]
 
-    known = detail[detail["externalTag"].astype(str).str.strip().ne("")].copy()
-    recurrence_rows: List[Dict[str, Any]] = []
-    if not known.empty:
+    def build_recurrence_table(source: pd.DataFrame, group_cols: List[str]) -> pd.DataFrame:
+        output_cols = group_cols + [
+            "Clientes únicos",
+            "Llamadas totales",
+            "1 consulta",
+            "2 consultas",
+            "3 consultas",
+            "4+ consultas",
+            "Clientes recurrentes",
+            "% recurrentes"
+        ]
+        if source.empty:
+            return pd.DataFrame(columns=output_cols)
+
+        rows: List[Dict[str, Any]] = []
         per_client = (
-            known.groupby(["conclusion", "externalTag"], dropna=False)
+            source.groupby(group_cols + ["externalTag"], dropna=False)
             .agg(consultas=("conversationId", "nunique"))
             .reset_index()
         )
-        for conclusion, group in per_client.groupby("conclusion", dropna=False):
-            calls_total = int(known.loc[known["conclusion"] == conclusion, "conversationId"].nunique())
+        for keys, group in per_client.groupby(group_cols, dropna=False):
+            if not isinstance(keys, tuple):
+                keys = (keys,)
+            mask = pd.Series(True, index=source.index)
+            row: Dict[str, Any] = {}
+            for col, value in zip(group_cols, keys):
+                mask = mask & (source[col] == value)
+                row[col] = value
+
+            calls_total = int(source.loc[mask, "conversationId"].nunique())
             unique_clients = int(group["externalTag"].nunique())
             c1 = int((group["consultas"] == 1).sum())
             c2 = int((group["consultas"] == 2).sum())
             c3 = int((group["consultas"] == 3).sum())
             c4 = int((group["consultas"] >= 4).sum())
             recurrent = c2 + c3 + c4
-            recurrence_rows.append({
-                "Conclusión": conclusion,
+            row.update({
                 "Clientes únicos": unique_clients,
                 "Llamadas totales": calls_total,
                 "1 consulta": c1,
                 "2 consultas": c2,
                 "3 consultas": c3,
                 "4+ consultas": c4,
+                "Clientes recurrentes": recurrent,
                 "% recurrentes": recurrent / unique_clients if unique_clients else 0
             })
+            rows.append(row)
 
-    recurrence = pd.DataFrame(recurrence_rows)
+        result = pd.DataFrame(rows, columns=output_cols)
+        if not result.empty:
+            result = result.sort_values(["Clientes recurrentes", "Llamadas totales"], ascending=[False, False])
+        return result
+
+    known = detail[detail["externalTag"].astype(str).str.strip().ne("")].copy()
+    recurrence = build_recurrence_table(known, ["conclusion"]).rename(columns={"conclusion": "Conclusión"})
+    recurrence_by_channel = build_recurrence_table(known, ["Banca", "conclusion"]).rename(columns={
+        "Banca": "Canal",
+        "conclusion": "Conclusion"
+    })
     if not recurrence.empty:
         recurrence["_clientes recurrentes"] = (
             pd.to_numeric(recurrence["2 consultas"], errors="coerce").fillna(0)
@@ -1769,7 +1800,7 @@ def build_client_analysis(
         field: _volume_pct_table(detail, field, field)
         for field in ["GENERACION_CLIENTE", "GENERO", "RANGO_FECHA_ACTUALIZACION", "SEGMENTO_BANCA", "ESTADO_CIVIL"]
     }
-    return detail, recurrence, location_tables, demographic_tables
+    return detail, recurrence, recurrence_by_channel, location_tables, demographic_tables
 
 
 def build_summary(df: pd.DataFrame) -> pd.DataFrame:
@@ -2083,6 +2114,7 @@ def create_excel(
     logger: logging.Logger,
     df_client_detail: Optional[pd.DataFrame] = None,
     df_recurrence: Optional[pd.DataFrame] = None,
+    df_recurrence_by_channel: Optional[pd.DataFrame] = None,
     location_tables: Optional[Dict[str, pd.DataFrame]] = None,
     demographic_tables: Optional[Dict[str, pd.DataFrame]] = None
 ) -> Path:
@@ -2093,6 +2125,8 @@ def create_excel(
         df_summary.to_excel(writer, sheet_name="Resumen", index=False)
         safe_recurrence = df_recurrence if df_recurrence is not None else pd.DataFrame()
         safe_recurrence.to_excel(writer, sheet_name="Recurrencia", index=False)
+        safe_recurrence_by_channel = df_recurrence_by_channel if df_recurrence_by_channel is not None else pd.DataFrame()
+        safe_recurrence_by_channel.to_excel(writer, sheet_name="Recurrencia por canal", index=False)
         _write_sectioned_tables(writer, "Ubicación", location_tables or {})
         _write_sectioned_tables(writer, "Demografía", demographic_tables or {})
 
@@ -2100,7 +2134,7 @@ def create_excel(
         for sheet_name in list(wb.sheetnames):
             _format_excel_sheet(wb[sheet_name])
 
-        for sheet_name in ["Resumen", "Recurrencia"]:
+        for sheet_name in ["Resumen", "Recurrencia", "Recurrencia por canal"]:
             if sheet_name not in wb.sheetnames:
                 continue
             ws = wb[sheet_name]
@@ -2229,6 +2263,7 @@ def _mini_metric_rows(df: Optional[pd.DataFrame], label_col: str, value_col: str
 def build_client_executive_email_block(
     df_client_detail: Optional[pd.DataFrame],
     df_recurrence: Optional[pd.DataFrame],
+    df_recurrence_by_channel: Optional[pd.DataFrame],
     location_tables: Optional[Dict[str, pd.DataFrame]],
     demographic_tables: Optional[Dict[str, pd.DataFrame]]
 ) -> str:
@@ -2247,6 +2282,19 @@ def build_client_executive_email_block(
         per_client = identified.groupby("externalTag")["conversationId"].nunique()
         recurrent_clients = int((per_client > 1).sum())
         recurrent_pct = recurrent_clients / unique_clients if unique_clients else 0.0
+
+    def channel_recurrence(canal: str) -> Tuple[int, int, float]:
+        if df_recurrence_by_channel is None or df_recurrence_by_channel.empty or "Canal" not in df_recurrence_by_channel.columns:
+            return 0, 0, 0.0
+        rows = df_recurrence_by_channel[df_recurrence_by_channel["Canal"].astype(str).str.upper() == canal.upper()]
+        if rows.empty:
+            return 0, 0, 0.0
+        clients = int(pd.to_numeric(rows.get("Clientes únicos", 0), errors="coerce").fillna(0).sum())
+        recurrent = int(pd.to_numeric(rows.get("Clientes recurrentes", 0), errors="coerce").fillna(0).sum())
+        return clients, recurrent, recurrent / clients if clients else 0.0
+
+    aol_clients, aol_recurrent, aol_recurrent_pct = channel_recurrence("AOL")
+    nbda_clients, nbda_recurrent, nbda_recurrent_pct = channel_recurrence("NBDA")
 
     top_recurrence = pd.DataFrame()
     if df_recurrence is not None and not df_recurrence.empty:
@@ -2334,6 +2382,7 @@ def _email_rows_with_bars(df: Optional[pd.DataFrame], label_col: str, value_col:
 def build_client_executive_email_block(
     df_client_detail: Optional[pd.DataFrame],
     df_recurrence: Optional[pd.DataFrame],
+    df_recurrence_by_channel: Optional[pd.DataFrame],
     location_tables: Optional[Dict[str, pd.DataFrame]],
     demographic_tables: Optional[Dict[str, pd.DataFrame]]
 ) -> str:
@@ -2352,6 +2401,19 @@ def build_client_executive_email_block(
         per_client = identified.groupby("externalTag")["conversationId"].nunique()
         recurrent_clients = int((per_client > 1).sum())
         recurrent_pct = recurrent_clients / unique_clients if unique_clients else 0.0
+
+    def channel_recurrence(canal: str) -> Tuple[int, int, float]:
+        if df_recurrence_by_channel is None or df_recurrence_by_channel.empty or "Canal" not in df_recurrence_by_channel.columns:
+            return 0, 0, 0.0
+        rows = df_recurrence_by_channel[df_recurrence_by_channel["Canal"].astype(str).str.upper() == canal.upper()]
+        if rows.empty:
+            return 0, 0, 0.0
+        clients = int(pd.to_numeric(rows.get("Clientes únicos", 0), errors="coerce").fillna(0).sum())
+        recurrent = int(pd.to_numeric(rows.get("Clientes recurrentes", 0), errors="coerce").fillna(0).sum())
+        return clients, recurrent, recurrent / clients if clients else 0.0
+
+    aol_clients, aol_recurrent, aol_recurrent_pct = channel_recurrence("AOL")
+    nbda_clients, nbda_recurrent, nbda_recurrent_pct = channel_recurrence("NBDA")
 
     top_recurrence = pd.DataFrame()
     if df_recurrence is not None and not df_recurrence.empty:
@@ -2401,6 +2463,16 @@ def build_client_executive_email_block(
                   </td>
                 </tr>
                 <tr>
+                  <td width="50%" colspan="2" style="padding:12px 12px 12px 22px;font-family:Segoe UI,Arial,sans-serif;border-top:1px solid #e2e8f0;">
+                    <div style="font-size:10px;color:#475569;text-transform:uppercase;font-weight:700;letter-spacing:.4px;">Recurrencia AOL</div>
+                    <div style="font-size:20px;color:#DA282D;font-weight:800;line-height:1.15;">{format_pct(aol_recurrent_pct)} <span style="font-size:12px;color:#64748b;font-weight:500;">({format_int(aol_recurrent)} de {format_int(aol_clients)} clientes)</span></div>
+                  </td>
+                  <td width="50%" style="padding:12px 22px 12px 12px;font-family:Segoe UI,Arial,sans-serif;border-top:1px solid #e2e8f0;">
+                    <div style="font-size:10px;color:#475569;text-transform:uppercase;font-weight:700;letter-spacing:.4px;">Recurrencia NBDA</div>
+                    <div style="font-size:20px;color:#0f172a;font-weight:800;line-height:1.15;">{format_pct(nbda_recurrent_pct)} <span style="font-size:12px;color:#64748b;font-weight:500;">({format_int(nbda_recurrent)} de {format_int(nbda_clients)} clientes)</span></div>
+                  </td>
+                </tr>
+                <tr>
                   <td valign="top" width="50%" colspan="2" style="padding:16px 24px 8px 22px;border-top:1px solid #e2e8f0;">
                     <div style="font-family:Segoe UI,Arial,sans-serif;font-size:12px;font-weight:800;color:#0f172a;text-transform:uppercase;border-bottom:2px solid #DA282D;padding-bottom:5px;">Top recurrencia</div>
                     <table width="100%" cellpadding="0" cellspacing="0">{_email_rows_with_bars(top_recurrence, "Conclusion", "Llamadas", bar_color="#DA282D")}</table>
@@ -2429,6 +2501,7 @@ def build_email_metrics(
     include_table: bool,
     df_client_detail: Optional[pd.DataFrame] = None,
     df_recurrence: Optional[pd.DataFrame] = None,
+    df_recurrence_by_channel: Optional[pd.DataFrame] = None,
     location_tables: Optional[Dict[str, pd.DataFrame]] = None,
     demographic_tables: Optional[Dict[str, pd.DataFrame]] = None
 ) -> Dict[str, str]:
@@ -2468,6 +2541,7 @@ def build_email_metrics(
         "CLIENT_EXECUTIVE_BLOCK": build_client_executive_email_block(
             df_client_detail,
             df_recurrence,
+            df_recurrence_by_channel,
             location_tables,
             demographic_tables
         ),
@@ -2483,6 +2557,7 @@ def render_email_html(
     include_table: bool,
     df_client_detail: Optional[pd.DataFrame] = None,
     df_recurrence: Optional[pd.DataFrame] = None,
+    df_recurrence_by_channel: Optional[pd.DataFrame] = None,
     location_tables: Optional[Dict[str, pd.DataFrame]] = None,
     demographic_tables: Optional[Dict[str, pd.DataFrame]] = None
 ) -> str:
@@ -2491,6 +2566,7 @@ def render_email_html(
         include_table=include_table,
         df_client_detail=df_client_detail,
         df_recurrence=df_recurrence,
+        df_recurrence_by_channel=df_recurrence_by_channel,
         location_tables=location_tables,
         demographic_tables=demographic_tables
     )
@@ -2662,6 +2738,7 @@ def main() -> int:
     output_path: Optional[Path] = None
     df_client_detail: Optional[pd.DataFrame] = None
     df_recurrence: Optional[pd.DataFrame] = None
+    df_recurrence_by_channel: Optional[pd.DataFrame] = None
     location_tables: Optional[Dict[str, pd.DataFrame]] = None
     demographic_tables: Optional[Dict[str, pd.DataFrame]] = None
 
@@ -2738,9 +2815,10 @@ def main() -> int:
                     )
                     df_demo = pd.DataFrame(columns=["ETIQUETA_EXTERNA"] + DEMOGRAPHIC_COLUMNS)
 
-                df_client_detail, df_recurrence, location_tables, demographic_tables = build_client_analysis(df_calls, df_demo)
+                df_client_detail, df_recurrence, df_recurrence_by_channel, location_tables, demographic_tables = build_client_analysis(df_calls, df_demo)
                 logger.info("Detalle Clientes generado: %s filas", 0 if df_client_detail is None else len(df_client_detail))
                 logger.info("Recurrencia generada: %s filas", 0 if df_recurrence is None else len(df_recurrence))
+                logger.info("Recurrencia por canal generada: %s filas", 0 if df_recurrence_by_channel is None else len(df_recurrence_by_channel))
             except Exception as detail_exc:
                 logger.exception(
                     "No se pudo construir recurrencia/ubicacion/demografia. El reporte base continuara: %s",
@@ -2748,10 +2826,12 @@ def main() -> int:
                 )
                 df_client_detail = pd.DataFrame()
                 df_recurrence = pd.DataFrame()
+                df_recurrence_by_channel = pd.DataFrame()
                 location_tables = {}
                 demographic_tables = {}
         else:
             logger.info("Analisis de clientes omitido por parametro INCLUDE_CLIENT_ANALYSIS=false.")
+            df_recurrence_by_channel = pd.DataFrame()
 
         timestamp = datetime.now(ZoneInfo(config.timezone_name)).strftime("%Y%m%d_%H%M%S")
         output_path = Path(config.output_dir) / f"Reporte_Conclusiones_NBDA_AOL_{timestamp}.xlsx"
@@ -2763,6 +2843,7 @@ def main() -> int:
             logger,
             df_client_detail=df_client_detail,
             df_recurrence=df_recurrence,
+            df_recurrence_by_channel=df_recurrence_by_channel,
             location_tables=location_tables,
             demographic_tables=demographic_tables
         )
@@ -2789,6 +2870,7 @@ def main() -> int:
                     include_table=include_summary_table,
                     df_client_detail=df_client_detail,
                     df_recurrence=df_recurrence,
+                    df_recurrence_by_channel=df_recurrence_by_channel,
                     location_tables=location_tables,
                     demographic_tables=demographic_tables
                 )

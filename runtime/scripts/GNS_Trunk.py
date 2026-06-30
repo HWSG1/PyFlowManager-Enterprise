@@ -200,6 +200,24 @@ def parse_genesys_datetime(value: Any) -> Optional[datetime]:
     return parsed.astimezone(timezone.utc)
 
 
+def conversation_duration_seconds(start_value: Any, end_value: Any) -> int:
+    start_dt = parse_genesys_datetime(start_value)
+    end_dt = parse_genesys_datetime(end_value)
+    if not start_dt or not end_dt or end_dt <= start_dt:
+        return 0
+    return int((end_dt - start_dt).total_seconds())
+
+
+def seconds_to_hhmmss(seconds: Any) -> str:
+    try:
+        total = int(float(seconds or 0))
+    except Exception:
+        total = 0
+    hours, rem = divmod(max(total, 0), 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
 def split_numbers(value: str) -> Set[str]:
     out: Set[str] = set()
     for part in clean_value(value).split(","):
@@ -879,11 +897,15 @@ def extract_conversations_for_range_job(
             edge_ids = "; ".join(sorted(vals.get("edge_ids", set())))
             peer_ids = "; ".join(sorted(vals.get("peer_ids", set())))
             providers = "; ".join(sorted(vals.get("providers", set())))
+            duration_seconds = conversation_duration_seconds(conv.get("conversationStart"), conv.get("conversationEnd"))
 
             rows.append({
                 "conversationId": conv_id,
                 "conversationStart": conv.get("conversationStart"),
                 "conversationEnd": conv.get("conversationEnd"),
+                "tiempo_real_segundos": duration_seconds,
+                "tiempo_real_minutos": round(duration_seconds / 60, 4),
+                "tiempo_real_hhmmss": seconds_to_hhmmss(duration_seconds),
                 "division": division,
                 "division_source": division_source,
                 "source_name": source_name,
@@ -1036,45 +1058,70 @@ def export_excel(
     ]
 
     if detail_df.empty:
-        summary_df = pd.DataFrame(columns=["division", "volumen_llamadas"] + base_cols)
-        summary_month_df = pd.DataFrame(columns=["anio", "mes_num", "mes", "periodo", "division", "volumen_llamadas"] + base_cols)
+        duration_cols = ["tiempo_real_segundos", "tiempo_real_minutos", "tiempo_real_hhmmss"]
+        summary_df = pd.DataFrame(columns=["division", "volumen_llamadas"] + duration_cols + base_cols)
+        summary_month_df = pd.DataFrame(columns=["anio", "mes_num", "mes", "periodo", "division", "volumen_llamadas"] + duration_cols + base_cols)
         pivot_df = pd.DataFrame()
     else:
-        unique_detail = detail_df.drop_duplicates(subset=["conversationId"])
+        unique_detail = detail_df.drop_duplicates(subset=["conversationId"]).copy()
+        unique_detail["tiempo_real_segundos"] = pd.to_numeric(
+            unique_detail.get("tiempo_real_segundos", 0),
+            errors="coerce"
+        ).fillna(0).astype(int)
 
         # Resumen general por división
         summary_df = (
             unique_detail
             .groupby("division", dropna=False)
-            .agg(volumen_llamadas=("conversationId", "nunique"))
+            .agg(
+                volumen_llamadas=("conversationId", "nunique"),
+                tiempo_real_segundos=("tiempo_real_segundos", "sum")
+            )
             .reset_index()
             .sort_values(["volumen_llamadas", "division"], ascending=[False, True])
         )
+        summary_df["tiempo_real_minutos"] = (summary_df["tiempo_real_segundos"] / 60).round(4)
+        summary_df["tiempo_real_hhmmss"] = summary_df["tiempo_real_segundos"].map(seconds_to_hhmmss)
 
         # Resumen mensual por división
         summary_month_df = (
             unique_detail
             .groupby(["anio", "mes_num", "mes", "periodo", "division"], dropna=False)
-            .agg(volumen_llamadas=("conversationId", "nunique"))
+            .agg(
+                volumen_llamadas=("conversationId", "nunique"),
+                tiempo_real_segundos=("tiempo_real_segundos", "sum")
+            )
             .reset_index()
             .sort_values(["anio", "mes_num", "division"], ascending=[True, True, True])
         )
+        summary_month_df["tiempo_real_minutos"] = (summary_month_df["tiempo_real_segundos"] / 60).round(4)
+        summary_month_df["tiempo_real_hhmmss"] = summary_month_df["tiempo_real_segundos"].map(seconds_to_hhmmss)
 
         # Matriz tipo tabla dinámica: filas Mes, columnas División
         pivot_df = (
             summary_month_df.pivot_table(
                 index=["anio", "mes_num", "mes", "periodo"],
                 columns="division",
-                values="volumen_llamadas",
+                values=["volumen_llamadas", "tiempo_real_minutos"],
                 aggfunc="sum",
                 fill_value=0
             )
             .reset_index()
             .sort_values(["anio", "mes_num"])
         )
-        pivot_df.columns = [str(c) for c in pivot_df.columns]
+        pivot_df.columns = [
+            "_".join([str(part) for part in c if str(part)])
+            if isinstance(c, tuple)
+            else str(c)
+            for c in pivot_df.columns
+        ]
         if len(pivot_df.columns) > 4:
-            pivot_df["Total general"] = pivot_df.iloc[:, 4:].sum(axis=1)
+            volume_cols = [c for c in pivot_df.columns if c.startswith("volumen_llamadas_")]
+            minute_cols = [c for c in pivot_df.columns if c.startswith("tiempo_real_minutos_")]
+            if volume_cols:
+                pivot_df["volumen_llamadas_Total general"] = pivot_df[volume_cols].sum(axis=1)
+            if minute_cols:
+                pivot_df["tiempo_real_minutos_Total general"] = pivot_df[minute_cols].sum(axis=1).round(4)
 
         for k, v in meta.items():
             summary_df[k] = v
@@ -1082,8 +1129,24 @@ def export_excel(
         summary_df["modo_filtro"] = filter_mode
         summary_month_df["modo_filtro"] = filter_mode
 
+        summary_df = summary_df[
+            ["division", "volumen_llamadas", "tiempo_real_segundos", "tiempo_real_minutos", "tiempo_real_hhmmss"]
+            + base_cols
+        ]
+        summary_month_df = summary_month_df[
+            ["anio", "mes_num", "mes", "periodo", "division", "volumen_llamadas", "tiempo_real_segundos", "tiempo_real_minutos", "tiempo_real_hhmmss"]
+            + base_cols
+        ]
+
         # Total general como fila final en resumen general
-        total_row = {"division": "TOTAL GENERAL", "volumen_llamadas": int(unique_detail["conversationId"].nunique())}
+        total_duration = int(unique_detail["tiempo_real_segundos"].sum())
+        total_row = {
+            "division": "TOTAL GENERAL",
+            "volumen_llamadas": int(unique_detail["conversationId"].nunique()),
+            "tiempo_real_segundos": total_duration,
+            "tiempo_real_minutos": round(total_duration / 60, 4),
+            "tiempo_real_hhmmss": seconds_to_hhmmss(total_duration)
+        }
         for k, v in meta.items():
             total_row[k] = v
         total_row["modo_filtro"] = filter_mode
@@ -1182,6 +1245,7 @@ def export_excel(
             if detail_export.empty:
                 detail_export = pd.DataFrame(columns=[
                     "conversationId", "conversationStart", "conversationEnd", "anio", "mes_num", "mes", "periodo", "division",
+                    "tiempo_real_segundos", "tiempo_real_minutos", "tiempo_real_hhmmss",
                     "division_source", "source_name", "direction", "ani", "dnis",
                     "trunk_name", "match_method", "edge_ids", "peer_ids", "providers", "job_id", "interval"
                 ])
