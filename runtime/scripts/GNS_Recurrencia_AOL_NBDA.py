@@ -1720,7 +1720,7 @@ def build_client_analysis(
         "conversationId", "Fecha", "conversationStart", "conversationEnd",
         "Duración segundos", "Duración minutos",
         "wrapUpCode", "Nombre de conclusion", "conclusion", "Banca", "externalTag", "Estado externalTag",
-        "Estado HANA"
+        "FLAG_RECURRENTE", "Estado HANA"
     ] + DEMOGRAPHIC_COLUMNS
 
     if df_calls.empty:
@@ -1745,6 +1745,22 @@ def build_client_analysis(
         else ("Encontrado en HANA" if normalize_dni(row.get("ETIQUETA_EXTERNA")) else "No encontrado"),
         axis=1
     )
+
+    # FLAG_RECURRENTE:
+    # 1 = el cliente llamó más de una vez dentro del mismo canal (AOL o NBDA).
+    # 0 = el cliente no es recurrente en ese canal o no tiene externalTag/DNI.
+    if {"Banca", "externalTag", "conversationId"}.issubset(detail.columns):
+        valid_recurrence = detail["externalTag"].astype(str).str.strip().ne("")
+        calls_by_channel_client = (
+            detail.loc[valid_recurrence]
+            .groupby(["Banca", "externalTag"], dropna=False)["conversationId"]
+            .transform("nunique")
+        )
+        detail["FLAG_RECURRENTE"] = 0
+        detail.loc[valid_recurrence, "FLAG_RECURRENTE"] = calls_by_channel_client.gt(1).astype(int).values
+    else:
+        detail["FLAG_RECURRENTE"] = 0
+
     for col in detail_columns:
         if col not in detail.columns:
             detail[col] = ""
