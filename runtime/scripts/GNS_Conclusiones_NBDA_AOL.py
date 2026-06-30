@@ -1775,10 +1775,10 @@ def build_client_analysis(
         return result
 
     known = detail[detail["externalTag"].astype(str).str.strip().ne("")].copy()
-    recurrence = build_recurrence_table(known, ["conclusion"]).rename(columns={"conclusion": "Conclusión"})
-    recurrence_by_channel = build_recurrence_table(known, ["Banca", "conclusion"]).rename(columns={
+    recurrence = build_recurrence_table(known, ["Nombre de conclusion"]).rename(columns={"Nombre de conclusion": "Conclusión"})
+    recurrence_by_channel = build_recurrence_table(known, ["Banca", "Nombre de conclusion"]).rename(columns={
         "Banca": "Canal",
-        "conclusion": "Conclusion"
+        "Nombre de conclusion": "Conclusion"
     })
     if not recurrence.empty:
         recurrence["_clientes recurrentes"] = (
