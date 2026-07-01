@@ -14,6 +14,7 @@ export class AuthService {
   constructor(private http: HttpClient, private themes: ThemeService) {
     const theme = this.user()?.theme;
     if (theme) this.themes.setTheme(theme, false);
+    window.addEventListener('pyflow:session-expired', () => this.clearSession());
   }
 
   isAuthenticated() { return !!this.token(); }
@@ -47,12 +48,17 @@ export class AuthService {
   }
 
   logout() {
+    this.clearSession();
+  }
+
+  private clearSession() {
     localStorage.removeItem('pyflow_token');
     localStorage.removeItem('pyflow_user');
     this.token.set(null);
     this.user.set(null);
     this.mustChangePassword.set(false);
     this.showChangePasswordModal.set(false);
+    this.loading.set(false);
   }
 
   forgotPassword(email: string, channel = 'email') {
