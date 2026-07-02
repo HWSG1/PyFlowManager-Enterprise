@@ -197,6 +197,13 @@ PYFLOW_PARAMS = {
         "options": ["true", "false"],
         "default": "true"
     },
+    "INCLUDE_TRANSCRIPT_ANALYSIS": {
+        "type": "select",
+        "label": "Incluir análisis de transcripciones de llamadas",
+        "required": True,
+        "options": ["true", "false"],
+        "default": "false"
+    },
     "HPR_HOST_ESPEJO": {
         "type": "global",
         "global_key": "HPR_HOST_ESPEJO",
@@ -1448,12 +1455,58 @@ def split_communication_ids(value: Any) -> List[str]:
     return [part.strip() for part in str(value).split(";") if part.strip()]
 
 
-def get_transcript_signed_url(config: Config, token: str, conversation_id: str, communication_id: str) -> str:
+def get_transcript_signed_url(
+    config: Config,
+    token: str,
+    conversation_id: str,
+    communication_id: str,
+    logger: Optional[logging.Logger] = None
+) -> str:
     url = (
         f"{config.genesys_region_base_url}/api/v2/speechandtextanalytics/"
         f"conversations/{conversation_id}/communications/{communication_id}/transcripturl"
     )
-    response = requests.get(url, headers=genesys_headers(token), timeout=config.request_timeout)
+    retries = max(1, env_int("TRANSCRIPT_MAX_RETRIES", 3))
+    timeout = max(5, min(config.request_timeout, env_int("TRANSCRIPT_REQUEST_TIMEOUT", 30)))
+    last_exc: Optional[Exception] = None
+    response: Optional[requests.Response] = None
+    for attempt in range(1, retries + 1):
+        try:
+            response = requests.get(url, headers=genesys_headers(token), timeout=timeout)
+            if response.status_code == 404:
+                raise TranscriptNotFound(f"Transcript no disponible para communicationId={communication_id}")
+            if response.status_code == 429 or response.status_code >= 500:
+                wait_seconds = min(30, attempt * 3)
+                if logger:
+                    logger.warning(
+                        "Transcript URL HTTP %s | intento %s/%s | conversationId=%s | esperando %ss",
+                        response.status_code,
+                        attempt,
+                        retries,
+                        conversation_id,
+                        wait_seconds,
+                    )
+                time.sleep(wait_seconds)
+                continue
+            break
+        except TranscriptNotFound:
+            raise
+        except Exception as exc:
+            last_exc = exc
+            wait_seconds = min(30, attempt * 3)
+            if logger:
+                logger.warning(
+                    "Error obteniendo URL transcript | intento %s/%s | conversationId=%s | communicationId=%s | %s",
+                    attempt,
+                    retries,
+                    conversation_id,
+                    communication_id,
+                    exc,
+                )
+            if attempt < retries:
+                time.sleep(wait_seconds)
+    if response is None:
+        raise RuntimeError(f"No se pudo solicitar URL de transcript: {last_exc}")
     if response.status_code == 404:
         raise TranscriptNotFound(f"Transcript no disponible para communicationId={communication_id}")
     if response.status_code >= 400:
@@ -1465,8 +1518,34 @@ def get_transcript_signed_url(config: Config, token: str, conversation_id: str, 
     return signed_url
 
 
-def download_transcript_json(config: Config, signed_url: str) -> Any:
-    response = requests.get(signed_url, timeout=config.request_timeout)
+def download_transcript_json(
+    config: Config,
+    signed_url: str,
+    logger: Optional[logging.Logger] = None
+) -> Any:
+    retries = max(1, env_int("TRANSCRIPT_MAX_RETRIES", 3))
+    timeout = max(5, min(config.request_timeout, env_int("TRANSCRIPT_REQUEST_TIMEOUT", 30)))
+    last_exc: Optional[Exception] = None
+    response: Optional[requests.Response] = None
+    for attempt in range(1, retries + 1):
+        try:
+            response = requests.get(signed_url, timeout=timeout)
+            if response.status_code == 429 or response.status_code >= 500:
+                wait_seconds = min(30, attempt * 3)
+                if logger:
+                    logger.warning("Descarga transcript HTTP %s | intento %s/%s | esperando %ss", response.status_code, attempt, retries, wait_seconds)
+                time.sleep(wait_seconds)
+                continue
+            break
+        except Exception as exc:
+            last_exc = exc
+            wait_seconds = min(30, attempt * 3)
+            if logger:
+                logger.warning("Error descargando transcript | intento %s/%s | %s", attempt, retries, exc)
+            if attempt < retries:
+                time.sleep(wait_seconds)
+    if response is None:
+        raise RuntimeError(f"No se pudo descargar transcript: {last_exc}")
     response.raise_for_status()
     try:
         return response.json()
@@ -1602,8 +1681,23 @@ def fetch_recurrent_nbda_transcriptions(
     missing_count = 0
     error_count = 0
     transcript_cache: Dict[Tuple[str, str], Tuple[str, int, str, str]] = {}
+    total_recurrent_rows = len(recurrent)
+    log_every = max(1, env_int("TRANSCRIPT_LOG_EVERY", 25))
+    transcript_sleep_seconds = max(0.0, env_float("TRANSCRIPT_API_SLEEP_SECONDS", 0.2))
 
-    for _, row in recurrent.iterrows():
+    for processed, (_, row) in enumerate(recurrent.iterrows(), start=1):
+        if processed == 1 or processed % log_every == 0 or processed == total_recurrent_rows:
+            progress = 70 + int((processed / max(total_recurrent_rows, 1)) * 25)
+            print(f"PYFLOW_PROGRESS={min(progress, 95)}", flush=True)
+            logger.info(
+                "Transcripciones NBDA avance: %s/%s | OK=%s | sin transcript=%s | errores=%s",
+                processed,
+                total_recurrent_rows,
+                ok_count,
+                missing_count,
+                error_count,
+            )
+
         conversation_id = str(row.get("conversationId") or "").strip()
         communication_ids = split_communication_ids(row.get("communicationIds"))
         if not communication_ids:
@@ -1618,8 +1712,8 @@ def fetch_recurrent_nbda_transcriptions(
             cache_key = (conversation_id, communication_id)
             try:
                 if cache_key not in transcript_cache:
-                    signed_url = get_transcript_signed_url(config, token, conversation_id, communication_id)
-                    transcript_json = download_transcript_json(config, signed_url)
+                    signed_url = get_transcript_signed_url(config, token, conversation_id, communication_id, logger)
+                    transcript_json = download_transcript_json(config, signed_url, logger)
                     transcript_cache[cache_key] = transcript_to_text(transcript_json)
                 text, phrases_count, _, _ = transcript_cache[cache_key]
                 if text.strip():
@@ -1653,7 +1747,8 @@ def fetch_recurrent_nbda_transcriptions(
             "Flag motivo repetido respecto a llamadas anteriores": "",
             "phrases_count": phrases_total,
         })
-        time.sleep(config.api_sleep_seconds)
+        if transcript_sleep_seconds:
+            time.sleep(transcript_sleep_seconds)
 
     transcripts = pd.DataFrame(transcript_rows, columns=transcript_columns)
     if not transcripts.empty:
@@ -2518,11 +2613,11 @@ def create_excel(
         safe_client_detail = df_client_detail if df_client_detail is not None else pd.DataFrame()
         safe_client_detail.to_excel(writer, sheet_name="Detalle Clientes", index=False)
 
-        safe_nbda_analysis = df_nbda_recurrence_analysis if df_nbda_recurrence_analysis is not None else pd.DataFrame()
-        safe_nbda_analysis.to_excel(writer, sheet_name="Analisis_Recurrencia_NBDA", index=False)
+        if df_nbda_recurrence_analysis is not None:
+            df_nbda_recurrence_analysis.to_excel(writer, sheet_name="Analisis_Recurrencia_NBDA", index=False)
 
-        safe_nbda_transcriptions = df_nbda_transcriptions if df_nbda_transcriptions is not None else pd.DataFrame()
-        safe_nbda_transcriptions.to_excel(writer, sheet_name="Transcrip_Recurrentes_NBDA", index=False)
+        if df_nbda_transcriptions is not None:
+            df_nbda_transcriptions.to_excel(writer, sheet_name="Transcrip_Recurrentes_NBDA", index=False)
 
         _write_sectioned_tables(writer, "Ubicación", location_tables or {})
         _write_sectioned_tables(writer, "Demografía", demographic_tables or {})
@@ -3028,7 +3123,7 @@ def build_email_metrics(
             df_recurrence_by_channel,
             location_tables,
             demographic_tables
-        ) + build_nbda_recurrence_email_block(df_nbda_recurrence_analysis),
+        ) + (build_nbda_recurrence_email_block(df_nbda_recurrence_analysis) if df_nbda_recurrence_analysis is not None else ""),
         "FIRMA": env_str("EMAIL_SIGNATURE", "Odair Umanzor"),
     }
 
@@ -3245,7 +3340,7 @@ def main() -> int:
             "DATE", "START_DATE", "END_DATE", "START_UTC", "END_UTC", "AUTO_START_DAY",
             "GENESYS_TIMEZONE", "OUTPUT_DIR", "CUT_OFF_TIME", "EMAIL_TO", "EMAIL_CC",
             "EMAIL_SUBJECT", "INCLUDE_SUMMARY_TABLE_IN_EMAIL", "GRAPH_TENANT_ID", "GRAPH_CLIENT_ID",
-            "GRAPH_CLIENT_SECRET", "GRAPH_SENDER_EMAIL", "INCLUDE_CLIENT_ANALYSIS",
+            "GRAPH_CLIENT_SECRET", "GRAPH_SENDER_EMAIL", "INCLUDE_CLIENT_ANALYSIS", "INCLUDE_TRANSCRIPT_ANALYSIS",
             "HPR_HOST_ESPEJO", "HPR_PORT", "HPR_USER", "HPR_PASSWORD",
             "HANA_CLIENT_SCHEMA", "HANA_CLIENT_TABLE", "DETAIL_PAGE_SIZE"
         ])
@@ -3311,12 +3406,18 @@ def main() -> int:
                 logger.info("Detalle Clientes generado: %s filas", 0 if df_client_detail is None else len(df_client_detail))
                 logger.info("Recurrencia generada: %s filas", 0 if df_recurrence is None else len(df_recurrence))
                 logger.info("Recurrencia por canal generada: %s filas", 0 if df_recurrence_by_channel is None else len(df_recurrence_by_channel))
-                df_nbda_recurrence_analysis, df_nbda_transcriptions = fetch_recurrent_nbda_transcriptions(
-                    config,
-                    token,
-                    df_client_detail,
-                    logger
-                )
+                if env_bool("INCLUDE_TRANSCRIPT_ANALYSIS", False):
+                    logger.info("Analisis de transcripciones NBDA habilitado por parametro INCLUDE_TRANSCRIPT_ANALYSIS=true.")
+                    df_nbda_recurrence_analysis, df_nbda_transcriptions = fetch_recurrent_nbda_transcriptions(
+                        config,
+                        token,
+                        df_client_detail,
+                        logger
+                    )
+                else:
+                    logger.info("Analisis de transcripciones NBDA omitido por parametro INCLUDE_TRANSCRIPT_ANALYSIS=false.")
+                    df_nbda_recurrence_analysis = None
+                    df_nbda_transcriptions = None
             except Exception as detail_exc:
                 logger.exception(
                     "No se pudo construir recurrencia/ubicacion/demografia. El reporte base continuara: %s",
@@ -3325,15 +3426,15 @@ def main() -> int:
                 df_client_detail = pd.DataFrame()
                 df_recurrence = pd.DataFrame()
                 df_recurrence_by_channel = pd.DataFrame()
-                df_nbda_recurrence_analysis = pd.DataFrame()
-                df_nbda_transcriptions = pd.DataFrame()
+                df_nbda_recurrence_analysis = None
+                df_nbda_transcriptions = None
                 location_tables = {}
                 demographic_tables = {}
         else:
             logger.info("Analisis de clientes omitido por parametro INCLUDE_CLIENT_ANALYSIS=false.")
             df_recurrence_by_channel = pd.DataFrame()
-            df_nbda_recurrence_analysis = pd.DataFrame()
-            df_nbda_transcriptions = pd.DataFrame()
+            df_nbda_recurrence_analysis = None
+            df_nbda_transcriptions = None
 
         timestamp = datetime.now(ZoneInfo(config.timezone_name)).strftime("%Y%m%d_%H%M%S")
         output_path = Path(config.output_dir) / f"Reporte_Recurrencia_AOL_NBDA_General_{timestamp}.xlsx"
