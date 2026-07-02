@@ -102,6 +102,10 @@ except Exception:
     dbapi = None
 
 
+class TranscriptNotFound(Exception):
+    pass
+
+
 # =========================================================
 # PYFLOW MANAGER PARAMS
 # =========================================================
@@ -1376,6 +1380,19 @@ def extract_external_tag(conversation: Dict[str, Any]) -> str:
     return ""
 
 
+def extract_communication_ids(conversation: Dict[str, Any]) -> List[str]:
+    ids: List[str] = []
+    for participant in conversation.get("participants") or []:
+        for session in participant.get("sessions") or []:
+            media_type = str(session.get("mediaType") or "").lower()
+            if media_type and media_type != "voice":
+                continue
+            value = session.get("sessionId") or session.get("communicationId")
+            if value and str(value) not in ids:
+                ids.append(str(value))
+    return ids
+
+
 def get_last_target_wrapup_for_conversation(
     conversation: Dict[str, Any],
     wrapup_catalog: Dict[str, str]
@@ -1423,6 +1440,263 @@ def calculate_conversation_duration_seconds(start_value: Any, end_value: Any) ->
         return 0.0
 
 
+def split_communication_ids(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return [part.strip() for part in str(value).split(";") if part.strip()]
+
+
+def get_transcript_signed_url(config: Config, token: str, conversation_id: str, communication_id: str) -> str:
+    url = (
+        f"{config.genesys_region_base_url}/api/v2/speechandtextanalytics/"
+        f"conversations/{conversation_id}/communications/{communication_id}/transcripturl"
+    )
+    response = requests.get(url, headers=genesys_headers(token), timeout=config.request_timeout)
+    if response.status_code == 404:
+        raise TranscriptNotFound(f"Transcript no disponible para communicationId={communication_id}")
+    if response.status_code >= 400:
+        raise RuntimeError(f"Transcript URL HTTP {response.status_code}: {response.text[:1000]}")
+    data = response.json() if response.text else {}
+    signed_url = data.get("url") or data.get("transcriptUrl") or data.get("downloadUrl")
+    if not signed_url:
+        raise RuntimeError(f"No se recibio URL de transcript. Respuesta: {data}")
+    return signed_url
+
+
+def download_transcript_json(config: Config, signed_url: str) -> Any:
+    response = requests.get(signed_url, timeout=config.request_timeout)
+    response.raise_for_status()
+    try:
+        return response.json()
+    except Exception:
+        return {"raw": response.text}
+
+
+def transcript_to_text(transcript_json: Any) -> Tuple[str, int, str, str]:
+    segments: List[str] = []
+    phrases_count = 0
+    first_marker = ""
+    last_marker = ""
+
+    def walk(obj: Any) -> None:
+        nonlocal phrases_count, first_marker, last_marker
+        if isinstance(obj, dict):
+            text = obj.get("text") or obj.get("transcript") or obj.get("phrase") or obj.get("utterance")
+            if text and isinstance(text, str):
+                speaker = obj.get("speaker") or obj.get("participantPurpose") or obj.get("channel") or ""
+                marker = obj.get("startTime") or obj.get("start") or obj.get("startOffsetMs") or obj.get("offset") or ""
+                if marker and not first_marker:
+                    first_marker = str(marker)
+                if marker:
+                    last_marker = str(marker)
+                prefix = f"{speaker}: " if speaker else ""
+                segments.append(prefix + " ".join(text.split()))
+                phrases_count += 1
+            for value in obj.values():
+                walk(value)
+        elif isinstance(obj, list):
+            for item in obj:
+                walk(item)
+
+    walk(transcript_json)
+    return "\n".join([item for item in segments if item.strip()]), phrases_count, first_marker, last_marker
+
+
+def classify_call_reason(row: pd.Series, transcript_text: str) -> str:
+    text = f"{row.get('conclusion', '')} {row.get('Nombre de conclusion', '')} {transcript_text or ''}".lower()
+    rules = [
+        ("Cambio de contraseña / acceso", ["contraseña", "contrasena", "password", "clave", "credencial", "no puedo entrar", "login", "ingresar"]),
+        ("Banca móvil / uso de app", ["banca movil", "banca móvil", "app", "aplicacion", "aplicación", "movil", "móvil", "aol movil"]),
+        ("Instalación o activación", ["instalacion", "instalación", "activar", "activacion", "activación", "usuario nuevo"]),
+        ("Token / OTP / sincronización", ["token", "smart token", "otp", "codigo", "código", "sincronizacion", "sincronización"]),
+        ("Transferencias ACH", ["ach", "transferencia", "transferencias"]),
+        ("Página web no funciona", ["pagina web", "página web", "sitio", "portal", "no funciona"]),
+        ("Migración / Atlántida HN", ["migracion", "migración", "atlantida hn", "atlántida hn"]),
+        ("Bloqueo o desbloqueo de usuario", ["bloqueo", "bloqueado", "desbloqueo", "desbloquear"]),
+        ("Actualización de datos", ["actualizacion", "actualización", "datos", "correo", "email"]),
+    ]
+    for label, keywords in rules:
+        if any(keyword in text for keyword in keywords):
+            return label
+    if not str(transcript_text or "").strip():
+        return "Sin transcripción disponible"
+    return str(row.get("conclusion") or row.get("Nombre de conclusion") or "Otro motivo").strip()
+
+
+def build_call_pattern(reasons: List[str], days_count: int) -> str:
+    unique_reasons = [reason for reason in dict.fromkeys(reasons) if reason]
+    if len(unique_reasons) <= 1 and days_count <= 1:
+        return "Rellamada mismo dia por el mismo motivo"
+    if len(unique_reasons) <= 1:
+        return "Rellamada en varios dias por el mismo motivo"
+    if days_count <= 1:
+        return "Varias llamadas el mismo dia por motivos distintos"
+    return "Rellamada en varios dias con motivos distintos"
+
+
+def build_operational_insight(main_reason: str, pattern: str) -> str:
+    if "contraseña" in main_reason.lower() or "acceso" in main_reason.lower():
+        return "Revisar cierre efectivo del caso de acceso y confirmar que el cliente puede ingresar antes de finalizar."
+    if "banca móvil" in main_reason.lower() or "app" in main_reason.lower():
+        return "Validar guion de soporte de app y pasos posteriores al cambio de acceso."
+    if "token" in main_reason.lower() or "otp" in main_reason.lower():
+        return "Reforzar diagnóstico de token/OTP y validar sincronización antes del cierre."
+    if "varios dias" in pattern.lower():
+        return "Dar seguimiento proactivo a clientes que vuelven en días distintos."
+    return "Revisar la trazabilidad del caso para identificar oportunidad de resolución en primer contacto."
+
+
+def fetch_recurrent_nbda_transcriptions(
+    config: Config,
+    token: str,
+    df_client_detail: Optional[pd.DataFrame],
+    logger: logging.Logger
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    transcript_columns = [
+        "Cliente / Identificador cliente", "ConversationId", "CommunicationId", "Fecha/hora de llamada",
+        "Canal", "Conclusión original", "Numero llamada cliente en dia", "Numero llamada cliente en periodo",
+        "Texto/transcripción completa", "Motivo detectado para esa llamada",
+        "Flag motivo repetido respecto a llamadas anteriores", "phrases_count"
+    ]
+    analysis_columns = [
+        "Cliente / Identificador cliente", "Total llamadas recurrentes NBDA", "Fechas de llamadas",
+        "Cantidad de días con recurrencia", "Motivo principal identificado", "Motivos secundarios",
+        "Patrón detectado", "Resumen del caso", "Recomendación / insight"
+    ]
+    if df_client_detail is None or df_client_detail.empty:
+        logger.info("Analisis NBDA recurrente omitido: no hay detalle de clientes.")
+        return pd.DataFrame(columns=analysis_columns), pd.DataFrame(columns=transcript_columns)
+
+    required = {"Banca", "externalTag", "conversationId"}
+    if not required.issubset(df_client_detail.columns):
+        logger.warning("Analisis NBDA recurrente omitido: faltan columnas %s", sorted(required - set(df_client_detail.columns)))
+        return pd.DataFrame(columns=analysis_columns), pd.DataFrame(columns=transcript_columns)
+
+    nbda = df_client_detail[
+        df_client_detail["Banca"].astype(str).str.upper().eq("NBDA")
+        & df_client_detail["externalTag"].astype(str).str.strip().ne("")
+    ].copy()
+    if nbda.empty:
+        logger.info("No se encontraron llamadas NBDA con cliente identificado.")
+        return pd.DataFrame(columns=analysis_columns), pd.DataFrame(columns=transcript_columns)
+
+    per_client = nbda.groupby("externalTag")["conversationId"].nunique()
+    recurrent_tags = set(per_client[per_client > 1].index.astype(str))
+    recurrent = nbda[nbda["externalTag"].astype(str).isin(recurrent_tags)].copy()
+    logger.info("Clientes recurrentes NBDA detectados: %s", len(recurrent_tags))
+    logger.info("Llamadas NBDA recurrentes detectadas: %s", recurrent["conversationId"].nunique() if not recurrent.empty else 0)
+
+    if recurrent.empty:
+        return pd.DataFrame(columns=analysis_columns), pd.DataFrame(columns=transcript_columns)
+
+    recurrent["Fecha_dt"] = pd.to_datetime(recurrent.get("Fecha", ""), errors="coerce")
+    recurrent["Dia"] = recurrent["Fecha_dt"].dt.strftime("%Y-%m-%d").fillna("")
+    recurrent = recurrent.sort_values(["externalTag", "Fecha_dt", "conversationId"])
+    recurrent["Numero llamada cliente en periodo"] = recurrent.groupby("externalTag").cumcount() + 1
+    recurrent["Numero llamada cliente en dia"] = recurrent.groupby(["externalTag", "Dia"]).cumcount() + 1
+
+    transcript_rows: List[Dict[str, Any]] = []
+    ok_count = 0
+    missing_count = 0
+    error_count = 0
+    transcript_cache: Dict[Tuple[str, str], Tuple[str, int, str, str]] = {}
+
+    for _, row in recurrent.iterrows():
+        conversation_id = str(row.get("conversationId") or "").strip()
+        communication_ids = split_communication_ids(row.get("communicationIds"))
+        if not communication_ids:
+            communication_ids = [""]
+
+        text_parts: List[str] = []
+        used_ids: List[str] = []
+        phrases_total = 0
+        for communication_id in communication_ids:
+            if not communication_id:
+                continue
+            cache_key = (conversation_id, communication_id)
+            try:
+                if cache_key not in transcript_cache:
+                    signed_url = get_transcript_signed_url(config, token, conversation_id, communication_id)
+                    transcript_json = download_transcript_json(config, signed_url)
+                    transcript_cache[cache_key] = transcript_to_text(transcript_json)
+                text, phrases_count, _, _ = transcript_cache[cache_key]
+                if text.strip():
+                    text_parts.append(text.strip())
+                phrases_total += phrases_count
+                used_ids.append(communication_id)
+            except TranscriptNotFound:
+                missing_count += 1
+            except Exception as exc:
+                error_count += 1
+                logger.warning("No se pudo extraer transcript | conversationId=%s | communicationId=%s | %s", conversation_id, communication_id, exc)
+
+        full_text = "\n\n".join(text_parts).strip()
+        if full_text:
+            ok_count += 1
+        else:
+            full_text = "Sin transcripción disponible"
+
+        reason = classify_call_reason(row, full_text if full_text != "Sin transcripción disponible" else "")
+        transcript_rows.append({
+            "Cliente / Identificador cliente": row.get("externalTag", ""),
+            "ConversationId": conversation_id,
+            "CommunicationId": ";".join(used_ids or communication_ids),
+            "Fecha/hora de llamada": row.get("Fecha", ""),
+            "Canal": row.get("Banca", ""),
+            "Conclusión original": row.get("Nombre de conclusion", ""),
+            "Numero llamada cliente en dia": row.get("Numero llamada cliente en dia", ""),
+            "Numero llamada cliente en periodo": row.get("Numero llamada cliente en periodo", ""),
+            "Texto/transcripción completa": full_text,
+            "Motivo detectado para esa llamada": reason,
+            "Flag motivo repetido respecto a llamadas anteriores": "",
+            "phrases_count": phrases_total,
+        })
+        time.sleep(config.api_sleep_seconds)
+
+    transcripts = pd.DataFrame(transcript_rows, columns=transcript_columns)
+    if not transcripts.empty:
+        transcripts["Flag motivo repetido respecto a llamadas anteriores"] = "No"
+        for _, group in transcripts.groupby("Cliente / Identificador cliente", sort=False):
+            seen: set = set()
+            for idx, item in group.iterrows():
+                reason = str(item.get("Motivo detectado para esa llamada") or "")
+                transcripts.at[idx, "Flag motivo repetido respecto a llamadas anteriores"] = "Si" if reason in seen else "No"
+                seen.add(reason)
+
+    analysis_rows: List[Dict[str, Any]] = []
+    for client, group in transcripts.groupby("Cliente / Identificador cliente", sort=False):
+        reasons = [str(v) for v in group["Motivo detectado para esa llamada"].tolist() if str(v).strip()]
+        reason_counts = pd.Series(reasons).value_counts() if reasons else pd.Series(dtype=int)
+        main_reason = str(reason_counts.index[0]) if not reason_counts.empty else "Sin dato"
+        secondary = ", ".join([str(idx) for idx in reason_counts.index[1:4]])
+        dates = sorted({str(v)[:10] for v in group["Fecha/hora de llamada"].tolist() if str(v).strip()})
+        pattern = build_call_pattern(reasons, len(dates))
+        total_calls = int(len(group))
+        analysis_rows.append({
+            "Cliente / Identificador cliente": client,
+            "Total llamadas recurrentes NBDA": total_calls,
+            "Fechas de llamadas": ", ".join(dates),
+            "Cantidad de días con recurrencia": len(dates),
+            "Motivo principal identificado": main_reason,
+            "Motivos secundarios": secondary,
+            "Patrón detectado": pattern,
+            "Resumen del caso": f"Cliente con {total_calls} llamadas NBDA en {len(dates)} dia(s). Motivo principal: {main_reason}.",
+            "Recomendación / insight": build_operational_insight(main_reason, pattern),
+        })
+
+    analysis = pd.DataFrame(analysis_rows, columns=analysis_columns)
+    if not analysis.empty:
+        analysis = analysis.sort_values(["Total llamadas recurrentes NBDA", "Cantidad de días con recurrencia"], ascending=[False, False])
+
+    logger.info("Transcripciones NBDA extraidas correctamente: %s", ok_count)
+    logger.info("Llamadas/comunicaciones NBDA sin transcripcion: %s", missing_count)
+    logger.info("Errores consultando transcripciones NBDA: %s", error_count)
+    logger.info("Clientes recurrentes NBDA analizados: %s", len(analysis))
+    return analysis, transcripts
+
+
 def query_conclusion_call_details(
     config: Config,
     token: str,
@@ -1440,7 +1714,7 @@ def query_conclusion_call_details(
         "conversationId", "conversationStart", "conversationEnd", "Fecha",
         "Duración segundos", "Duración minutos",
         "wrapUpCode", "Nombre de conclusion", "conclusion", "Banca",
-        "externalTag", "Estado externalTag"
+        "externalTag", "Estado externalTag", "communicationIds"
     ]
     if not target_wrapup_ids:
         logger.warning("Detalle clientes omitido: no hay wrapups objetivo.")
@@ -1559,6 +1833,7 @@ def query_conclusion_call_details(
                 conv_start = conversation.get("conversationStart") or ""
                 conv_end = conversation.get("conversationEnd") or ""
                 duration_seconds = calculate_conversation_duration_seconds(conv_start, conv_end)
+                communication_ids = extract_communication_ids(conversation)
                 rows.append({
                     "conversationId": conversation.get("conversationId") or conversation.get("id") or "",
                     "conversationStart": conv_start,
@@ -1571,7 +1846,8 @@ def query_conclusion_call_details(
                     "conclusion": conclusion,
                     "Banca": get_banca(wrapup_name),
                     "externalTag": external_tag,
-                    "Estado externalTag": "Con DNI" if external_tag else "Sin DNI / externalTag"
+                    "Estado externalTag": "Con DNI" if external_tag else "Sin DNI / externalTag",
+                    "communicationIds": ";".join(communication_ids)
                 })
 
             logger.info(
@@ -1720,7 +1996,7 @@ def build_client_analysis(
         "conversationId", "Fecha", "conversationStart", "conversationEnd",
         "Duración segundos", "Duración minutos",
         "wrapUpCode", "Nombre de conclusion", "conclusion", "Banca", "externalTag", "Estado externalTag",
-        "FLAG_RECURRENTE", "Estado HANA"
+        "communicationIds", "FLAG_RECURRENTE", "Estado HANA"
     ] + DEMOGRAPHIC_COLUMNS
 
     if df_calls.empty:
@@ -2217,6 +2493,8 @@ def create_excel(
     df_client_detail: Optional[pd.DataFrame] = None,
     df_recurrence: Optional[pd.DataFrame] = None,
     df_recurrence_by_channel: Optional[pd.DataFrame] = None,
+    df_nbda_recurrence_analysis: Optional[pd.DataFrame] = None,
+    df_nbda_transcriptions: Optional[pd.DataFrame] = None,
     location_tables: Optional[Dict[str, pd.DataFrame]] = None,
     demographic_tables: Optional[Dict[str, pd.DataFrame]] = None
 ) -> Path:
@@ -2239,6 +2517,12 @@ def create_excel(
         # Hoja nueva solicitada: cada llamada con datos del cliente desde HANA.
         safe_client_detail = df_client_detail if df_client_detail is not None else pd.DataFrame()
         safe_client_detail.to_excel(writer, sheet_name="Detalle Clientes", index=False)
+
+        safe_nbda_analysis = df_nbda_recurrence_analysis if df_nbda_recurrence_analysis is not None else pd.DataFrame()
+        safe_nbda_analysis.to_excel(writer, sheet_name="Analisis_Recurrencia_NBDA", index=False)
+
+        safe_nbda_transcriptions = df_nbda_transcriptions if df_nbda_transcriptions is not None else pd.DataFrame()
+        safe_nbda_transcriptions.to_excel(writer, sheet_name="Transcrip_Recurrentes_NBDA", index=False)
 
         _write_sectioned_tables(writer, "Ubicación", location_tables or {})
         _write_sectioned_tables(writer, "Demografía", demographic_tables or {})
@@ -2642,12 +2926,66 @@ def build_client_executive_email_block(
 """
 
 
+def build_nbda_recurrence_email_block(df_nbda_analysis: Optional[pd.DataFrame]) -> str:
+    if df_nbda_analysis is None or df_nbda_analysis.empty:
+        return """
+              <table border="0" cellpadding="0" cellspacing="0" width="100%" style="background-color:#f8fafc;border:1px solid #e2e8f0;margin:0 0 20px 0;">
+                <tr>
+                  <td style="padding:16px 22px;font-family:Segoe UI,Arial,sans-serif;">
+                    <div style="font-size:15px;font-weight:800;color:#0f172a;">Análisis de recurrencia NBDA</div>
+                    <div style="font-size:12px;color:#64748b;margin-top:4px;">No se encontraron clientes recurrentes NBDA para analizar o no hubo transcripciones disponibles.</div>
+                  </td>
+                </tr>
+              </table>
+"""
+
+    work = df_nbda_analysis.copy().head(10)
+    rows: List[str] = []
+    for _, item in work.iterrows():
+        cliente = html.escape(str(item.get("Cliente / Identificador cliente", "") or "Sin cliente"))
+        llamadas = format_int(item.get("Total llamadas recurrentes NBDA", 0))
+        dias = html.escape(str(item.get("Fechas de llamadas", "") or ""))
+        motivo = html.escape(str(item.get("Motivo principal identificado", "") or "Sin dato"))
+        patron = html.escape(str(item.get("Patrón detectado", "") or item.get("Patron detectado", "") or "Sin patrón"))
+        insight = html.escape(str(item.get("Resumen del caso", "") or item.get("Recomendación / insight", "") or ""))
+        rows.append(f"""
+                    <tr>
+                      <td style="padding:10px 8px;border-bottom:1px solid #e2e8f0;font-family:Segoe UI,Arial,sans-serif;font-size:11px;color:#0f172a;font-weight:700;">{cliente}</td>
+                      <td align="center" style="padding:10px 8px;border-bottom:1px solid #e2e8f0;font-family:Segoe UI,Arial,sans-serif;font-size:12px;color:#DA282D;font-weight:800;">{llamadas}</td>
+                      <td style="padding:10px 8px;border-bottom:1px solid #e2e8f0;font-family:Segoe UI,Arial,sans-serif;font-size:11px;color:#475569;">{dias}</td>
+                      <td style="padding:10px 8px;border-bottom:1px solid #e2e8f0;font-family:Segoe UI,Arial,sans-serif;font-size:11px;color:#0f172a;">{motivo}</td>
+                      <td style="padding:10px 8px;border-bottom:1px solid #e2e8f0;font-family:Segoe UI,Arial,sans-serif;font-size:11px;color:#475569;">{patron}</td>
+                      <td style="padding:10px 8px;border-bottom:1px solid #e2e8f0;font-family:Segoe UI,Arial,sans-serif;font-size:11px;color:#475569;">{insight}</td>
+                    </tr>""")
+
+    return f"""
+              <table border="0" cellpadding="0" cellspacing="0" width="100%" style="background-color:#ffffff;border:1px solid #e2e8f0;margin:0 0 20px 0;">
+                <tr>
+                  <td colspan="6" style="padding:16px 22px 10px 22px;font-family:Segoe UI,Arial,sans-serif;">
+                    <div style="font-size:15px;font-weight:800;color:#0f172a;">Análisis de recurrencia NBDA</div>
+                    <div style="font-size:12px;color:#64748b;margin-top:4px;">Clientes recurrentes NBDA analizados con transcripciones. Se muestran los principales casos por cantidad de llamadas.</div>
+                  </td>
+                </tr>
+                <tr style="background-color:#DA282D;">
+                  <th align="left" style="padding:9px 8px;font-family:Segoe UI,Arial,sans-serif;font-size:10px;color:#ffffff;text-transform:uppercase;">Cliente</th>
+                  <th align="center" style="padding:9px 8px;font-family:Segoe UI,Arial,sans-serif;font-size:10px;color:#ffffff;text-transform:uppercase;">Llamadas</th>
+                  <th align="left" style="padding:9px 8px;font-family:Segoe UI,Arial,sans-serif;font-size:10px;color:#ffffff;text-transform:uppercase;">Días</th>
+                  <th align="left" style="padding:9px 8px;font-family:Segoe UI,Arial,sans-serif;font-size:10px;color:#ffffff;text-transform:uppercase;">Motivo principal</th>
+                  <th align="left" style="padding:9px 8px;font-family:Segoe UI,Arial,sans-serif;font-size:10px;color:#ffffff;text-transform:uppercase;">Patrón</th>
+                  <th align="left" style="padding:9px 8px;font-family:Segoe UI,Arial,sans-serif;font-size:10px;color:#ffffff;text-transform:uppercase;">Resumen / insight</th>
+                </tr>
+                {''.join(rows)}
+              </table>
+"""
+
+
 def build_email_metrics(
     df_summary: pd.DataFrame,
     include_table: bool,
     df_client_detail: Optional[pd.DataFrame] = None,
     df_recurrence: Optional[pd.DataFrame] = None,
     df_recurrence_by_channel: Optional[pd.DataFrame] = None,
+    df_nbda_recurrence_analysis: Optional[pd.DataFrame] = None,
     location_tables: Optional[Dict[str, pd.DataFrame]] = None,
     demographic_tables: Optional[Dict[str, pd.DataFrame]] = None
 ) -> Dict[str, str]:
@@ -2690,7 +3028,7 @@ def build_email_metrics(
             df_recurrence_by_channel,
             location_tables,
             demographic_tables
-        ),
+        ) + build_nbda_recurrence_email_block(df_nbda_recurrence_analysis),
         "FIRMA": env_str("EMAIL_SIGNATURE", "Odair Umanzor"),
     }
 
@@ -2704,6 +3042,7 @@ def render_email_html(
     df_client_detail: Optional[pd.DataFrame] = None,
     df_recurrence: Optional[pd.DataFrame] = None,
     df_recurrence_by_channel: Optional[pd.DataFrame] = None,
+    df_nbda_recurrence_analysis: Optional[pd.DataFrame] = None,
     location_tables: Optional[Dict[str, pd.DataFrame]] = None,
     demographic_tables: Optional[Dict[str, pd.DataFrame]] = None
 ) -> str:
@@ -2713,6 +3052,7 @@ def render_email_html(
         df_client_detail=df_client_detail,
         df_recurrence=df_recurrence,
         df_recurrence_by_channel=df_recurrence_by_channel,
+        df_nbda_recurrence_analysis=df_nbda_recurrence_analysis,
         location_tables=location_tables,
         demographic_tables=demographic_tables
     )
@@ -2885,6 +3225,8 @@ def main() -> int:
     df_client_detail: Optional[pd.DataFrame] = None
     df_recurrence: Optional[pd.DataFrame] = None
     df_recurrence_by_channel: Optional[pd.DataFrame] = None
+    df_nbda_recurrence_analysis: Optional[pd.DataFrame] = None
+    df_nbda_transcriptions: Optional[pd.DataFrame] = None
     location_tables: Optional[Dict[str, pd.DataFrame]] = None
     demographic_tables: Optional[Dict[str, pd.DataFrame]] = None
 
@@ -2969,6 +3311,12 @@ def main() -> int:
                 logger.info("Detalle Clientes generado: %s filas", 0 if df_client_detail is None else len(df_client_detail))
                 logger.info("Recurrencia generada: %s filas", 0 if df_recurrence is None else len(df_recurrence))
                 logger.info("Recurrencia por canal generada: %s filas", 0 if df_recurrence_by_channel is None else len(df_recurrence_by_channel))
+                df_nbda_recurrence_analysis, df_nbda_transcriptions = fetch_recurrent_nbda_transcriptions(
+                    config,
+                    token,
+                    df_client_detail,
+                    logger
+                )
             except Exception as detail_exc:
                 logger.exception(
                     "No se pudo construir recurrencia/ubicacion/demografia. El reporte base continuara: %s",
@@ -2977,11 +3325,15 @@ def main() -> int:
                 df_client_detail = pd.DataFrame()
                 df_recurrence = pd.DataFrame()
                 df_recurrence_by_channel = pd.DataFrame()
+                df_nbda_recurrence_analysis = pd.DataFrame()
+                df_nbda_transcriptions = pd.DataFrame()
                 location_tables = {}
                 demographic_tables = {}
         else:
             logger.info("Analisis de clientes omitido por parametro INCLUDE_CLIENT_ANALYSIS=false.")
             df_recurrence_by_channel = pd.DataFrame()
+            df_nbda_recurrence_analysis = pd.DataFrame()
+            df_nbda_transcriptions = pd.DataFrame()
 
         timestamp = datetime.now(ZoneInfo(config.timezone_name)).strftime("%Y%m%d_%H%M%S")
         output_path = Path(config.output_dir) / f"Reporte_Recurrencia_AOL_NBDA_General_{timestamp}.xlsx"
@@ -2994,6 +3346,8 @@ def main() -> int:
             df_client_detail=df_client_detail,
             df_recurrence=df_recurrence,
             df_recurrence_by_channel=df_recurrence_by_channel,
+            df_nbda_recurrence_analysis=df_nbda_recurrence_analysis,
+            df_nbda_transcriptions=df_nbda_transcriptions,
             location_tables=location_tables,
             demographic_tables=demographic_tables
         )
@@ -3021,6 +3375,7 @@ def main() -> int:
                     df_client_detail=df_client_detail,
                     df_recurrence=df_recurrence,
                     df_recurrence_by_channel=df_recurrence_by_channel,
+                    df_nbda_recurrence_analysis=df_nbda_recurrence_analysis,
                     location_tables=location_tables,
                     demographic_tables=demographic_tables
                 )
