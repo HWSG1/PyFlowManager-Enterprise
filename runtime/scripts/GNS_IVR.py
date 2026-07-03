@@ -763,37 +763,20 @@ def build_windows(start_dt: datetime, end_dt: datetime, by_day: bool) -> List[Tu
     return windows
 
 
-def request_with_retry(
-    method: str,
-    url: str,
-    config: Config,
-    logger: logging.Logger,
-    retry_statuses: Optional[Iterable[int]] = None,
-    **kwargs
-) -> requests.Response:
-    """Ejecuta requests con reintentos controlados.
-
-    - Reintenta 429 y errores 5xx.
-    - Permite reintentar códigos específicos como 404 cuando Genesys crea el job
-      pero todavía no expone /jobs/{id} o /results.
-    """
-    retry_status_set = {int(x) for x in (retry_statuses or [])}
+def request_with_retry(method: str, url: str, config: Config, logger: logging.Logger, **kwargs) -> requests.Response:
     last_error = None
     for attempt in range(1, config.max_api_retries + 1):
         try:
             response = requests.request(method, url, timeout=config.request_timeout, **kwargs)
-            should_retry = response.status_code == 429 or response.status_code >= 500 or response.status_code in retry_status_set
-            if should_retry and attempt < config.max_api_retries:
+            if response.status_code == 429:
                 retry_after = response.headers.get("Retry-After")
                 wait = int(retry_after) if retry_after and retry_after.isdigit() else min(60, 5 * attempt)
-                logger.warning(
-                    "HTTP %s | intento %s/%s | esperando %ss | %s",
-                    response.status_code,
-                    attempt,
-                    config.max_api_retries,
-                    wait,
-                    response.text[:500],
-                )
+                logger.warning("HTTP 429 | intento %s/%s | esperando %ss", attempt, config.max_api_retries, wait)
+                time.sleep(wait)
+                continue
+            if response.status_code >= 500:
+                wait = min(60, 5 * attempt)
+                logger.warning("HTTP %s | intento %s/%s | esperando %ss", response.status_code, attempt, config.max_api_retries, wait)
                 time.sleep(wait)
                 continue
             if response.status_code >= 400:
@@ -802,8 +785,6 @@ def request_with_retry(
             return response
         except Exception as exc:
             last_error = exc
-            if attempt >= config.max_api_retries:
-                break
             wait = min(60, 5 * attempt)
             logger.warning("Error request | intento %s/%s | %s | esperando %ss", attempt, config.max_api_retries, exc, wait)
             time.sleep(wait)
@@ -869,7 +850,7 @@ def get_details_job_status(config: Config, token: str, job_id: str, logger: logg
     404 Not Found. Por eso primero esperamos el estado final correcto.
     """
     url = f"{config.genesys_api_base}/api/v2/analytics/conversations/details/jobs/{job_id}"
-    response = request_with_retry("GET", url, config, logger, headers=genesys_headers(token), retry_statuses={404})
+    response = request_with_retry("GET", url, config, logger, headers=genesys_headers(token))
     return response.json()
 
 
@@ -926,7 +907,7 @@ def get_job_results_page(config: Config, token: str, job_id: str, cursor: str, l
     url = f"{config.genesys_api_base}/api/v2/analytics/conversations/details/jobs/{job_id}/results?pageSize={config.job_page_size}"
     if cursor:
         url += f"&cursor={cursor}"
-    response = request_with_retry("GET", url, config, logger, headers=genesys_headers(token), retry_statuses={404})
+    response = request_with_retry("GET", url, config, logger, headers=genesys_headers(token))
     return response.json()
 
 
@@ -1241,11 +1222,6 @@ def resolve_load_columns(config: Config, logger: logging.Logger) -> Tuple[List[s
             'La tabla destino no tiene la columna obligatoria ID_TRANSACCION. '
             'No se puede hacer MERGE de IVR de forma segura.'
         )
-    if "FECHA_INGRESO" not in hana_set:
-        raise RuntimeError(
-            'La tabla destino no tiene la columna obligatoria FECHA_INGRESO. '
-            'No se puede borrar/cargar rangos IVR de forma segura.'
-        )
 
     load_columns = [c for c in IVR_COLUMNS if c.upper() in hana_set]
     missing_columns = [c for c in IVR_COLUMNS if c.upper() not in hana_set]
@@ -1367,22 +1343,8 @@ def merge_ivr_rows(config: Config, rows: List[Dict[str, Any]], logger: logging.L
                 logger.info("MERGE parcial OK | lote: %s | acumulado: %s/%s", len(batch), loaded, len(rows))
             except Exception as exc:
                 conn.rollback()
-                logger.exception("Error en MERGE lote desde fila %s: %s. Se intentará fila por fila para rescatar registros válidos.", start + 1, exc)
-                for offset, row_value in enumerate(values, start=1):
-                    try:
-                        cur.execute(sql, row_value)
-                        conn.commit()
-                        loaded += 1
-                    except Exception as row_exc:
-                        conn.rollback()
-                        failed += 1
-                        row_id = batch[offset - 1].get("ID_TRANSACCION") if offset - 1 < len(batch) else "<sin id>"
-                        logger.exception(
-                            "Fila fallida en MERGE | posición global=%s | ID_TRANSACCION=%s | error=%s",
-                            start + offset,
-                            row_id,
-                            row_exc,
-                        )
+                failed += len(batch)
+                logger.exception("Error en MERGE lote desde fila %s: %s", start + 1, exc)
     finally:
         cur.close()
         conn.close()
@@ -1473,18 +1435,6 @@ def query_client_profiles(config: Config, etiquetas: List[str], logger: logging.
         conn.close()
 
 
-def safe_int(value: Any, default: int = 0) -> int:
-    try:
-        if value is None:
-            return default
-        text = str(value).strip()
-        if text == "":
-            return default
-        return int(float(text))
-    except Exception:
-        return default
-
-
 def build_segment_bases(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     grouped: Dict[str, List[Dict[str, Any]]] = {}
     for row in rows:
@@ -1497,9 +1447,9 @@ def build_segment_bases(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]
     autoservicio = []
     abandono = []
     for etiqueta, items in grouped.items():
-        max_auto = max(safe_int(x.get("AUTOSERVICIO")) for x in items)
-        max_paso_agente = max(safe_int(x.get("PASO_AGENTE_FLAG")) for x in items)
-        max_blacklist = max(safe_int(x.get("BLACKLIST")) for x in items)
+        max_auto = max(int(x.get("AUTOSERVICIO") or 0) for x in items)
+        max_paso_agente = max(int(x.get("PASO_AGENTE_FLAG") or 0) for x in items)
+        max_blacklist = max(int(x.get("BLACKLIST") or 0) for x in items)
         base = dict(items[0])
         base["MAX_AUTOSERVICIO"] = max_auto
         base["MAX_PASO_AGENTE_FLAG"] = max_paso_agente
@@ -1587,7 +1537,7 @@ def main() -> int:
         if run_mode not in valid_modes:
             raise ValueError(f"RUN_MODE inválido: {run_mode}. Valores válidos: {sorted(valid_modes)}")
         send_surveys = run_mode in ("enviar_encuesta", "cargar_hana_y_enviar_encuesta")
-        write_autoservicio = run_mode in ("solo_autoservicio", "enviar_encuesta", "cargar_y_autoservicio", "cargar_hana_y_enviar_encuesta")
+        write_autoservicio = run_mode in ("solo_autoservicio", "enviar_encuesta", "cargar_y_autoservicio")
         write_abandono = run_mode == "solo_abandono"
         start_dt, end_dt, date_mode = calculate_interval(args, config)
         windows = build_windows(start_dt, end_dt, config.process_by_day)
@@ -1635,27 +1585,11 @@ def main() -> int:
                 # Validamos columnas ANTES de borrar para evitar pérdida de datos si la estructura de HANA no coincide.
                 load_columns, hana_meta = resolve_load_columns(config, logger)
                 pyflow_progress(55)
-
-                # Protección: si Genesys no devolvió filas, no borramos rangos existentes por accidente.
-                # Si de verdad necesitas limpiar un rango vacío, configura ALLOW_EMPTY_RANGE_DELETE=true.
-                allow_empty_delete = env_bool("ALLOW_EMPTY_RANGE_DELETE", False)
-                if config.delete_range_before_load and not all_rows and not allow_empty_delete:
-                    raise RuntimeError(
-                        "Genesys devolvió 0 filas IVR. Se detiene la carga para evitar borrar el rango en HANA "
-                        "sin tener datos nuevos para reemplazarlo. Si deseas permitirlo, usa ALLOW_EMPTY_RANGE_DELETE=true."
-                    )
-
                 if config.delete_range_before_load:
                     deleted = delete_ivr_range(config, start_dt, end_dt, logger)
                 pyflow_progress(60)
                 loaded, failed = merge_ivr_rows(config, all_rows, logger, load_columns, hana_meta)
                 pyflow_progress(70)
-
-                if failed > 0 and run_mode == "cargar_hana_y_enviar_encuesta":
-                    raise RuntimeError(
-                        f"No se enviarán encuestas porque fallaron {failed} filas al cargar HANA. "
-                        "Corrige la carga antes de ejecutar el envío."
-                    )
         need_auto = run_mode in ("solo_autoservicio", "enviar_encuesta", "cargar_y_autoservicio", "cargar_hana_y_enviar_encuesta")
         need_abandono = run_mode == "solo_abandono"
         if need_auto or need_abandono:
@@ -1676,20 +1610,15 @@ def main() -> int:
                     abandono_rows = enrich_rows(abandono_rows, client_lookup)
             if need_auto:
                 if send_surveys:
-                    if config.dry_run:
-                        logger.warning("DRY_RUN=true. No se enviarán encuestas Qualtrics ni reporte por correo.")
-                    elif run_mode == "cargar_hana_y_enviar_encuesta" and failed > 0:
-                        raise RuntimeError(f"No se enviarán encuestas porque existen {failed} filas fallidas en HANA.")
-                    else:
-                        surveys_sent, surveys_without_email = enviar_encuestas_qualtrics(config, autoservicio_rows, logger)
-                        enviar_reporte_encuestas(
-                            config,
-                            total_autoservicio=len(autoservicio_rows),
-                            enviadas=surveys_sent,
-                            sin_correo=surveys_without_email,
-                            date_mode=date_mode,
-                            logger=logger,
-                        )
+                    surveys_sent, surveys_without_email = enviar_encuestas_qualtrics(config, autoservicio_rows, logger)
+                    enviar_reporte_encuestas(
+                        config,
+                        total_autoservicio=len(autoservicio_rows),
+                        enviadas=surveys_sent,
+                        sin_correo=surveys_without_email,
+                        date_mode=date_mode,
+                        logger=logger,
+                    )
                 if write_autoservicio:
                     path = write_output(autoservicio_rows, config.output_dir, "GNS_IVR_Full_Autoservicio", config.output_format, logger)
                     if path:
