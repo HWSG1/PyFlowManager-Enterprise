@@ -38,7 +38,8 @@ function safePathSegment(value: string, fallback: string): string {
 }
 
 function getAvailableScriptFolder(baseName: string): string {
-  const safeBase = safePathSegment(baseName, 'script');
+  const withoutPythonExtension = String(baseName || '').replace(/\.py$/i, '');
+  const safeBase = safePathSegment(withoutPythonExtension, 'script');
   let folderName = safeBase;
   let counter = 2;
 
