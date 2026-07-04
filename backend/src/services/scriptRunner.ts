@@ -40,6 +40,20 @@ function parseProgressLine(line: string): number | null {
   return Math.max(0, Math.min(100, progress));
 }
 
+function parsePauseLine(line: string): string | null {
+  const match = line.trim().match(/^PYFLOW_PAUSED(?:=(.*))?$/i);
+  if (!match) return null;
+
+  return String(match[1] || 'Ejecución pausada. Esperando continuar.').trim();
+}
+
+function parseResumedLine(line: string): string | null {
+  const match = line.trim().match(/^PYFLOW_RESUMED(?:=(.*))?$/i);
+  if (!match) return null;
+
+  return String(match[1] || 'Ejecución reanudada.').trim();
+}
+
 function rememberLine(buffer: string[], line: string): void {
   const clean = String(line || '').trim();
   if (!clean) return;
@@ -48,6 +62,19 @@ function rememberLine(buffer: string[], line: string): void {
   if (buffer.length > 20) {
     buffer.shift();
   }
+}
+
+async function setExecutionStatus(executionId: number, status: 'Ejecutando' | 'Pausado'): Promise<void> {
+  const pool = await getPool();
+  await pool.request()
+    .input('execution_id', sql.Int, executionId)
+    .input('status', sql.NVarChar(20), status)
+    .query(`
+      UPDATE dbo.ScriptExecutions
+      SET status = @status
+      WHERE id = @execution_id
+        AND status NOT IN ('Cancelado', 'Exitoso', 'Error')
+    `);
 }
 
 export async function runScript(
@@ -111,7 +138,7 @@ if (!skipQueueCheck) {
   const runningResult = await pool.request().query(`
     SELECT COUNT(*) AS running
     FROM dbo.ScriptExecutions
-    WHERE status = 'Ejecutando'
+    WHERE status IN ('Ejecutando', 'Pausado')
   `);
 
   const running = Number(
@@ -204,14 +231,25 @@ if (!skipQueueCheck) {
     resolvedGlobalParams[param.param_key] = String(globalValue ?? '');
   }
 
-  const finalParameters: Record<string, string> = {
-    ...resolvedGlobalParams,
-    ...parameters
-  };
-
   const workingDirectory = script.working_directory
     ? path.resolve(script.working_directory)
     : path.dirname(resolvedPath);
+  const scriptOutputDirectory = path.join(workingDirectory, 'output');
+  fs.mkdirSync(scriptOutputDirectory, { recursive: true });
+  fs.mkdirSync(path.join(scriptOutputDirectory, 'json'), { recursive: true });
+
+  const finalParameters: Record<string, string> = {
+    ...resolvedGlobalParams,
+    ...parameters,
+    PYFLOW_SCRIPT_DIR: workingDirectory,
+    PYFLOW_OUTPUT_DIR: scriptOutputDirectory,
+    PYFLOW_EXPORT_DIR: scriptOutputDirectory,
+    OUTPUT_DIR: scriptOutputDirectory,
+    EXPORT_DIR: scriptOutputDirectory,
+    EXPORTS_DIR: scriptOutputDirectory,
+    REPORT_OUTPUT_DIR: scriptOutputDirectory,
+    JSON_OUTPUT_DIR: path.join(scriptOutputDirectory, 'json')
+  };
 
   const pythonCommand = script.python_interpreter || env.pythonCommand;
 
@@ -232,6 +270,12 @@ if (!skipQueueCheck) {
 
   const startResult = await startRequest.execute('dbo.usp_StartScriptExecution');
   const executionId = startResult.output.execution_id as number;
+  const controlDirectory = path.resolve(env.runtime.controlDir, 'executions', String(executionId));
+  const resumeFile = path.join(controlDirectory, 'resume.flag');
+  fs.mkdirSync(controlDirectory, { recursive: true });
+  if (fs.existsSync(resumeFile)) {
+    fs.unlinkSync(resumeFile);
+  }
 
   await pool.request()
     .input('execution_id', sql.Int, executionId)
@@ -281,6 +325,13 @@ if (!skipQueueCheck) {
       ...finalParameters,
       PYTHONUNBUFFERED: '1',
       PYFLOW_EXECUTION_ID: String(executionId),
+      PYFLOW_CONTROL_DIR: controlDirectory,
+      PYFLOW_RESUME_FILE: resumeFile,
+      PYFLOW_SCRIPT_PATH: resolvedPath,
+      PYTHONPATH: [
+        path.resolve(env.runtime.scriptsDir, '..'),
+        process.env.PYTHONPATH || ''
+      ].filter(Boolean).join(path.delimiter),
       PYTHONIOENCODING: 'utf-8',
       PYTHONUTF8: '1',
     }
@@ -308,6 +359,36 @@ if (!skipQueueCheck) {
         emitExecutionLog(executionId, {
           progress,
           source: 'progress'
+        });
+        continue;
+      }
+
+      const pauseMessage = parsePauseLine(line);
+      if (pauseMessage !== null) {
+        await setExecutionStatus(executionId, 'Pausado');
+        rememberLine(recentOutput, pauseMessage);
+        await addExecutionLog(executionId, 'WARNING', pauseMessage);
+        emitExecutionLog(executionId, {
+          level: 'WARNING',
+          message: pauseMessage,
+          status: 'Pausado',
+          paused: true,
+          source: 'runner'
+        });
+        continue;
+      }
+
+      const resumedMessage = parseResumedLine(line);
+      if (resumedMessage !== null) {
+        await setExecutionStatus(executionId, 'Ejecutando');
+        rememberLine(recentOutput, resumedMessage);
+        await addExecutionLog(executionId, 'INFO', resumedMessage);
+        emitExecutionLog(executionId, {
+          level: 'INFO',
+          message: resumedMessage,
+          status: 'Ejecutando',
+          resumed: true,
+          source: 'runner'
         });
         continue;
       }

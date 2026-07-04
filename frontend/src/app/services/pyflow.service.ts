@@ -72,7 +72,7 @@ export class PyflowService {
   editingScheduleId = signal<number | null>(null);
   editingScheduleData = signal<any>(null);
 
-  runningExecutions = computed(() => this.executions().filter(e => e.status === 'Ejecutando').length);
+  runningExecutions = computed(() => this.executions().filter(e => e.status === 'Ejecutando' || e.status === 'Pausado').length);
   totalScripts = computed(() => this.scripts().length);
   activeScripts = computed(() => this.scripts().filter(s => s.status === 'active').length);
   errorScripts = computed(() => this.scripts().filter(s => s.lastStatus === 'Error').length);
@@ -459,6 +459,10 @@ export class PyflowService {
 
   cancelExecution(executionId: number) {
     return this.http.post(`${this.apiUrl}/scripts/executions/${executionId}/cancel`, {});
+  }
+
+  resumeExecution(executionId: number) {
+    return this.http.post(`${this.apiUrl}/scripts/executions/${executionId}/resume`, {});
   }
 
   getScriptParameters(scriptId: number) {

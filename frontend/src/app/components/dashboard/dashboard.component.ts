@@ -618,6 +618,7 @@ export class DashboardComponent implements AfterViewInit, OnDestroy {
       COMPLETED: 'Exitoso',
       FAILED: 'Error',
       RUNNING: 'Ejecutando',
+      PAUSED: 'Pausado',
       CANCELLED: 'Cancelado',
       CANCELED: 'Cancelado',
       PENDING: 'Pendiente',
@@ -634,6 +635,7 @@ export class DashboardComponent implements AfterViewInit, OnDestroy {
       Exitoso: 'px-2 py-0.5 rounded-full text-[10px] bg-emerald-950 border border-emerald-900 text-emerald-400 font-medium',
       Error: 'px-2 py-0.5 rounded-full text-[10px] bg-rose-950 border border-rose-900 text-rose-400 font-medium',
       Ejecutando: 'px-2 py-0.5 rounded-full text-[10px] bg-blue-950 border border-blue-900 text-blue-400 font-medium',
+      Pausado: 'px-2 py-0.5 rounded-full text-[10px] bg-amber-950 border border-amber-900 text-amber-300 font-medium',
       Cancelado: 'px-2 py-0.5 rounded-full text-[10px] bg-slate-900 border border-slate-800 text-slate-400 font-medium',
       Pendiente: 'px-2 py-0.5 rounded-full text-[10px] bg-amber-950 border border-amber-900 text-amber-400 font-medium',
       'En Cola': 'px-2 py-0.5 rounded-full text-[10px] bg-amber-950 border border-amber-900 text-amber-400 font-medium'

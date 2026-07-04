@@ -10,6 +10,8 @@ import { createVersionSnapshot } from '../services/versioning.service';
 import { auditEvent } from '../services/audit.service';
 import { requireAuth, requireExecutionAccess, requirePermission, requireScriptAccess } from '../services/security.service';
 import { extractPyflowParams, syncScriptParameters } from '../services/scriptParameters.service';
+import { addExecutionLog } from '../services/dbLogService';
+import { emitExecutionLog } from '../services/logBus';
 
 const router = Router();
 
@@ -19,12 +21,34 @@ if (!fs.existsSync(scriptsDir)) {
   fs.mkdirSync(scriptsDir, { recursive: true });
 }
 
-const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, scriptsDir),
-  filename: (_req, file, cb) => cb(null, path.basename(file.originalname))
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 25 * 1024 * 1024 }
 });
 
-const upload = multer({ storage });
+function safePathSegment(value: string, fallback: string): string {
+  const clean = String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^0-9A-Za-z._-]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 120);
+
+  return clean || fallback;
+}
+
+function getAvailableScriptFolder(baseName: string): string {
+  const safeBase = safePathSegment(baseName, 'script');
+  let folderName = safeBase;
+  let counter = 2;
+
+  while (fs.existsSync(path.join(scriptsDir, folderName))) {
+    folderName = `${safeBase}_${counter}`;
+    counter += 1;
+  }
+
+  return folderName;
+}
 
 router.get('/', requireAuth, async (req, res, next) => {
   try {
@@ -79,20 +103,45 @@ router.get('/', requireAuth, async (req, res, next) => {
 });
 
 router.post('/', requireAuth, requirePermission('scripts.create'), upload.single('file'), async (req, res, next) => {
+  let createdScriptDirectory: string | null = null;
+
   try {
     const body = req.body || {};
     const pool = await getPool();
     const uploadedFile = req.file;
 
-    if (uploadedFile?.path) {
-      extractPyflowParams(fs.readFileSync(uploadedFile.path, 'utf8'));
+    if (uploadedFile?.buffer) {
+      const extension = path.extname(uploadedFile.originalname).toLowerCase();
+      if (extension !== '.py') {
+        return res.status(400).json({ message: 'Solo se permite importar archivos Python .py.' });
+      }
+
+      extractPyflowParams(uploadedFile.buffer.toString('utf8'));
     }
 
     const rawFilePath = uploadedFile
-      ? uploadedFile.filename
+      ? path.basename(uploadedFile.originalname)
       : body.file_path || body.path || body.name;
 
-    const cleanFilePath = path.basename(rawFilePath.replace(/\\/g, '/'));
+    const cleanFileName = safePathSegment(path.basename(rawFilePath.replace(/\\/g, '/')), 'script.py');
+    const scriptBaseName = path.basename(cleanFileName, path.extname(cleanFileName));
+    const scriptFolderName = uploadedFile
+      ? getAvailableScriptFolder(body.name || scriptBaseName)
+      : '';
+    const cleanFilePath = uploadedFile
+      ? path.posix.join(scriptFolderName, cleanFileName)
+      : path.basename(rawFilePath.replace(/\\/g, '/'));
+    const finalUploadedPath = uploadedFile
+      ? path.join(scriptsDir, scriptFolderName, cleanFileName)
+      : null;
+
+    if (uploadedFile?.buffer && finalUploadedPath) {
+      createdScriptDirectory = path.dirname(finalUploadedPath);
+      fs.mkdirSync(path.join(createdScriptDirectory, 'config'), { recursive: true });
+      fs.mkdirSync(path.join(createdScriptDirectory, 'input'), { recursive: true });
+      fs.mkdirSync(path.join(createdScriptDirectory, 'output'), { recursive: true });
+      fs.writeFileSync(finalUploadedPath, uploadedFile.buffer, { flag: 'wx' });
+    }
 
     const result = await pool.request()
       .input('created_by_user_id', sql.Int, body.created_by_user_id || env.defaultUserId)
@@ -136,15 +185,15 @@ router.post('/', requireAuth, requirePermission('scripts.create'), upload.single
     const insertedScript = result.recordset[0];
     const scriptId = insertedScript.id;
 
-    if (uploadedFile?.path) {
+    if (finalUploadedPath) {
       await createVersionSnapshot(
         scriptId,
         body.version || '1.0.0',
-        uploadedFile.path,
+        finalUploadedPath,
         (req as any).user?.id || body.created_by_user_id || env.defaultUserId,
         body.change_notes || 'Versión inicial'
       );
-      const content = fs.readFileSync(uploadedFile.path, 'utf8');
+      const content = fs.readFileSync(finalUploadedPath, 'utf8');
       await syncScriptParameters(scriptId, content);
     }
 
@@ -155,6 +204,10 @@ router.post('/', requireAuth, requirePermission('scripts.create'), upload.single
 
     res.status(201).json(insertedScript);
   } catch (err) {
+    if (createdScriptDirectory && fs.existsSync(createdScriptDirectory)) {
+      fs.rmSync(createdScriptDirectory, { recursive: true, force: true });
+    }
+
     next(err);
   }
 });
@@ -915,6 +968,15 @@ router.delete('/:id/definitive', requireAuth, requireScriptAccess('edit'), async
       if (fs.existsSync(fullPath)) {
         fs.unlinkSync(fullPath);
       }
+
+      const scriptDirectory = path.dirname(fullPath);
+      const isScriptOwnDirectory =
+        path.dirname(scriptDirectory) === allowedDir &&
+        path.basename(scriptDirectory) !== '.versions';
+
+      if (isScriptOwnDirectory && fs.existsSync(scriptDirectory)) {
+        fs.rmSync(scriptDirectory, { recursive: true, force: true });
+      }
     }
 
     const versionsRoot = path.resolve(env.runtime.scriptsDir, '.versions');
@@ -1000,7 +1062,7 @@ router.post('/executions/:id/cancel', requireAuth, requirePermission('executions
 
     const execution = result.recordset[0];
 
-    if (execution.status !== 'Ejecutando') {
+    if (!['Ejecutando', 'Pausado'].includes(execution.status)) {
       return res.json({ ok: true, message: 'La ejecución ya no está activa.' });
     }
 
@@ -1018,6 +1080,61 @@ router.post('/executions/:id/cancel', requireAuth, requirePermission('executions
     await auditEvent(req, 'execution.cancel', 'execution', executionId, { status: execution.status }, { status: 'Cancelado' });
 
     res.json({ ok: true, message: 'Ejecución cancelada correctamente.' });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post('/executions/:id/resume', requireAuth, requireExecutionAccess('execute'), async (req, res, next) => {
+  try {
+    const executionId = Number(req.params.id);
+    const pool = await getPool();
+
+    const result = await pool.request()
+      .input('id', sql.Int, executionId)
+      .query(`
+        SELECT TOP 1 id, status
+        FROM dbo.ScriptExecutions
+        WHERE id = @id
+      `);
+
+    if (!result.recordset.length) {
+      return res.status(404).json({ message: 'Ejecución no encontrada.' });
+    }
+
+    const execution = result.recordset[0];
+
+    if (execution.status !== 'Pausado') {
+      return res.status(400).json({ message: 'La ejecución no está pausada.' });
+    }
+
+    const controlDirectory = path.resolve(env.runtime.controlDir, 'executions', String(executionId));
+    const resumeFile = path.join(controlDirectory, 'resume.flag');
+    fs.mkdirSync(controlDirectory, { recursive: true });
+    fs.writeFileSync(resumeFile, new Date().toISOString(), 'utf8');
+
+    await pool.request()
+      .input('execution_id', sql.Int, executionId)
+      .input('status', sql.NVarChar(20), 'Ejecutando')
+      .query(`
+        UPDATE dbo.ScriptExecutions
+        SET status = @status
+        WHERE id = @execution_id
+          AND status = 'Pausado'
+      `);
+
+    await addExecutionLog(executionId, 'INFO', 'Continuar solicitado desde PyFlow Manager.');
+    emitExecutionLog(executionId, {
+      level: 'INFO',
+      message: 'Continuar solicitado desde PyFlow Manager.',
+      status: 'Ejecutando',
+      resumed: true,
+      source: 'runner'
+    });
+
+    await auditEvent(req, 'execution.resume', 'execution', executionId, { status: 'Pausado' }, { status: 'Ejecutando' });
+
+    res.json({ ok: true, message: 'Señal de continuar enviada correctamente.' });
   } catch (err) {
     next(err);
   }

@@ -35,14 +35,21 @@ import { ScriptGovernanceComponent } from '../script-governance/script-governanc
           <div class="flex items-center gap-2">
             <button
               (click)="runScript()"
-              [disabled]="isRunning"
+              [disabled]="isRunning || isPaused"
               class="bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed text-white font-semibold text-xs px-4 py-2.5 rounded-lg">
               ▶ Ejecutar Ahora
             </button>
 
             <button
+              (click)="resumeExecution()"
+              [disabled]="!isPaused"
+              class="bg-amber-600 hover:bg-amber-500 disabled:opacity-50 disabled:cursor-not-allowed text-white font-semibold text-xs px-4 py-2.5 rounded-lg">
+              ▶ Continuar
+            </button>
+
+            <button
               (click)="cancelExecution()"
-              [disabled]="!isRunning"
+              [disabled]="!isRunning && !isPaused"
               class="bg-slate-800 hover:bg-rose-900/60 disabled:opacity-50 disabled:cursor-not-allowed text-slate-300 border border-slate-700 font-semibold text-xs px-4 py-2.5 rounded-lg">
               ✕ Cancelar Ejecución
             </button>
@@ -62,7 +69,7 @@ import { ScriptGovernanceComponent } from '../script-governance/script-governanc
 
             <div class="flex items-center justify-between p-3 bg-slate-900 border border-slate-800 rounded-lg">
               <div class="flex items-center gap-2">
-                <span class="w-3 h-3 rounded-full" [class]="isRunning ? 'bg-blue-500 animate-pulse' : 'bg-slate-500'"></span>
+                <span class="w-3 h-3 rounded-full" [class]="statusDotClass()"></span>
                 <span class="font-semibold text-sm text-slate-200">{{ statusText }}</span>
               </div>
               <span class="text-xs text-slate-500">{{ timer }}</span>
@@ -391,6 +398,7 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
   @ViewChild('consolePane') consolePane?: ElementRef<HTMLDivElement>;
 
   isRunning = false;
+  isPaused = false;
   progress = 0;
   timer = '--:--';
   statusText = 'Detenido / En espera';
@@ -631,7 +639,7 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
   }
 
   runScript() {
-  if (!this.script || this.isRunning) return;
+  if (!this.script || this.isRunning || this.isPaused) return;
 
   if (!this.validateParameters()) {
     return;
@@ -657,6 +665,7 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
   this.statusText = 'Iniciando...';
   this.progress = 5;
   this.isRunning = true;
+  this.isPaused = false;
 
   this.svc.showToast(`Ejecutando ${this.script.name}`, 'info');
 
@@ -702,6 +711,7 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
     })
     .catch(err => {
       this.isRunning = false;
+      this.isPaused = false;
       this.statusText = 'Error';
       this.progress = 0;
 
@@ -774,11 +784,21 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
 
       const payload = JSON.parse(event.data);
 
+      if (payload.status === 'Pausado') {
+        this.isRunning = false;
+        this.isPaused = true;
+        this.statusText = 'Pausado';
+      } else if (payload.status === 'Ejecutando') {
+        this.isRunning = true;
+        this.isPaused = false;
+        this.statusText = 'Ejecutando';
+      }
+
       if (payload.progress !== undefined) {
         const progress = Number(payload.progress);
         if (Number.isFinite(progress)) {
           this.progress = Math.max(0, Math.min(100, progress));
-          this.statusText = 'Ejecutando';
+          if (!this.isPaused) this.statusText = 'Ejecutando';
         }
         return;
       }
@@ -786,12 +806,13 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
       const progressFromMessage = this.readProgress(payload.message);
       if (progressFromMessage !== null) {
         this.progress = progressFromMessage;
-        this.statusText = 'Ejecutando';
+        if (!this.isPaused) this.statusText = 'Ejecutando';
         return;
       }
 
       if (payload.done) {
         this.isRunning = false;
+        this.isPaused = false;
         this.progress = 100;
         this.statusText = payload.status;
 
@@ -818,11 +839,12 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
   }
 
   cancelExecution() {
-    if (!this.isRunning || !this.currentExecutionId) return;
+    if ((!this.isRunning && !this.isPaused) || !this.currentExecutionId) return;
 
     this.svc.cancelExecution(this.currentExecutionId).subscribe({
       next: () => {
         this.isRunning = false;
+        this.isPaused = false;
         this.statusText = 'Cancelado';
         this.progress = 100;
 
@@ -847,6 +869,33 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
     });
   }
 
+  resumeExecution() {
+    if (!this.isPaused || !this.currentExecutionId) return;
+
+    this.svc.resumeExecution(this.currentExecutionId).subscribe({
+      next: () => {
+        this.isRunning = true;
+        this.isPaused = false;
+        this.statusText = 'Ejecutando';
+
+        this.consoleLines.push({
+          text: '[SYSTEM] Señal de continuar enviada.',
+          cls: 'text-amber-300'
+        });
+        this.scrollConsoleToBottom();
+
+        this.svc.loadExecutions();
+      },
+      error: err => {
+        this.consoleLines.push({
+          text: `[ERROR] No se pudo continuar: ${err?.error?.message || err.message}`,
+          cls: 'text-red-400'
+        });
+        this.scrollConsoleToBottom();
+      }
+    });
+  }
+
   ngOnDestroy() {
     this.stopConsoleWatch();
   }
@@ -856,10 +905,17 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
       Exitoso: 'px-2 py-0.5 rounded-full text-[10px] bg-emerald-950 border border-emerald-900 text-emerald-400 font-medium',
       Error: 'px-2 py-0.5 rounded-full text-[10px] bg-rose-950 border border-rose-900 text-rose-400 font-medium',
       Ejecutando: 'px-2 py-0.5 rounded-full text-[10px] bg-blue-950 border border-blue-900 text-blue-400 font-medium',
+      Pausado: 'px-2 py-0.5 rounded-full text-[10px] bg-amber-950 border border-amber-900 text-amber-300 font-medium',
       Cancelado: 'px-2 py-0.5 rounded-full text-[10px] bg-slate-900 border border-slate-800 text-slate-400 font-medium'
     };
 
     return map[status] ?? map['Cancelado'];
+  }
+
+  statusDotClass() {
+    if (this.isPaused) return 'bg-amber-400 animate-pulse';
+    if (this.isRunning) return 'bg-blue-500 animate-pulse';
+    return 'bg-slate-500';
   }
   openExecutionLog(executionId: string | number) {
     const cleanId = Number(String(executionId).replace('EX-', ''));
@@ -916,10 +972,16 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
 
           if (selectedExecution?.status === 'Ejecutando') {
             this.isRunning = true;
+            this.isPaused = false;
             this.statusText = 'Ejecutando';
             this.progress = 50;
+          } else if (selectedExecution?.status === 'Pausado') {
+            this.isRunning = false;
+            this.isPaused = true;
+            this.statusText = 'Pausado';
           } else {
             this.isRunning = false;
+            this.isPaused = false;
             this.statusText = selectedExecution?.status || 'Detenido / En espera';
 
             if (selectedExecution?.status === 'Exitoso' || selectedExecution?.status === 'Cancelado') {

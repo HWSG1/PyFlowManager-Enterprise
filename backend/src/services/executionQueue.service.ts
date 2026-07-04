@@ -29,7 +29,7 @@ export async function processExecutionQueue(): Promise<void> {
     const runningResult = await pool.request().query(`
       SELECT COUNT(*) AS running
       FROM dbo.ScriptExecutions
-      WHERE status = 'Ejecutando'
+      WHERE status IN ('Ejecutando', 'Pausado')
     `);
 
     const running = Number(

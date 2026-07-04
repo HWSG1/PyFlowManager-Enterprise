@@ -25,6 +25,7 @@ export const env = {
   runtime: {
     scriptsDir: path.resolve(process.cwd(), process.env.RUNTIME_SCRIPTS_DIR || '../runtime/scripts'),
     logsDir: path.resolve(process.cwd(), process.env.RUNTIME_LOGS_DIR || '../runtime/logs'),
-    exportsDir: path.resolve(process.cwd(), process.env.RUNTIME_EXPORTS_DIR || '../runtime/exports')
+    exportsDir: path.resolve(process.cwd(), process.env.RUNTIME_EXPORTS_DIR || '../runtime/exports'),
+    controlDir: path.resolve(process.cwd(), process.env.RUNTIME_CONTROL_DIR || '../runtime/control')
   }
 };

@@ -6,7 +6,7 @@ export interface Script {
   status: 'active' | 'inactive';
   lastRun: string;
   nextRun: string;
-  lastStatus: 'Exitoso' | 'Error' | 'Ejecutando' | 'Cancelado' | 'Nunca';
+  lastStatus: 'Exitoso' | 'Error' | 'Ejecutando' | 'Pausado' | 'Cancelado' | 'Nunca';
   description: string;
   author: string;
   version: string;
@@ -18,7 +18,7 @@ export interface Script {
 export interface Execution {
   id: string;
   script: string;
-  status: 'Exitoso' | 'Error' | 'Cancelado' | 'Ejecutando';
+  status: 'Exitoso' | 'Error' | 'Cancelado' | 'Ejecutando' | 'Pausado';
   start: string;
   end: string;
   duration: string;

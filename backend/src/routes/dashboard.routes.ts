@@ -104,7 +104,7 @@ router.get("/summary", requireAuth, async (req, res) => {
 
         (SELECT COUNT(*)
         FROM ScriptExecutions ex JOIN VisibleScripts v ON v.id=ex.script_id
-        WHERE ex.status IN ('Ejecutando', 'RUNNING')
+        WHERE ex.status IN ('Ejecutando', 'Pausado', 'RUNNING')
         ) AS runningCount,
 
         (SELECT COUNT(*)

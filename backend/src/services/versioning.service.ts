@@ -14,10 +14,13 @@ function safeVersion(version: string): string {
 
 export function resolveManagedScriptPath(filePath: string): string {
   const scriptsRoot = path.resolve(env.runtime.scriptsDir);
+  const normalized = String(filePath || '').replace(/\\/g, '/');
   const resolved = path.isAbsolute(filePath)
     ? path.resolve(filePath)
-    : path.resolve(scriptsRoot, path.basename(filePath.replace(/\\/g, '/')));
-  if (!resolved.toLowerCase().startsWith(scriptsRoot.toLowerCase())) {
+    : path.resolve(scriptsRoot, normalized);
+  const rootLower = scriptsRoot.toLowerCase();
+  const resolvedLower = resolved.toLowerCase();
+  if (resolvedLower !== rootLower && !resolvedLower.startsWith(`${rootLower}${path.sep}`)) {
     throw new Error('Ruta de script fuera del directorio administrado.');
   }
   return resolved;

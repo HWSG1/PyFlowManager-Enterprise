@@ -230,6 +230,7 @@ export class ScriptsComponent {
       Exitoso: 'px-1.5 py-0.5 rounded text-[9px] bg-emerald-950 text-emerald-400',
       Error: 'px-1.5 py-0.5 rounded text-[9px] bg-rose-950 text-rose-400',
       Ejecutando: 'px-1.5 py-0.5 rounded text-[9px] bg-blue-950 text-blue-400',
+      Pausado: 'px-1.5 py-0.5 rounded text-[9px] bg-amber-950 text-amber-300',
       Cancelado: 'px-1.5 py-0.5 rounded text-[9px] bg-slate-800 text-slate-400',
       Nunca: 'px-1.5 py-0.5 rounded text-[9px] bg-slate-800 text-slate-500',
     };
