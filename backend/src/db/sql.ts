@@ -47,9 +47,16 @@ export async function getPool(): Promise<sql.ConnectionPool> {
     database: env.db.database,
     user: env.db.user,
     password: env.db.password,
+    connectionTimeout: Number(process.env.DB_CONNECTION_TIMEOUT_MS || 30000),
+    requestTimeout: Number(process.env.DB_REQUEST_TIMEOUT_MS || 60000),
     options: {
       encrypt: env.db.encrypt,
       trustServerCertificate: env.db.trustServerCertificate
+    },
+    pool: {
+      max: Number(process.env.DB_POOL_MAX || 10),
+      min: 0,
+      idleTimeoutMillis: Number(process.env.DB_POOL_IDLE_TIMEOUT_MS || 30000)
     }
   };
 

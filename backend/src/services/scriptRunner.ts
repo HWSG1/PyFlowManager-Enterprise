@@ -64,6 +64,25 @@ function rememberLine(buffer: string[], line: string): void {
   }
 }
 
+async function safeAddExecutionLog(
+  executionId: number,
+  level: 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR' | 'CRITICAL',
+  message: string,
+  failureCounter: { count: number },
+  source = 'runner'
+): Promise<void> {
+  try {
+    await addExecutionLog(executionId, level, message, source);
+  } catch (error: any) {
+    failureCounter.count += 1;
+    if (failureCounter.count <= 5 || failureCounter.count % 100 === 0) {
+      console.error(
+        `[execution-log] No se pudo guardar log de ejecución ${executionId}: ${error?.message || error}`
+      );
+    }
+  }
+}
+
 async function setExecutionStatus(executionId: number, status: 'Ejecutando' | 'Pausado'): Promise<void> {
   const pool = await getPool();
   await pool.request()
@@ -309,7 +328,9 @@ if (!skipQueueCheck) {
       `);
   }
 
-  await addExecutionLog(executionId, 'INFO', `Iniciando ejecución: ${script.name}`);
+  const logPersistFailures = { count: 0 };
+
+  await safeAddExecutionLog(executionId, 'INFO', `Iniciando ejecución: ${script.name}`, logPersistFailures);
   emitExecutionLog(executionId, {
     level: 'INFO',
     message: `Iniciando ejecución: ${script.name}`,
@@ -367,7 +388,7 @@ if (!skipQueueCheck) {
       if (pauseMessage !== null) {
         await setExecutionStatus(executionId, 'Pausado');
         rememberLine(recentOutput, pauseMessage);
-        await addExecutionLog(executionId, 'WARNING', pauseMessage);
+        await safeAddExecutionLog(executionId, 'WARNING', pauseMessage, logPersistFailures);
         emitExecutionLog(executionId, {
           level: 'WARNING',
           message: pauseMessage,
@@ -382,7 +403,7 @@ if (!skipQueueCheck) {
       if (resumedMessage !== null) {
         await setExecutionStatus(executionId, 'Ejecutando');
         rememberLine(recentOutput, resumedMessage);
-        await addExecutionLog(executionId, 'INFO', resumedMessage);
+        await safeAddExecutionLog(executionId, 'INFO', resumedMessage, logPersistFailures);
         emitExecutionLog(executionId, {
           level: 'INFO',
           message: resumedMessage,
@@ -394,7 +415,7 @@ if (!skipQueueCheck) {
       }
 
       rememberLine(recentOutput, line);
-      await addExecutionLog(executionId, 'INFO', line);
+      await safeAddExecutionLog(executionId, 'INFO', line, logPersistFailures, 'stdout');
       emitExecutionLog(executionId, {
         level: 'INFO',
         message: line,
@@ -408,7 +429,7 @@ if (!skipQueueCheck) {
 
     for (const line of lines) {
       rememberLine(recentOutput, line);
-      await addExecutionLog(executionId, 'ERROR', line);
+      await safeAddExecutionLog(executionId, 'ERROR', line, logPersistFailures, 'stderr');
       emitExecutionLog(executionId, {
         level: 'ERROR',
         message: line,
@@ -420,7 +441,7 @@ if (!skipQueueCheck) {
   child.on('error', async (error) => {
     const msg = `Error iniciando proceso Python: ${error.message}`;
     rememberLine(recentOutput, msg);
-    await addExecutionLog(executionId, 'ERROR', msg);
+    await safeAddExecutionLog(executionId, 'ERROR', msg, logPersistFailures);
     emitExecutionLog(executionId, {
       level: 'ERROR',
       message: msg,
@@ -440,7 +461,7 @@ if (!skipQueueCheck) {
     const currentStatus = current.recordset[0]?.status;
 
     if (currentStatus === 'Cancelado') {
-      await addExecutionLog(executionId, 'WARNING', 'Proceso detenido por cancelación manual.');
+      await safeAddExecutionLog(executionId, 'WARNING', 'Proceso detenido por cancelación manual.', logPersistFailures);
 
       emitExecutionLog(executionId, {
         level: 'WARNING',
@@ -461,10 +482,11 @@ if (!skipQueueCheck) {
       : '';
     const msg = `Proceso finalizado con código ${exitCode}${exitCode === 0 ? '' : `${signalText}${tail}`}`;
 
-    await addExecutionLog(
+    await safeAddExecutionLog(
       executionId,
       code === 0 ? 'INFO' : 'ERROR',
-      msg
+      msg,
+      logPersistFailures
     );
 
     await pool.request()
@@ -490,7 +512,7 @@ if (!skipQueueCheck) {
       const delaySeconds = Math.round(baseDelay * Math.pow(backoff, retryAttempt));
       const rootExecutionId = parentExecutionId || executionId;
       const retryMessage = `Reintento ${retryAttempt + 1}/${maxRetries} programado en ${delaySeconds} segundos.`;
-      await addExecutionLog(executionId, 'WARNING', retryMessage);
+      await safeAddExecutionLog(executionId, 'WARNING', retryMessage, logPersistFailures);
       emitExecutionLog(executionId, { level: 'WARNING', message: retryMessage, retryScheduled: true });
 
       await pool.request()

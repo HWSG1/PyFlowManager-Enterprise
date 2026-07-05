@@ -234,6 +234,8 @@ class Config:
     output_format: str
     save_transcript_json: bool
     json_output_dir: str
+    log_every_n: int
+    transcript_debug: bool
     dry_run: bool
 
 
@@ -281,6 +283,8 @@ def load_config() -> Config:
         output_format=output_format,
         save_transcript_json=env_bool("SAVE_TRANSCRIPT_JSON", False),
         json_output_dir=env_str("JSON_OUTPUT_DIR", ""),
+        log_every_n=max(1, env_int("LOG_EVERY_N", 500)),
+        transcript_debug=env_bool("TRANSCRIPT_DEBUG", False),
         dry_run=env_bool("DRY_RUN", False),
     )
 
@@ -1072,14 +1076,15 @@ def buscar_transcript_url(config: Config, token: str, conversation_details: Dict
         communication_id = candidato["communication_id"]
         purpose = candidato["purpose"]
         recording = candidato["recording"]
-        logger.info(
-            "Probando transcripturl | conversationId=%s | communicationId=%s | purpose=%s | recording=%s | prioridad=%s",
-            conversation_id,
-            communication_id,
-            purpose,
-            recording,
-            candidato["prioridad"],
-        )
+        if config.transcript_debug:
+            logger.info(
+                "Probando transcripturl | conversationId=%s | communicationId=%s | purpose=%s | recording=%s | prioridad=%s",
+                conversation_id,
+                communication_id,
+                purpose,
+                recording,
+                candidato["prioridad"],
+            )
 
         try:
             transcript_url = obtener_transcript_url(config, token, conversation_id, communication_id, logger)
@@ -1109,13 +1114,14 @@ def buscar_transcript_url(config: Config, token: str, conversation_details: Dict
                 "recording": recording,
                 "resultado": f"ERROR: {exc}",
             })
-            logger.warning(
-                "Error probando transcripturl | conversationId=%s | communicationId=%s | purpose=%s | error=%s",
-                conversation_id,
-                communication_id,
-                purpose,
-                exc,
-            )
+            if config.transcript_debug:
+                logger.warning(
+                    "Error probando transcripturl | conversationId=%s | communicationId=%s | purpose=%s | error=%s",
+                    conversation_id,
+                    communication_id,
+                    purpose,
+                    exc,
+                )
 
     return {
         "conversation_id": conversation_id,
@@ -1318,13 +1324,14 @@ def process_conversation_transcripts(
     end_utc = conv.get("conversationEnd", "")
     duration_sec = duration_seconds(start_utc, end_utc)
 
-    logger.info(
-        "Procesando conversacion %s/%s | %s | candidatos transcript: %s",
-        idx,
-        total,
-        conversation_id,
-        len(candidatos),
-    )
+    if idx == 1 or idx % config.log_every_n == 0 or idx == total:
+        logger.info(
+            "Procesando conversacion %s/%s | %s | candidatos transcript: %s",
+            idx,
+            total,
+            conversation_id,
+            len(candidatos),
+        )
 
     contact_flat: Dict[str, Any] = {}
     if config.output_mode == "transcript_campania":
@@ -1379,11 +1386,12 @@ def process_conversation_transcripts(
             "text": "",
         }
         rows.append(row)
-        logger.info(
-            "Transcript no disponible despues de probar candidatos | conversacion: %s | estado=%s",
-            conversation_id,
-            row["transcript_estado"],
-        )
+        if config.transcript_debug:
+            logger.info(
+                "Transcript no disponible despues de probar candidatos | conversacion: %s | estado=%s",
+                conversation_id,
+                row["transcript_estado"],
+            )
         return rows, transcript_not_found_count, errors
 
     try:
@@ -1406,13 +1414,14 @@ def process_conversation_transcripts(
             "text": text,
         }
         rows.append(row)
-        logger.info(
-            "Transcripcion OK | conversacion: %s | communicationId=%s | purpose=%s | chars=%s",
-            conversation_id,
-            communication_id,
-            transcript_lookup.get("purpose", ""),
-            len(text or ""),
-        )
+        if config.transcript_debug:
+            logger.info(
+                "Transcripcion OK | conversacion: %s | communicationId=%s | purpose=%s | chars=%s",
+                conversation_id,
+                communication_id,
+                transcript_lookup.get("purpose", ""),
+                len(text or ""),
+            )
         if config.api_sleep_seconds > 0:
             time.sleep(config.api_sleep_seconds)
     except Exception as exc:
@@ -1508,7 +1517,7 @@ def main() -> int:
                 except Exception as exc:
                     errors.append(f"Error procesando conversacion en paralelo: {exc}")
 
-                if completed == 1 or completed % 25 == 0 or completed == total_conversations:
+                if completed == 1 or completed % config.log_every_n == 0 or completed == total_conversations:
                     progress = int((completed / total_conversations) * 100) if total_conversations else 100
                     print(f"PYFLOW_PROGRESS={progress}", flush=True)
                     logger.info(
@@ -1574,7 +1583,8 @@ def main() -> int:
                     time.sleep(config.api_sleep_seconds)
                 except TranscriptNotFound as exc:
                     transcript_not_found_count += 1
-                    logger.info("Transcript omitido | conversación: %s | communicationId: %s | motivo: %s", conversation_id, communication_id, exc)
+                    if config.transcript_debug:
+                        logger.info("Transcript omitido | conversación: %s | communicationId: %s | motivo: %s", conversation_id, communication_id, exc)
                     continue
                 except Exception as exc:
                     msg = f"Error transcript conversationId={conversation_id} communicationId={communication_id}: {exc}"
