@@ -1,0 +1,277 @@
+{
+  "version": "1.0",
+  "descripcion": "Catálogo editable de temas de negocio para evaluar acierto operativo en llamadas.",
+  "temas": {
+    "ATM_RETIRO_NO_DISPENSADO": {
+      "descripcion": "Cliente indica que realizó un retiro en ATM/cajero automático, el monto fue debitado, pero no recibió el efectivo.",
+      "producto_servicio": "ATM / Cuenta / Tarjeta de débito",
+      "requiere_gestion_cc": "Depende del procedimiento vigente. Si el Contact Center puede registrar reclamo, debe gestionarse; si no, debe orientarse con claridad.",
+      "palabras_clave_cliente": [
+        "cajero no me dio el dinero",
+        "no me dispensó",
+        "no dispensó",
+        "no salió el efectivo",
+        "retiro en atm",
+        "cajero automático",
+        "me debitó",
+        "me hizo el cargo",
+        "me rebajó",
+        "no recibí el efectivo",
+        "perdí dinero en el cajero"
+      ],
+      "acciones_esperadas": [
+        "Identificar que se trata de un retiro ATM no dispensado.",
+        "Validar identidad del cliente según política interna.",
+        "Validar fecha, monto, cuenta/tarjeta y ubicación del ATM si el proceso lo requiere.",
+        "Indicar el proceso correcto de reclamo o gestión.",
+        "Registrar gestión/caso/reclamo si corresponde al Contact Center.",
+        "Explicar tiempos de respuesta, número de gestión y próximos pasos cuando aplique."
+      ],
+      "frases_gestion_correcta": [
+        "le voy a generar un reclamo",
+        "vamos a registrar su caso",
+        "le brindaré un número de gestión",
+        "el tiempo de respuesta es",
+        "validaremos la transacción",
+        "necesito confirmar la fecha y el monto"
+      ],
+      "senales_mala_gestion": [
+        "eso no se atiende aquí",
+        "debe ir a una agencia",
+        "tiene que ir a la sucursal",
+        "no podemos ayudarle",
+        "llame después",
+        "no sé",
+        "no tengo acceso"
+      ],
+      "conclusion_correcta_sugerida": "RECLAMO_ATM_RETIRO_NO_DISPENSADO"
+    },
+    "BANCA_DIGITAL_PROBLEMA_ACCESO": {
+      "descripcion": "Cliente reporta problema para ingresar a la app o banca web, usuario bloqueado, contraseña, migración, dispositivo o error de autenticación.",
+      "producto_servicio": "Banca digital / App / Web",
+      "requiere_gestion_cc": "Generalmente sí requiere diagnóstico, orientación o escalamiento según procedimiento.",
+      "palabras_clave_cliente": [
+        "no puedo entrar",
+        "no puedo ingresar",
+        "la app no funciona",
+        "la aplicación no funciona",
+        "banca en línea",
+        "usuario bloqueado",
+        "contraseña",
+        "clave",
+        "autenticación",
+        "me da error",
+        "migración atlántida",
+        "atlántida hn"
+      ],
+      "acciones_esperadas": [
+        "Identificar si el problema es usuario, contraseña, OTP, dispositivo, conexión, app o migración.",
+        "Validar identidad del cliente según política interna.",
+        "Brindar pasos claros de recuperación o desbloqueo.",
+        "Escalar o generar gestión cuando el caso no pueda resolverse en línea.",
+        "Confirmar comprensión del cliente y próximos pasos."
+      ],
+      "frases_gestion_correcta": [
+        "vamos a validar su usuario",
+        "vamos a recuperar su contraseña",
+        "le indicaré los pasos",
+        "voy a escalar el caso",
+        "generaré una gestión",
+        "confirme si recibió el código"
+      ],
+      "senales_mala_gestion": [
+        "intente más tarde",
+        "vaya a agencia",
+        "no sé",
+        "no tenemos sistema",
+        "no puedo ayudarle",
+        "ese error no lo vemos aquí"
+      ],
+      "conclusion_correcta_sugerida": "SOPORTE_BANCA_DIGITAL"
+    },
+    "NO_RECIBE_CODIGO_OTP": {
+      "descripcion": "Cliente indica que no recibe código OTP, token, SMS, correo de validación o código de seguridad.",
+      "producto_servicio": "OTP / Seguridad / Banca digital",
+      "requiere_gestion_cc": "Sí, requiere validación y diagnóstico del canal de envío de código.",
+      "palabras_clave_cliente": [
+        "no me llega el código",
+        "no recibo el código",
+        "no me llega otp",
+        "otp",
+        "token",
+        "código de seguridad",
+        "sms",
+        "correo de validación",
+        "me pide un código"
+      ],
+      "acciones_esperadas": [
+        "Validar identidad del cliente.",
+        "Confirmar medio de envío del código: SMS, correo u otro.",
+        "Verificar si el dato registrado está actualizado según procedimiento.",
+        "Brindar pasos correctos o generar gestión si aplica.",
+        "No cerrar la llamada sin dar alternativa clara."
+      ],
+      "frases_gestion_correcta": [
+        "vamos a validar el número registrado",
+        "vamos a validar el correo",
+        "le voy a indicar los pasos",
+        "generaré el reporte",
+        "actualizaremos sus datos según procedimiento"
+      ],
+      "senales_mala_gestion": [
+        "solo espere",
+        "intente mañana",
+        "no podemos hacer nada",
+        "vaya a agencia sin validar",
+        "no sé por qué no le llega"
+      ],
+      "conclusion_correcta_sugerida": "NO_RECIBE_CODIGO_OTP"
+    },
+    "TARJETA_EXTRAVIADA_O_BLOQUEO": {
+      "descripcion": "Cliente reporta tarjeta perdida, robada, extraviada o solicita bloqueo de tarjeta.",
+      "producto_servicio": "Tarjeta de crédito / débito",
+      "requiere_gestion_cc": "Sí, usualmente requiere bloqueo inmediato o gestión de seguridad según procedimiento.",
+      "palabras_clave_cliente": [
+        "perdí mi tarjeta",
+        "me robaron la tarjeta",
+        "extravié la tarjeta",
+        "bloquear tarjeta",
+        "bloqueo de tarjeta",
+        "tarjeta perdida",
+        "monedero",
+        "billetera",
+        "wallet"
+      ],
+      "acciones_esperadas": [
+        "Identificar riesgo de seguridad.",
+        "Validar identidad según política.",
+        "Bloquear o guiar bloqueo de tarjeta si corresponde.",
+        "Informar pasos para reposición y prevención de fraude.",
+        "Confirmar si hubo consumos no reconocidos."
+      ],
+      "frases_gestion_correcta": [
+        "vamos a bloquear la tarjeta",
+        "por seguridad",
+        "validaremos consumos",
+        "le explicaré la reposición",
+        "confirme si reconoce las transacciones"
+      ],
+      "senales_mala_gestion": [
+        "llame después",
+        "vaya a agencia primero",
+        "no puedo bloquear",
+        "no sé qué hacer",
+        "espere a ver si aparece"
+      ],
+      "conclusion_correcta_sugerida": "BLOQUEO_TARJETA_EXTRAVIADA"
+    },
+    "CARGO_NO_RECONOCIDO_O_FRAUDE": {
+      "descripcion": "Cliente reporta transacción, cargo, compra, retiro o consumo que no reconoce.",
+      "producto_servicio": "Tarjetas / Cuentas / Fraude",
+      "requiere_gestion_cc": "Sí, requiere validación, bloqueo preventivo o reclamo según procedimiento.",
+      "palabras_clave_cliente": [
+        "no reconozco",
+        "cargo no reconocido",
+        "transacción no reconocida",
+        "compra que no hice",
+        "me aparece un consumo",
+        "fraude",
+        "me sacaron dinero",
+        "me hicieron un cargo"
+      ],
+      "acciones_esperadas": [
+        "Identificar si es fraude o desconocimiento de comercio.",
+        "Validar identidad.",
+        "Validar fecha, monto y comercio.",
+        "Aplicar procedimiento de bloqueo/reclamo si corresponde.",
+        "Informar tiempos y recomendaciones de seguridad."
+      ],
+      "frases_gestion_correcta": [
+        "vamos a validar la transacción",
+        "vamos a bloquear preventivamente",
+        "generaré el reclamo",
+        "le brindaré el número de gestión",
+        "no comparta sus credenciales"
+      ],
+      "senales_mala_gestion": [
+        "espere a que se revierta solo",
+        "no podemos hacer nada",
+        "vaya a agencia sin validar",
+        "llame al comercio únicamente",
+        "no sé"
+      ],
+      "conclusion_correcta_sugerida": "RECLAMO_CARGO_NO_RECONOCIDO"
+    },
+    "ACTUALIZACION_DATOS": {
+      "descripcion": "Cliente necesita actualizar datos personales, número telefónico, correo, dirección o información de contacto.",
+      "producto_servicio": "Datos de cliente / CRM",
+      "requiere_gestion_cc": "Depende del dato y política interna; puede requerir canal digital, agencia o gestión interna.",
+      "palabras_clave_cliente": [
+        "actualizar datos",
+        "cambiar número",
+        "cambiar correo",
+        "actualizar teléfono",
+        "actualizar dirección",
+        "datos personales",
+        "mi número cambió",
+        "mi correo cambió"
+      ],
+      "acciones_esperadas": [
+        "Identificar qué dato necesita actualizarse.",
+        "Validar identidad.",
+        "Indicar canal correcto y requisitos según política.",
+        "Generar gestión si el Contact Center puede hacerlo.",
+        "Explicar tiempos y confirmación de actualización."
+      ],
+      "frases_gestion_correcta": [
+        "vamos a validar sus datos",
+        "le indicaré los requisitos",
+        "podemos actualizar",
+        "debe presentar",
+        "generaré una gestión"
+      ],
+      "senales_mala_gestion": [
+        "no se puede",
+        "no sé",
+        "vaya a agencia" ,
+        "llame después",
+        "no tengo acceso"
+      ],
+      "conclusion_correcta_sugerida": "ACTUALIZACION_DATOS"
+    },
+    "INFORMACION_GENERAL": {
+      "descripcion": "Consulta informativa donde el cliente solicita orientación general sobre productos, horarios, requisitos o servicios.",
+      "producto_servicio": "General",
+      "requiere_gestion_cc": "No necesariamente; puede bastar con orientación clara y completa.",
+      "palabras_clave_cliente": [
+        "consulta",
+        "información",
+        "requisitos",
+        "horario",
+        "cómo puedo",
+        "quiero saber",
+        "me puede indicar"
+      ],
+      "acciones_esperadas": [
+        "Escuchar y entender la consulta.",
+        "Brindar información clara y completa.",
+        "Confirmar si el cliente necesita algo adicional.",
+        "Tipificar correctamente."
+      ],
+      "frases_gestion_correcta": [
+        "con gusto le indico",
+        "los requisitos son",
+        "el horario es",
+        "puede realizarlo de esta manera",
+        "¿algo más en que pueda ayudarle?"
+      ],
+      "senales_mala_gestion": [
+        "no sé",
+        "busque en la página",
+        "llame después",
+        "no tengo información"
+      ],
+      "conclusion_correcta_sugerida": "INFORMACION_GENERAL"
+    }
+  }
+}

@@ -1,0 +1,83 @@
+{
+  "version": "1.0",
+  "descripcion": "Matriz de evaluación para medir acierto operativo en llamadas.",
+  "criterios": {
+    "identificacion_motivo": {
+      "peso": 20,
+      "descripcion": "Evalúa si el operador identificó correctamente el motivo real del cliente.",
+      "rubrica": {
+        "20": "Identificó claramente el motivo real y lo confirmó o actuó sobre él.",
+        "10": "Identificó parcialmente el motivo, pero omitió detalles relevantes.",
+        "0": "No identificó el motivo o entendió otra necesidad."
+      }
+    },
+    "validacion": {
+      "peso": 15,
+      "descripcion": "Evalúa si el operador realizó las validaciones necesarias para atender o escalar.",
+      "rubrica": {
+        "15": "Validó identidad y datos operativos necesarios según el caso.",
+        "8": "Validó parcialmente, pero faltaron datos importantes.",
+        "0": "No validó datos necesarios o la transcripción no evidencia validación."
+      }
+    },
+    "aplicacion_proceso": {
+      "peso": 30,
+      "descripcion": "Evalúa si aplicó el proceso correcto: gestión, reclamo, bloqueo, escalamiento, orientación o redirección válida.",
+      "rubrica": {
+        "30": "Aplicó correctamente el proceso esperado o la redirección fue justificada.",
+        "15": "Aplicó el proceso de forma parcial o incompleta.",
+        "0": "No gestionó, redirigió incorrectamente o dio una respuesta contraria al proceso esperado."
+      }
+    },
+    "calidad_solucion": {
+      "peso": 15,
+      "descripcion": "Evalúa si la solución/orientación fue clara, completa y con próximos pasos.",
+      "rubrica": {
+        "15": "Explicó solución, requisitos, tiempos y próximos pasos con claridad.",
+        "8": "Brindó orientación, pero incompleta o poco clara.",
+        "0": "No brindó solución clara o cerró sin orientar."
+      }
+    },
+    "empatia_trato": {
+      "peso": 10,
+      "descripcion": "Evalúa cortesía, disposición, escucha activa y trato adecuado del operador.",
+      "rubrica": {
+        "10": "Trato cordial, empático y profesional.",
+        "5": "Trato neutro o correcto, con poca empatía.",
+        "0": "Trato poco servicial, cortante o sin disposición."
+      }
+    },
+    "tipificacion": {
+      "peso": 10,
+      "descripcion": "Evalúa si la conclusión/wrap-up de Genesys coincide con el motivo real.",
+      "rubrica": {
+        "10": "Conclusión coincide con el motivo real.",
+        "5": "Conclusión cercana pero demasiado general.",
+        "0": "Conclusión no coincide o induce a error operativo."
+      }
+    }
+  },
+  "umbrales_resultado": [
+    {"min": 90, "max": 100, "resultado": "Acierto alto"},
+    {"min": 75, "max": 89, "resultado": "Acierto"},
+    {"min": 60, "max": 74, "resultado": "Acierto parcial"},
+    {"min": 1, "max": 59, "resultado": "No acierto"},
+    {"min": 0, "max": 0, "resultado": "No evaluable"}
+  ],
+  "banderas_criticas": {
+    "redireccion_incorrecta": "Operador remitió a agencia/u otro canal sin evidencia de que correspondía.",
+    "no_gestiono": "El motivo requería gestión y no hay evidencia de que el operador la realizara.",
+    "informacion_incorrecta": "El operador brindó información que parece contraria al procedimiento cargado.",
+    "mala_tipificacion": "La conclusión de Genesys no coincide con el motivo real.",
+    "baja_empatia": "Respuesta poco servicial, cortante o sin disposición.",
+    "cliente_recurrente": "Cliente volvió a llamar por el mismo motivo o en una ventana cercana.",
+    "transcripcion_insuficiente": "No hay texto suficiente para evaluar con confianza."
+  },
+  "reglas_operativas": [
+    "No asumir mala atención solo porque el cliente esté molesto.",
+    "No asumir buena atención solo porque hubo saludo o cortesía.",
+    "Una redirección solo es incorrecta si contradice reglas de negocio cargadas o si no hubo validación/orientación mínima.",
+    "Si no hay evidencia en la transcripción, clasificar ese punto como No evidenciado.",
+    "Toda conclusión debe contener evidencia resumida del cliente y del operador."
+  ]
+}

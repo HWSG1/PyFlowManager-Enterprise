@@ -228,6 +228,20 @@ if (!skipQueueCheck) {
     `);
 
   const resolvedGlobalParams: Record<string, string> = {};
+  const allGlobalParams: Record<string, string> = {};
+
+  const allGlobalValueResult = await pool.request().query(`
+    SELECT
+      var_key,
+      var_value
+    FROM dbo.GlobalVariables
+  `);
+
+  for (const item of allGlobalValueResult.recordset) {
+    const key = String(item.var_key || '').trim();
+    if (!key) continue;
+    allGlobalParams[key] = String(item.var_value ?? '');
+  }
 
   for (const param of globalParamResult.recordset) {
     const globalKey = param.global_key || param.param_key;
@@ -343,6 +357,7 @@ if (!skipQueueCheck) {
     shell: false,
     env: {
       ...process.env,
+      ...allGlobalParams,
       ...finalParameters,
       PYTHONUNBUFFERED: '1',
       PYFLOW_EXECUTION_ID: String(executionId),
