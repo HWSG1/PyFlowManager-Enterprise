@@ -1,2 +1,6 @@
 runtime/scripts/.versions/
 runtime/scripts/.uploads/
+runtime/scripts/*/output/
+runtime/scripts/*/output/**
+runtime/control/
+runtime/control/**

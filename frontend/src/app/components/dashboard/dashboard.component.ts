@@ -285,7 +285,7 @@ Chart.register(...registerables);
                     </span>
 
                     <span class="text-[11px] text-blue-400 whitespace-nowrap">
-                      {{ formatDate(s.next_run_at) }}
+                      {{ formatDate(s.next_run_at, true) }}
                     </span>
                   </div>
 
@@ -644,14 +644,25 @@ export class DashboardComponent implements AfterViewInit, OnDestroy {
     return map[normalized] || map['Cancelado'];
   }
 
-  formatDate(value: any): string {
+  formatDate(value: any, storedAsUtc = false): string {
     if (!value) return '-';
 
     try {
       const text = String(value).trim();
+      const sqlDateTime = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?$/i.exec(text);
+
+      if (sqlDateTime && !storedAsUtc) {
+        const [, year, month, day, hourText, minute] = sqlDateTime;
+        const hour = Number(hourText);
+        const hour12 = hour % 12 || 12;
+        const suffix = hour < 12 ? 'a. m.' : 'p. m.';
+        return `${day}/${month}/${year}, ${String(hour12).padStart(2, '0')}:${minute} ${suffix}`;
+      }
+
       const sqlDateWithoutTimezone = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2}(?:\.\d+)?)$/.exec(text);
-      const normalized = sqlDateWithoutTimezone
-        ? `${sqlDateWithoutTimezone[1]}T${sqlDateWithoutTimezone[2]}Z`
+      const hasTimezone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(text);
+      const normalized = sqlDateWithoutTimezone && !hasTimezone
+        ? `${sqlDateWithoutTimezone[1]}T${sqlDateWithoutTimezone[2]}${storedAsUtc ? 'Z' : ''}`
         : text;
       const date = value instanceof Date ? value : new Date(normalized);
 

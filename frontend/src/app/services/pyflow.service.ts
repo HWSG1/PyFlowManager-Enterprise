@@ -5,13 +5,24 @@ import { interval, Subscription } from 'rxjs';
 import { Script, Execution, Schedule, Toast, TabName, EnvParam } from '../models/models';
 import { environment } from '../../environments/environment';
 
-function formatDate(value: any): string {
+function formatDate(value: any, storedAsUtc = false): string {
   if (!value) return 'Nunca';
 
   const raw = String(value).trim();
+  const sqlDateTime = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?$/i.exec(raw);
+
+  if (sqlDateTime && !storedAsUtc) {
+    const [, year, month, day, hourText, minute] = sqlDateTime;
+    const hour = Number(hourText);
+    const hour12 = hour % 12 || 12;
+    const suffix = hour < 12 ? 'a. m.' : 'p. m.';
+    return `${day}/${month}/${year}, ${String(hour12).padStart(2, '0')}:${minute} ${suffix}`;
+  }
+
   const sqlDateWithoutTimezone = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2}(?:\.\d+)?)$/.exec(raw);
-  const normalized = sqlDateWithoutTimezone
-    ? `${sqlDateWithoutTimezone[1]}T${sqlDateWithoutTimezone[2]}Z`
+  const hasTimezone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(raw);
+  const normalized = sqlDateWithoutTimezone && !hasTimezone
+    ? `${sqlDateWithoutTimezone[1]}T${sqlDateWithoutTimezone[2]}${storedAsUtc ? 'Z' : ''}`
     : raw;
   const date = value instanceof Date ? value : new Date(normalized);
 
@@ -165,7 +176,7 @@ export class PyflowService {
       path: row.file_path || '',
       status: row.is_active ? 'active' : 'inactive',
       lastRun: formatDate(row.last_execution_start_time),
-      nextRun: formatDate(row.next_run_at),
+      nextRun: formatDate(row.next_run_at, true),
       lastStatus: row.last_execution_status || 'Nunca',
       description: row.description || '',
       author: row.created_by || 'Admin_User',
@@ -196,7 +207,7 @@ export class PyflowService {
       scriptName: row.script_name,
       frequency: row.frequency_label || 'Personalizado',
       cronExpression: row.cron_expression || '',
-      nextRun: formatDate(row.next_run_at),
+      nextRun: formatDate(row.next_run_at, true),
       status: row.is_active ? 'active' : 'paused'
     };
   }
@@ -461,8 +472,17 @@ export class PyflowService {
     return this.http.post(`${this.apiUrl}/scripts/executions/${executionId}/cancel`, {});
   }
 
+  pauseExecution(executionId: number) {
+    return this.http.post(`${this.apiUrl}/scripts/executions/${executionId}/pause`, {});
+  }
+
   resumeExecution(executionId: number) {
     return this.http.post(`${this.apiUrl}/scripts/executions/${executionId}/resume`, {});
+  }
+
+  rerunExecution(executionId: string | number) {
+    const id = String(executionId).replace('EX-', '');
+    return this.http.post<any>(`${this.apiUrl}/scripts/executions/${id}/rerun`, {});
   }
 
   getScriptParameters(scriptId: number) {

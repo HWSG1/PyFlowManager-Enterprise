@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { getPool, sql } from '../db/sql';
 import { env } from '../config/env';
 import { runScript } from '../services/scriptRunner';
-import { exec } from 'child_process';
+import { exec, execFile } from 'child_process';
 import path from 'path';
 import multer from 'multer';
 import fs from 'fs';
@@ -16,6 +16,108 @@ import { emitExecutionLog } from '../services/logBus';
 const router = Router();
 
 const scriptsDir = path.resolve(env.runtime.scriptsDir);
+
+function controlWindowsProcess(pid: number, action: 'suspend' | 'resume'): Promise<void> {
+  const method = action === 'suspend' ? 'Suspend' : 'Resume';
+  const orderedPids = action === 'suspend'
+    ? '$targetPids = @($children.ToArray()) + @($rootId)'
+    : '$targetPids = @($rootId) + @($children.ToArray())';
+  const script = `
+$ErrorActionPreference = 'Stop'
+$code = @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+
+public static class PyFlowProcessControl
+{
+    [DllImport("ntdll.dll")]
+    private static extern int NtSuspendProcess(IntPtr processHandle);
+
+    [DllImport("ntdll.dll")]
+    private static extern int NtResumeProcess(IntPtr processHandle);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr OpenProcess(uint processAccess, bool bInheritHandle, int processId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr hObject);
+
+    private const uint PROCESS_SUSPEND_RESUME = 0x0800;
+
+    public static void Suspend(int pid)
+    {
+        Control(pid, true);
+    }
+
+    public static void Resume(int pid)
+    {
+        Control(pid, false);
+    }
+
+    private static void Control(int pid, bool suspend)
+    {
+        IntPtr handle = OpenProcess(PROCESS_SUSPEND_RESUME, false, pid);
+        if (handle == IntPtr.Zero)
+        {
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        }
+
+        try
+        {
+            int result = suspend ? NtSuspendProcess(handle) : NtResumeProcess(handle);
+            if (result != 0)
+            {
+                throw new InvalidOperationException("Nt process control failed: " + result);
+            }
+        }
+        finally
+        {
+            CloseHandle(handle);
+        }
+    }
+}
+'@
+Add-Type -TypeDefinition $code
+$rootId = ${pid}
+$all = @(Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId)
+$children = New-Object System.Collections.Generic.List[int]
+$queue = New-Object System.Collections.Generic.Queue[int]
+$queue.Enqueue($rootId)
+while ($queue.Count -gt 0) {
+  $current = $queue.Dequeue()
+  foreach ($proc in $all | Where-Object { $_.ParentProcessId -eq $current }) {
+    if (-not $children.Contains([int]$proc.ProcessId)) {
+      $children.Add([int]$proc.ProcessId)
+      $queue.Enqueue([int]$proc.ProcessId)
+    }
+  }
+}
+${orderedPids}
+foreach ($targetPid in $targetPids) {
+  $process = Get-Process -Id $targetPid -ErrorAction SilentlyContinue
+  if ($process) {
+    [PyFlowProcessControl]::${method}([int]$targetPid)
+  }
+}
+`;
+
+  return new Promise((resolve, reject) => {
+    execFile(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
+      { windowsHide: true, timeout: 15000 },
+      (error, stdout, stderr) => {
+        if (error) {
+          reject(new Error(stderr?.trim() || stdout?.trim() || error.message));
+          return;
+        }
+
+        resolve();
+      }
+    );
+  });
+}
 
 if (!fs.existsSync(scriptsDir)) {
   fs.mkdirSync(scriptsDir, { recursive: true });
@@ -1044,6 +1146,80 @@ router.post('/:id/run', requireAuth, requireScriptAccess('execute'), async (req,
   }
 });
 
+router.post('/executions/:id/rerun', requireAuth, requireExecutionAccess('execute'), async (req, res, next) => {
+  try {
+    const executionId = Number(req.params.id);
+    const pool = await getPool();
+
+    const executionResult = await pool.request()
+      .input('id', sql.Int, executionId)
+      .query(`
+        SELECT TOP 1 id, script_id, status
+        FROM dbo.ScriptExecutions
+        WHERE id = @id
+      `);
+
+    if (!executionResult.recordset.length) {
+      return res.status(404).json({ message: 'Ejecución no encontrada.' });
+    }
+
+    const previousExecution = executionResult.recordset[0];
+
+    if (!['Error', 'Cancelado'].includes(previousExecution.status)) {
+      return res.status(400).json({
+        message: 'Solo se pueden volver a ejecutar ejecuciones en Error o Cancelado.'
+      });
+    }
+
+    const paramsResult = await pool.request()
+      .input('execution_id', sql.Int, executionId)
+      .input('script_id', sql.Int, previousExecution.script_id)
+      .query(`
+        SELECT
+          ep.param_key,
+          ep.param_value
+        FROM dbo.ExecutionParameters ep
+        JOIN dbo.ScriptParameters sp
+          ON sp.script_id = @script_id
+          AND sp.param_key = ep.param_key
+        WHERE ep.execution_id = @execution_id
+          AND ISNULL(sp.control_type, '') <> 'global'
+          AND ISNULL(sp.param_type, '') <> 'global'
+          AND ISNULL(ep.param_value, '') <> '********'
+        ORDER BY ep.param_key
+      `);
+
+    const parameters: Record<string, string> = {};
+    for (const row of paramsResult.recordset) {
+      parameters[row.param_key] = row.param_value ?? '';
+    }
+
+    const result = await runScript(
+      Number(previousExecution.script_id),
+      (req as any).user?.id || env.defaultUserId,
+      parameters
+    );
+
+    await auditEvent(req, 'execution.rerun', 'execution', result.executionId, {
+      previous_execution_id: executionId,
+      previous_status: previousExecution.status
+    }, {
+      script_id: previousExecution.script_id,
+      parameters_count: Object.keys(parameters).length
+    });
+
+    res.status(202).json({
+      ...result,
+      executionId: result.executionId,
+      execution_id: result.executionId,
+      id: result.executionId,
+      previousExecutionId: executionId
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.post('/executions/:id/cancel', requireAuth, requirePermission('executions.cancel'), requireExecutionAccess('execute'), async (req, res, next) => {
   try {
     const executionId = Number(req.params.id);
@@ -1086,6 +1262,62 @@ router.post('/executions/:id/cancel', requireAuth, requirePermission('executions
   }
 });
 
+router.post('/executions/:id/pause', requireAuth, requireExecutionAccess('execute'), async (req, res, next) => {
+  try {
+    const executionId = Number(req.params.id);
+    const pool = await getPool();
+
+    const result = await pool.request()
+      .input('id', sql.Int, executionId)
+      .query(`
+        SELECT TOP 1 id, process_id, status
+        FROM dbo.ScriptExecutions
+        WHERE id = @id
+      `);
+
+    if (!result.recordset.length) {
+      return res.status(404).json({ message: 'Ejecución no encontrada.' });
+    }
+
+    const execution = result.recordset[0];
+
+    if (execution.status !== 'Ejecutando') {
+      return res.status(400).json({ message: 'La ejecución no está en proceso.' });
+    }
+
+    if (!execution.process_id) {
+      return res.status(400).json({ message: 'La ejecución no tiene proceso asociado para pausar.' });
+    }
+
+    await controlWindowsProcess(Number(execution.process_id), 'suspend');
+
+    await pool.request()
+      .input('execution_id', sql.Int, executionId)
+      .input('status', sql.NVarChar(20), 'Pausado')
+      .query(`
+        UPDATE dbo.ScriptExecutions
+        SET status = @status
+        WHERE id = @execution_id
+          AND status = 'Ejecutando'
+      `);
+
+    await addExecutionLog(executionId, 'WARNING', 'Ejecución pausada manualmente desde PyFlow Manager.');
+    emitExecutionLog(executionId, {
+      level: 'WARNING',
+      message: 'Ejecución pausada manualmente desde PyFlow Manager.',
+      status: 'Pausado',
+      paused: true,
+      source: 'runner'
+    });
+
+    await auditEvent(req, 'execution.pause', 'execution', executionId, { status: 'Ejecutando' }, { status: 'Pausado' });
+
+    res.json({ ok: true, message: 'Ejecución pausada correctamente.' });
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.post('/executions/:id/resume', requireAuth, requireExecutionAccess('execute'), async (req, res, next) => {
   try {
     const executionId = Number(req.params.id);
@@ -1094,7 +1326,7 @@ router.post('/executions/:id/resume', requireAuth, requireExecutionAccess('execu
     const result = await pool.request()
       .input('id', sql.Int, executionId)
       .query(`
-        SELECT TOP 1 id, status
+        SELECT TOP 1 id, process_id, status
         FROM dbo.ScriptExecutions
         WHERE id = @id
       `);
@@ -1107,6 +1339,10 @@ router.post('/executions/:id/resume', requireAuth, requireExecutionAccess('execu
 
     if (execution.status !== 'Pausado') {
       return res.status(400).json({ message: 'La ejecución no está pausada.' });
+    }
+
+    if (execution.process_id) {
+      await controlWindowsProcess(Number(execution.process_id), 'resume');
     }
 
     const controlDirectory = path.resolve(env.runtime.controlDir, 'executions', String(executionId));

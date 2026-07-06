@@ -41,6 +41,13 @@ import { ScriptGovernanceComponent } from '../script-governance/script-governanc
             </button>
 
             <button
+              (click)="pauseExecution()"
+              [disabled]="!isRunning || isPaused"
+              class="bg-slate-800 hover:bg-slate-700 disabled:opacity-50 disabled:cursor-not-allowed text-slate-200 border border-slate-700 font-semibold text-xs px-4 py-2.5 rounded-lg">
+              ⏸ Pausar
+            </button>
+
+            <button
               (click)="resumeExecution()"
               [disabled]="!isPaused"
               class="bg-amber-600 hover:bg-amber-500 disabled:opacity-50 disabled:cursor-not-allowed text-white font-semibold text-xs px-4 py-2.5 rounded-lg">
@@ -354,7 +361,7 @@ import { ScriptGovernanceComponent } from '../script-governance/script-governanc
                     <th class="px-5 py-3 text-left">Inicio</th>
                     <th class="px-5 py-3 text-left">Duración</th>
                     <th class="px-5 py-3 text-left">Mensaje</th>
-                    <th class="px-5 py-3 text-left">Log</th>
+                    <th class="px-5 py-3 text-left">Acción</th>
                   </tr>
                 </thead>
 
@@ -376,11 +383,22 @@ import { ScriptGovernanceComponent } from '../script-governance/script-governanc
                       </td>
 
                       <td class="px-5 py-3">
+                        <div class="flex items-center gap-2">
                         <button
                           (click)="openExecutionLog(ex.id)"
                           class="text-blue-400 hover:text-blue-300 font-semibold text-xs">
                           Ver Log
                         </button>
+
+                        @if (canRerunExecution(ex)) {
+                          <button
+                            (click)="rerunExecution(ex)"
+                            [disabled]="isRunning || isPaused"
+                            class="text-emerald-400 hover:text-emerald-300 disabled:opacity-50 disabled:cursor-not-allowed font-semibold text-xs">
+                            Reintentar
+                          </button>
+                        }
+                        </div>
                       </td>
                     </tr>
                   }
@@ -439,6 +457,10 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
 
   get scriptExecutions() {
     return this.svc.executions().filter(e => e.script === this.script?.name);
+  }
+
+  canRerunExecution(execution: any): boolean {
+    return execution?.status === 'Error' || execution?.status === 'Cancelado';
   }
 
   isGlobalParam(param: any): boolean {
@@ -862,6 +884,99 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
       error: err => {
         this.consoleLines.push({
           text: `[ERROR] No se pudo cancelar: ${err?.error?.message || err.message}`,
+          cls: 'text-red-400'
+        });
+        this.scrollConsoleToBottom();
+      }
+    });
+  }
+
+  pauseExecution() {
+    if (!this.isRunning || this.isPaused || !this.currentExecutionId) return;
+
+    this.svc.pauseExecution(this.currentExecutionId).subscribe({
+      next: () => {
+        this.isRunning = false;
+        this.isPaused = true;
+        this.statusText = 'Pausado';
+
+        this.consoleLines.push({
+          text: '[SYSTEM] Ejecución pausada manualmente.',
+          cls: 'text-amber-300'
+        });
+        this.scrollConsoleToBottom();
+
+        this.svc.loadExecutions();
+      },
+      error: err => {
+        this.consoleLines.push({
+          text: `[ERROR] No se pudo pausar: ${err?.error?.message || err.message}`,
+          cls: 'text-red-400'
+        });
+        this.scrollConsoleToBottom();
+      }
+    });
+  }
+
+  rerunExecution(execution: any) {
+    if (!this.canRerunExecution(execution) || this.isRunning || this.isPaused) return;
+
+    const previousId = Number(String(execution.id).replace('EX-', ''));
+    if (!previousId) return;
+
+    this.stopConsoleWatch();
+    this.viewingExecutionParameters = null;
+    this.executionParams = [];
+    this.consoleLines = [];
+    this.shouldFollowConsole = true;
+    this.statusText = 'Iniciando...';
+    this.progress = 5;
+    this.isRunning = true;
+    this.isPaused = false;
+
+    this.consoleLines.push({
+      text: `[SYSTEM] Reintentando EX-${previousId} con los mismos parámetros`,
+      cls: 'text-amber-300'
+    });
+    this.scrollConsoleToBottom(true);
+
+    this.svc.rerunExecution(previousId).subscribe({
+      next: result => {
+        const executionId =
+          result?.executionId ??
+          result?.execution_id ??
+          result?.id;
+
+        if (!executionId) {
+          this.isRunning = false;
+          this.isPaused = false;
+          this.statusText = 'Error';
+          this.progress = 0;
+          this.consoleLines.push({
+            text: '[ERROR] El backend no devolvió el ID de la nueva ejecución.',
+            cls: 'text-red-400'
+          });
+          this.scrollConsoleToBottom();
+          return;
+        }
+
+        this.currentExecutionId = Number(executionId);
+        this.consoleLines.push({
+          text: `[SYSTEM] Nueva ejecución EX-${executionId} iniciada desde EX-${previousId}`,
+          cls: 'text-blue-400'
+        });
+        this.scrollConsoleToBottom();
+        this.connectExecutionStream(Number(executionId));
+        this.svc.loadExecutions();
+      },
+      error: err => {
+        this.isRunning = false;
+        this.isPaused = false;
+        this.statusText = 'Error';
+        this.progress = 0;
+
+        this.consoleLines.push({
+          text: `[ERROR] No se pudo reintentar: ${err?.error?.message || err.message}`,
           cls: 'text-red-400'
         });
         this.scrollConsoleToBottom();

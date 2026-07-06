@@ -76,7 +76,7 @@ router.get("/summary", requireAuth, async (req, res) => {
     .input("user_id", sql.Int, user.id)
     .input("is_super_admin", sql.Bit, !!user.is_super_admin)
     .query(`
-    DECLARE @todayStart DATETIME = DATEADD(HOUR, -6, CAST(CAST(GETDATE() AS DATE) AS DATETIME));
+    DECLARE @todayStart DATETIME = CAST(CAST(GETDATE() AS DATE) AS DATETIME);
     DECLARE @tomorrowStart DATETIME = DATEADD(DAY, 1, @todayStart);
     ;WITH VisibleScripts AS (${visibleScriptsCte})
 
@@ -170,15 +170,15 @@ router.get("/summary", requireAuth, async (req, res) => {
     .query(`
     WITH VisibleScripts AS (${visibleScriptsCte})
     SELECT
-        CAST(DATEADD(HOUR, -6, start_time) AS DATE) AS executionDate,
+        CAST(start_time AS DATE) AS executionDate,
 
         SUM(CASE WHEN status = 'Exitoso' THEN 1 ELSE 0 END) AS successCount,
         SUM(CASE WHEN status = 'Error' THEN 1 ELSE 0 END) AS errorCount
 
     FROM ScriptExecutions ex JOIN VisibleScripts v ON v.id=ex.script_id
-    WHERE ex.start_time >= DATEADD(HOUR, 6, CAST(@date_from AS DATETIME2))
-      AND ex.start_time < DATEADD(HOUR, 6, DATEADD(DAY, 1, CAST(@date_to AS DATETIME2)))
-    GROUP BY CAST(DATEADD(HOUR, -6, ex.start_time) AS DATE)
+    WHERE ex.start_time >= CAST(@date_from AS DATETIME2)
+      AND ex.start_time < DATEADD(DAY, 1, CAST(@date_to AS DATETIME2))
+    GROUP BY CAST(ex.start_time AS DATE)
     ORDER BY executionDate
     `);
 
