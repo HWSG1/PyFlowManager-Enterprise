@@ -1,0 +1,113 @@
+{
+  "version": "2.8.1",
+  "nombre": "Matriz de Evaluación - Pregunta 2.8",
+  "pregunta": "Resuelve eficientemente el problema del cliente",
+  "objetivo": "Evaluar únicamente si el asesor dio una respuesta útil y eficiente al motivo del cliente, ya sea resolviendo, gestionando, orientando correctamente o brindando información clara cuando la llamada no requería gestión.",
+  "salidas_validas": ["Sí", "No", "N/A"],
+  "definiciones_resultado": {
+    "Sí": "Aplica cuando hay evidencia de que el asesor entendió el motivo y brindó una solución, gestión, orientación, información útil o redirección correcta. Incluye consultas informativas que no requieren gestión, siempre que el asesor conteste claramente lo solicitado.",
+    "No": "Aplica cuando el cliente sí presentó un motivo claro y evaluable, pero el asesor no resolvió, no orientó, no gestionó cuando correspondía, brindó información incompleta/incorrecta, redirigió sin sustento o dejó al cliente sin próximos pasos claros.",
+    "N/A": "Aplica cuando no es posible evaluar: no hubo contacto efectivo, cliente no contesta, llamada cae antes del motivo, solo saludo/despedida, transcripción insuficiente, audio no entendible, gestión fuera de alcance sin evidencia suficiente o no existe problema/consulta clara del cliente."
+  },
+  "tipos_interaccion": {
+    "Consulta informativa": "El cliente pide información, saldos, fechas, requisitos, estados, horarios, pasos o aclaraciones. No necesariamente requiere crear gestión.",
+    "Gestión operativa": "El cliente requiere que el asesor realice una acción, registro, bloqueo, reclamo, escalamiento, actualización o solicitud.",
+    "Reclamo / incidente": "El cliente reporta un problema, afectación, cargo, error, bloqueo, fraude, falla de canal o situación que requiere diagnóstico y/o proceso específico.",
+    "Venta / retención / ofrecimiento": "La llamada se relaciona con ofrecimiento, confirmación, aceptación, rechazo, retención o seguimiento comercial.",
+    "No contactado / no evaluable": "No existe conversación suficiente para determinar si el asesor resolvió eficientemente."
+  },
+  "criterios_observables": [
+    {
+      "id": "motivo_identificado",
+      "descripcion": "El asesor identifica o entiende qué necesita el cliente.",
+      "uso": "Ayuda a determinar si la llamada es evaluable y si el asesor estaba respondiendo al motivo correcto."
+    },
+    {
+      "id": "respuesta_util",
+      "descripcion": "El asesor da información clara, pasos, requisitos, saldo, fecha, monto, estado, canal correcto o explicación útil.",
+      "uso": "Clave para marcar 'Sí' en consultas que no requieren gestión."
+    },
+    {
+      "id": "gestion_correcta",
+      "descripcion": "Cuando el caso requiere acción, el asesor realiza, registra, escala, bloquea, genera reclamo/caso o explica el proceso correcto.",
+      "uso": "Clave para marcar 'Sí' en gestiones operativas o reclamos."
+    },
+    {
+      "id": "redireccion_correcta",
+      "descripcion": "Si el asesor remite a agencia, canal digital, otro departamento o comercio, la redirección es explicada y parece corresponder al proceso.",
+      "uso": "Una redirección puede ser 'Sí' si es el canal correcto y se explican próximos pasos."
+    },
+    {
+      "id": "eficiencia_claridad",
+      "descripcion": "La respuesta es directa, clara y deja al cliente con el siguiente paso definido, sin vueltas innecesarias.",
+      "uso": "Diferencia entre resolver y solo conversar sin cerrar el motivo."
+    }
+  ],
+  "reglas_decision": {
+    "marcar_si": [
+      "Consulta informativa: el asesor brinda información útil, clara y relacionada con lo solicitado, aunque no cree una gestión.",
+      "Gestión operativa: el asesor ejecuta la gestión, genera caso/reclamo, bloquea, escala o indica el proceso correcto con pasos claros.",
+      "Redirección: el asesor explica que el trámite corresponde a otro canal y brinda requisitos, ubicación, tiempos o pasos de forma clara.",
+      "El cliente confirma entendimiento, acepta la orientación o la conversación cierra naturalmente después de la respuesta útil.",
+      "El asesor no resuelve en línea, pero deja el próximo paso correcto y completo."
+    ],
+    "marcar_no": [
+      "El cliente presenta un motivo claro y el asesor no responde a ese motivo.",
+      "El asesor dice que no puede ayudar, que no sabe o que llame después sin dar alternativa útil.",
+      "El asesor remite a agencia u otro canal sin validar, sin explicar o cuando la transcripción sugiere que sí podía orientar/gestionar.",
+      "La información brindada es evidentemente incompleta, contradictoria o no relacionada con la solicitud.",
+      "El cliente queda sin solución ni próximos pasos claros.",
+      "El asesor cierra la llamada sin atender el requerimiento principal del cliente."
+    ],
+    "marcar_na": [
+      "No contactado, no contesta, buzón, llamada muda, abandono, error técnico o timeout.",
+      "Transcripción insuficiente para conocer el motivo del cliente o la respuesta del asesor.",
+      "Solo hay saludo, autenticación parcial o despedida sin contenido evaluable.",
+      "No hay problema ni consulta clara del cliente.",
+      "La llamada se corta antes de que el asesor pueda resolver u orientar."
+    ]
+  },
+  "frases_positivas_referencia": [
+    "con gusto le indico",
+    "le informo",
+    "puede realizarlo",
+    "los requisitos son",
+    "el horario es",
+    "su saldo es",
+    "la fecha de pago es",
+    "el pago mínimo es",
+    "le voy a generar",
+    "queda registrado",
+    "número de gestión",
+    "vamos a validar",
+    "vamos a bloquear",
+    "voy a escalar",
+    "le explicaré los pasos",
+    "debe presentarse con",
+    "el tiempo de respuesta es"
+  ],
+  "frases_riesgo_referencia": [
+    "no sé",
+    "no puedo ayudarle",
+    "llame después",
+    "intente más tarde",
+    "eso no se atiende aquí",
+    "vaya a agencia",
+    "no tengo información",
+    "no tenemos sistema",
+    "no puedo hacer nada"
+  ],
+  "campos_salida_requeridos": [
+    "p2_8_resuelve_eficientemente",
+    "tipo_interaccion",
+    "motivo_cliente",
+    "requiere_gestion",
+    "brindo_informacion_util",
+    "gestion_realizada",
+    "redireccion_correcta",
+    "justificacion_breve",
+    "evidencia_cliente",
+    "evidencia_operador",
+    "confianza"
+  ]
+}
