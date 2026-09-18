@@ -1,8 +1,36 @@
-runtime/scripts/.versions/
-runtime/scripts/.uploads/
-runtime/scripts/*/input/
-runtime/scripts/*/input/**
-runtime/scripts/*/output/
-runtime/scripts/*/output/**
-runtime/control/
-runtime/control/**
+# Dependencias y compilaciones
+node_modules/
+dist/
+.angular/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example
+*.log
+*.backup
+
+# Estado y archivos generados por las ejecuciones
+/runtime/logs/
+/runtime/control/
+/runtime/exports/
+/runtime/scripts/.versions/
+/runtime/scripts/**/*.zip
+/runtime/scripts/**/output/**
+/runtime/scripts/**/input/**
+/runtime/scripts/**/logs/**
+/runtime/scripts/**/tmp/**
+/runtime/scripts/**/cache/**
+# Mantener directorios para que existan al clonar
+!/runtime/scripts/**/output/**/
+!/runtime/scripts/**/input/**/
+!/runtime/scripts/**/output/**/.gitkeep
+!/runtime/scripts/**/input/**/.gitkeep
+# Recursos necesarios del reporte, no son datos de ejecucion
+!/runtime/scripts/ABA_Reporte_Diario/input/Logo_Banco_Atlantida_Email.png
+!/runtime/scripts/ABA_Reporte_Diario/input/plantilla_correo_ordenes_aba.html
+
+/runtime/scripts/.uploads/
+/.codex_tmp*/

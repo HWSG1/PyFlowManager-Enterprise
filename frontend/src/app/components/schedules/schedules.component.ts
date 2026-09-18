@@ -3,11 +3,12 @@ import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { PyflowService } from '../../services/pyflow.service';
 import { Schedule } from '../../models/models';
+import { GenesysFlowSelectComponent } from '../genesys-flow-select/genesys-flow-select.component';
 
 @Component({
   selector: 'app-schedules',
   standalone: true,
-  imports: [CommonModule, FormsModule],
+  imports: [CommonModule, FormsModule, GenesysFlowSelectComponent],
   template: `
     <div class="flex flex-col gap-6">
       <div>
@@ -56,7 +57,20 @@ import { Schedule } from '../../models/models';
                       }
                     </label>
 
-                    @if (p.control_type === 'select') {
+                    @if (p.control_type?.startsWith('genesys_')) {
+                      <app-genesys-flow-select [catalog]="p.control_type === 'genesys_flow' ? 'flows' : p.control_type.substring(8)" [scriptId]="+newSchedule.scriptId!" [(value)]="p.value" />
+                    } @else if (isDynamicExcelParameter(p)) {
+                      <select
+                        [(ngModel)]="p.value"
+                        (ngModelChange)="onDynamicExcelParameterChange(p.param_key, $event)"
+                        [disabled]="inputSchemaLoading"
+                        class="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-300 focus:outline-none focus:border-blue-500 disabled:opacity-60">
+                        <option value="">Seleccione...</option>
+                        @for (opt of dynamicExcelOptions(p); track opt) {
+                          <option [value]="opt">{{ opt }}</option>
+                        }
+                      </select>
+                    } @else if (p.control_type === 'select') {
                       <select
                         [(ngModel)]="p.value"
                         class="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-300 focus:outline-none focus:border-blue-500">
@@ -387,6 +401,9 @@ export class SchedulesComponent {
 
   scheduleParameters: any[] = [];
   tagDraftValues: Record<string, string> = {};
+  inputSchemaLoading = false;
+  inputSchemaSheets: string[] = [];
+  inputSchemaColumns: string[] = [];
   scheduleNameFilter = '';
   scheduleStatusFilter = 'all';
 
@@ -444,6 +461,8 @@ export class SchedulesComponent {
     this.newSchedule = this.getEmptyScheduleForm();
     this.scheduleParameters = [];
     this.tagDraftValues = {};
+    this.inputSchemaSheets = [];
+    this.inputSchemaColumns = [];
     this.buildCronFromControls();
   }
 
@@ -470,11 +489,69 @@ export class SchedulesComponent {
             ...p,
             value: p.param_value || this.getDefaultValue(p)
           }));
+        this.loadInputSchema();
       },
       error: err => {
         this.scheduleParameters = [];
         this.svc.showToast(
           `Error cargando parámetros: ${err?.error?.message || err.message}`,
+          'error'
+        );
+      }
+    });
+  }
+
+  isDynamicExcelParameter(param: any): boolean {
+    return ['excel_sheet', 'excel_column'].includes(
+      String(param?.control_type || '').toLowerCase()
+    );
+  }
+
+  dynamicExcelOptions(param: any): string[] {
+    return String(param?.control_type || '').toLowerCase() === 'excel_sheet'
+      ? this.inputSchemaSheets
+      : this.inputSchemaColumns;
+  }
+
+  onDynamicExcelParameterChange(key: string, value: string) {
+    if (key !== 'SOURCE_SHEET' || !value) return;
+
+    const column = this.scheduleParameters.find(
+      param => param.param_key === 'TRANSCRIPT_COLUMN'
+    );
+    if (column) column.value = '';
+    this.loadInputSchema(value);
+  }
+
+  loadInputSchema(sheet?: string) {
+    const scriptId = Number(this.newSchedule.scriptId || 0);
+    const hasDynamicParams = this.scheduleParameters.some(
+      param => this.isDynamicExcelParameter(param)
+    );
+    if (!scriptId || !hasDynamicParams) return;
+
+    const sheetParam = this.scheduleParameters.find(
+      param => param.param_key === 'SOURCE_SHEET'
+    );
+    const selectedSheet = sheet ?? String(sheetParam?.value || '');
+    this.inputSchemaLoading = true;
+
+    this.svc.getScriptInputSchema(scriptId, selectedSheet).subscribe({
+      next: schema => {
+        this.inputSchemaSheets = Array.isArray(schema?.sheets)
+          ? schema.sheets.map((item: any) => String(item))
+          : [];
+        this.inputSchemaColumns = Array.isArray(schema?.columns)
+          ? schema.columns.map((item: any) => String(item))
+          : [];
+        this.inputSchemaLoading = false;
+      },
+      error: err => {
+        this.inputSchemaSheets = [];
+        this.inputSchemaColumns = [];
+        this.inputSchemaLoading = false;
+        this.svc.showToast(
+          err?.error?.message || err.message || 'No se pudo leer el archivo de la carpeta input.',
           'error'
         );
       }
@@ -794,6 +871,7 @@ export class SchedulesComponent {
                 ...p,
                 value: paramsMap[p.param_key] ?? p.param_value ?? this.getDefaultValue(p)
               }));
+            this.loadInputSchema();
           },
           error: err => {
             this.scheduleParameters = [];

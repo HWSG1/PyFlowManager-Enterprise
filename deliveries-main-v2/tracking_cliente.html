@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Seguimiento de Entrega | PyME Delivery</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+  <style>
+    body { font-family: 'Inter', system-ui, -apple-system, Segoe UI, Roboto, 'Helvetica Neue', Arial; background:#f7f9fb; }
+    .safe-bottom { padding-bottom: env(safe-area-inset-bottom); }
+  </style>
+</head>
+<body class="min-h-screen">
+  <header class="sticky top-0 z-30 bg-white/90 backdrop-blur border-b border-slate-200">
+    <div class="max-w-3xl mx-auto px-4 py-3">
+      <h1 class="text-xl sm:text-2xl font-bold text-indigo-700">Seguimiento de tu entrega</h1>
+      <p class="text-slate-600 text-sm mt-1">Consulta el estado de tu pedido en tiempo real.</p>
+    </div>
+  </header>
+
+  <main class="max-w-3xl mx-auto px-4 py-4 sm:py-6 space-y-5 safe-bottom">
+    <section id="cardPedido" class="rounded-2xl border border-slate-200 bg-white p-4 sm:p-6 shadow-sm hidden">
+      <div class="flex items-center justify-between gap-2">
+        <div>
+          <div class="text-xs text-slate-500">Pedido</div>
+          <div id="pedidoId" class="font-semibold text-slate-800 break-all">—</div>
+        </div>
+        <span id="estadoBadge" class="text-[11px] px-2 py-0.5 rounded-full bg-slate-100 text-slate-700">—</span>
+      </div>
+
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mt-4">
+        <div class="space-y-1 text-sm text-slate-700">
+          <div><span class="font-medium">Empresa:</span> <span id="empresa">—</span></div>
+          <div><span class="font-medium">Cliente:</span> <span id="cliente">—</span></div>
+          <div><span class="font-medium">Dirección:</span> <span id="direccion">—</span></div>
+          <div><span class="font-medium">Paquetes:</span> <span id="paquetes">—</span>
+            <span id="fragil" class="hidden ml-2 text-[11px] px-2 py-0.5 rounded-full bg-amber-100 text-amber-700">Frágil</span>
+          </div>
+        </div>
+        <div class="space-y-1 text-sm text-slate-700">
+          <div><span class="font-medium">Creado:</span> <span id="creado">—</span></div>
+          <div id="horaEntregaWrap" class="hidden"><span class="font-medium">Entregado:</span> <span id="horaEntrega">—</span></div>
+          <div id="repWrap" class="hidden"><span class="font-medium">Repartidor:</span> <span id="repDatos">—</span></div>
+        </div>
+      </div>
+
+      <div class="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-2">
+        <a id="btnGMaps" target="_blank" class="px-4 py-3 rounded-xl text-center bg-indigo-50 text-indigo-700 border hover:bg-indigo-100">Abrir en Google Maps</a>
+        <a id="btnWaze" target="_blank" class="px-4 py-3 rounded-xl text-center bg-blue-50 text-blue-700 border hover:bg-blue-100">Abrir en Waze</a>
+      </div>
+    </section>
+
+    <section class="rounded-2xl border border-slate-200 bg-white p-4 sm:p-6 shadow-sm">
+      <h2 class="text-base sm:text-lg font-semibold text-slate-800 mb-4">Estado de la entrega</h2>
+      <ol id="timeline" class="relative border-s border-slate-200 ml-3 pl-5 space-y-5"></ol>
+      <p id="ultimoUpd" class="mt-3 text-xs text-slate-500">Última actualización: —</p>
+    </section>
+
+    <section id="notFound" class="rounded-2xl border border-rose-200 bg-rose-50 p-4 sm:p-6 hidden">
+      <h2 class="text-base sm:text-lg font-semibold text-rose-700">Pedido no encontrado</h2>
+      <p class="text-rose-700/80 text-sm mt-1">Verifica el QR o ingresa el código de seguimiento correctamente.</p>
+      <div class="mt-3 flex gap-2">
+        <input id="manualId" class="flex-1 px-3 py-2 rounded-lg border" placeholder="Pega aquí tu código (UUID)" />
+        <button id="btnCargarManual" class="px-4 py-2 rounded-lg bg-slate-900 text-white">Ver pedido</button>
+      </div>
+    </section>
+
+    <p class="text-center text-xs text-slate-500">* Esta página se actualiza automáticamente.</p>
+  </main>
+
+  <!-- Supabase -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+
+  <script>
+    const SUPABASE_URL = "https://zxheorryhmnttbtxrnyz.supabase.co";
+    const SUPABASE_ANON_KEY = "sb_publishable_o_8HqeCqz32uUvCCYNPe6A_4F8B-ydy";
+    const db = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+    const $ = (id) => document.getElementById(id);
+
+    const statusColors = {
+      'NUEVO': 'bg-slate-200 text-slate-700',
+      'APROBADO': 'bg-indigo-100 text-indigo-700',
+      'EN_RUTA': 'bg-amber-100 text-amber-800',
+      'ENTREGADO': 'bg-green-100 text-green-800',
+      'NO_ENTREGADO': 'bg-rose-100 text-rose-700',
+      'DEVUELTO': 'bg-rose-100 text-rose-700'
+    };
+
+    function fmtDate(s){ if(!s) return '—'; const d=new Date(s); return d.toLocaleString(); }
+    const esc = (t)=> String(t||'').replace(/&/g,'&amp;').replace(/</g,'&lt;');
+
+    // === NUEVO: agrega 'comment' por estado, usando la nota más reciente si existe ===
+    function buildTimeline(estado, creado_en, hora_entrega, comments){
+      const steps = [
+        { key:'NUEVO',       label:'Pedido creado',             ts: creado_en,                    comment: comments.NUEVO?.comentario || '' },
+        { key:'EN_RUTA',     label:'En ruta hacia la dirección',ts: comments.EN_RUTA?.creado_en || null, comment: comments.EN_RUTA?.comentario || '' },
+        { key:'ENTREGADO',   label:'Entregado',                 ts: hora_entrega || comments.ENTREGADO?.creado_en || null, comment: comments.ENTREGADO?.comentario || '' }
+      ];
+      if(estado==='NO_ENTREGADO'){
+        steps.push({ key:'NO_ENTREGADO', label:'No entregado', ts: comments.NO_ENTREGADO?.creado_en || null, comment: comments.NO_ENTREGADO?.comentario || '' });
+      }
+      const order=['NUEVO','APROBADO','EN_RUTA','ENTREGADO','NO_ENTREGADO','DEVUELTO'];
+      const idx=order.indexOf(estado);
+      return steps.map(s=>({ ...s, done: order.indexOf(s.key)!==-1 && order.indexOf(s.key)<=idx && !(estado==='NO_ENTREGADO'&&s.key==='ENTREGADO') }));
+    }
+
+    function renderTimeline(tl){
+      const el=$('timeline'); el.innerHTML='';
+      tl.forEach(s=>{
+        const dot=s.done?'bg-green-600':'bg-slate-300';
+        const when=s.ts?`<div class="text-xs text-slate-500 mt-1">${fmtDate(s.ts)}</div>`:'';
+        const comment = s.comment ? `<div class="mt-1 text-sm text-slate-700">${esc(s.comment)}</div>` : '';
+        el.insertAdjacentHTML('beforeend',`
+          <li class="relative">
+            <span class="absolute -left-[23px] top-1 h-3 w-3 rounded-full ${dot} ring-2 ring-white"></span>
+            <div class="text-sm ${s.done?'text-slate-900 font-medium':'text-slate-600'}">${s.label}</div>
+            ${when}
+            ${comment}
+          </li>`);
+      });
+    }
+
+    function setBadge(estado){
+      const badge=$('estadoBadge');
+      const cls=statusColors[estado]||'bg-slate-100 text-slate-700';
+      badge.className=`text-[11px] px-2 py-0.5 rounded-full ${cls}`;
+      badge.textContent=estado||'—';
+    }
+
+    async function loadRepartidor(repId){
+      const { data } = await db.from('repartidores').select('*').eq('id',repId).maybeSingle();
+      if(data){ $('repWrap').classList.remove('hidden'); $('repDatos').textContent=`${data.nombre} • ${data.celular||''} • ${data.placa||''}`.replace(/\s•\s$/,''); }
+    }
+
+    function setMapLinks(destino){
+      const enc=encodeURIComponent(destino||'');
+      $('btnGMaps').href=`https://www.google.com/maps/search/?api=1&query=${enc}`;
+      $('btnWaze').href=`https://waze.com/ul?q=${enc}&navigate=yes`;
+    }
+
+    let currentId=null, initialLoaded=false;
+    async function loadPedido(id){
+      if(!id){ if(!initialLoaded){ $('notFound').classList.remove('hidden'); } return; }
+
+      // 1) Pedido
+      const { data, error } = await db.from('deliveries_demo').select('*').eq('id',id).maybeSingle();
+      if(error||!data){ if(!initialLoaded){ $('notFound').classList.remove('hidden'); } return; }
+      initialLoaded=true; $('notFound').classList.add('hidden'); $('cardPedido').classList.remove('hidden');
+
+      $('pedidoId').textContent=data.id;
+      $('empresa').textContent=data.empresa_solicitante||'—';
+      $('cliente').textContent=data.nombre_cliente||'—';
+      $('direccion').textContent=data.direccion_entrega||'—';
+      $('paquetes').textContent=data.cantidad_paquetes??'—';
+      if(data.es_fragil)$('fragil').classList.remove('hidden'); else $('fragil').classList.add('hidden');
+      $('creado').textContent=fmtDate(data.creado_en);
+      if(data.hora_entrega){ $('horaEntregaWrap').classList.remove('hidden'); $('horaEntrega').textContent=fmtDate(data.hora_entrega); }
+      setBadge(data.estado_pedido||'—'); setMapLinks(data.direccion_entrega||''); if(data.repartidor_id) loadRepartidor(data.repartidor_id);
+
+      // 2) Notas de entrega (tomamos la más reciente por estado)
+      const { data: notas } = await db
+        .from('delivery_notas')
+        .select('estado, comentario, creado_en')
+        .eq('delivery_id', id)
+        .order('creado_en', { ascending: false });
+
+      const lastBy = {};
+      (notas||[]).forEach(n => { if(!lastBy[n.estado]) lastBy[n.estado]=n; });
+
+      // 3) Timeline con comentarios
+      renderTimeline(
+        buildTimeline(
+          data.estado_pedido||'NUEVO',
+          data.creado_en,
+          data.hora_entrega,
+          {
+            NUEVO:        lastBy['NUEVO']        || null,
+            EN_RUTA:      lastBy['EN_RUTA']      || null,
+            ENTREGADO:    lastBy['ENTREGADO']    || null,
+            NO_ENTREGADO: lastBy['NO_ENTREGADO'] || null
+          }
+        )
+      );
+
+      $('ultimoUpd').textContent='Última actualización: '+fmtDate(new Date());
+    }
+
+    async function start(){
+      const params=new URLSearchParams(location.search);
+      currentId=params.get('id')||'';
+      if(!currentId){ $('notFound').classList.remove('hidden'); }
+      await loadPedido(currentId);
+      setInterval(()=>loadPedido(currentId),15000);
+    }
+
+    $('btnCargarManual').addEventListener('click',()=>{
+      const id=$('manualId').value.trim();
+      if(id){ currentId=id; initialLoaded=false; loadPedido(currentId); }
+    });
+
+    start();
+  </script>
+</body>
+</html>

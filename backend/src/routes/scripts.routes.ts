@@ -12,6 +12,7 @@ import { requireAuth, requireExecutionAccess, requirePermission, requireScriptAc
 import { extractPyflowParams, syncScriptParameters } from '../services/scriptParameters.service';
 import { addExecutionLog } from '../services/dbLogService';
 import { emitExecutionLog } from '../services/logBus';
+import { listGenesysFlows, listGenesysCatalog, isGenesysCatalog } from '../services/genesysFlows.service';
 
 const router = Router();
 
@@ -151,6 +152,64 @@ function getAvailableScriptFolder(baseName: string): string {
   }
 
   return folderName;
+}
+
+function inspectScriptInputSchema(
+  pythonCommand: string,
+  scriptPath: string,
+  workingDirectory: string,
+  sourceSheet: string
+): Promise<any> {
+  const args = ['-u', scriptPath, '--inspect-input-schema'];
+  if (sourceSheet) {
+    args.push('--source-sheet', sourceSheet);
+  }
+
+  return new Promise((resolve, reject) => {
+    execFile(
+      pythonCommand,
+      args,
+      {
+        cwd: workingDirectory,
+        windowsHide: true,
+        timeout: 30000,
+        maxBuffer: 10 * 1024 * 1024,
+        env: {
+          ...process.env,
+          PYFLOW_SCRIPT_DIR: workingDirectory
+        }
+      },
+      (error, stdout, stderr) => {
+        const output = `${stdout || ''}\n${stderr || ''}`;
+        const schemaLine = output
+          .split(/\r?\n/)
+          .find(line => line.startsWith('PYFLOW_INPUT_SCHEMA='));
+
+        if (schemaLine) {
+          try {
+            resolve(JSON.parse(schemaLine.substring('PYFLOW_INPUT_SCHEMA='.length)));
+            return;
+          } catch {
+            reject(new Error('El script devolvió un esquema de entrada inválido.'));
+            return;
+          }
+        }
+
+        const errorLine = output
+          .split(/\r?\n/)
+          .find(line => line.startsWith('PYFLOW_INPUT_SCHEMA_ERROR='));
+
+        if (errorLine) {
+          reject(new Error(errorLine.substring('PYFLOW_INPUT_SCHEMA_ERROR='.length).trim()));
+          return;
+        }
+
+        reject(new Error(
+          String(stderr || stdout || error?.message || 'No se pudo inspeccionar el archivo de entrada.').trim()
+        ));
+      }
+    );
+  });
 }
 
 router.get('/', requireAuth, async (req, res, next) => {
@@ -315,6 +374,84 @@ router.post('/', requireAuth, requirePermission('scripts.create'), upload.single
   }
 });
 
+router.get('/:id/input-schema', requireAuth, requireScriptAccess('view'), async (req, res, next) => {
+  try {
+    const pool = await getPool();
+    const scriptId = Number(req.params.id);
+    const sourceSheet = String(req.query.sheet || '').trim();
+
+    const result = await pool.request()
+      .input('script_id', sql.Int, scriptId)
+      .query(`
+        SELECT TOP 1
+          file_path,
+          working_directory,
+          python_interpreter
+        FROM dbo.Scripts
+        WHERE id = @script_id
+      `);
+
+    const script = result.recordset[0];
+    if (!script) {
+      return res.status(404).json({ message: 'Script no encontrado.' });
+    }
+
+    const allowedDir = path.resolve(env.runtime.scriptsDir);
+    const scriptPath = path.resolve(
+      path.isAbsolute(script.file_path)
+        ? script.file_path
+        : path.join(allowedDir, script.file_path)
+    );
+
+    if (scriptPath === allowedDir || !scriptPath.startsWith(`${allowedDir}${path.sep}`)) {
+      return res.status(400).json({ message: 'Ruta de script fuera del directorio permitido.' });
+    }
+    if (!fs.existsSync(scriptPath)) {
+      return res.status(404).json({ message: 'El archivo del script no existe.' });
+    }
+
+    const workingDirectory = script.working_directory
+      ? path.resolve(script.working_directory)
+      : path.dirname(scriptPath);
+    const pythonCommand = String(script.python_interpreter || env.pythonCommand || '').trim()
+      .replace(/^"(.*)"$/, '$1');
+
+    const schema = await inspectScriptInputSchema(
+      pythonCommand,
+      scriptPath,
+      workingDirectory,
+      sourceSheet
+    );
+
+    return res.json(schema);
+  } catch (err: any) {
+    const message = err?.message || 'No se pudo inspeccionar el archivo de entrada.';
+    if (
+      message.includes('carpeta input') ||
+      message.includes('carpeta de entrada') ||
+      message.includes('un solo archivo') ||
+      message.includes('hoja seleccionada')
+    ) {
+      return res.status(422).json({ message });
+    }
+    next(err);
+  }
+});
+
+router.get('/:id/genesys-catalog/:catalog', requireAuth, requireScriptAccess('view'), async (req, res) => {
+  if (!isGenesysCatalog(req.params.catalog)) return res.status(400).json({ message: 'Catálogo no válido.' });
+  try { return res.json(await listGenesysCatalog(Number(req.params.id), req.params.catalog)); }
+  catch (err: any) { return res.status(502).json({ message: err?.message || 'No se pudo consultar el catálogo.' }); }
+});
+
+router.get('/:id/genesys-flows', requireAuth, requireScriptAccess('view'), async (req, res) => {
+  try {
+    return res.json(await listGenesysFlows(Number(req.params.id)));
+  } catch (err: any) {
+    return res.status(502).json({ message: err?.message || 'No se pudieron consultar los flujos.' });
+  }
+});
+
 router.get('/:id/parameters', requireAuth, requireScriptAccess('view'), async (req, res, next) => {
   try {
     const pool = await getPool();
@@ -448,6 +585,21 @@ router.get('/:id/parameters', requireAuth, requireScriptAccess('view'), async (r
     const isGnsEstadosAgentes = rows.some((row: any) => row.script_name === 'GNS_Estados_Agentes.py');
 
     if (isTranscriptionExtractor) {
+      // Lee los nuevos controles desde el archivo sin borrar parámetros guardados.
+      const source = path.join(scriptsDir, 'GNS_Extractor_Transcripciones', 'GNS_Extractor_Transcripciones.py');
+      const definitions = extractPyflowParams(fs.readFileSync(source, 'utf8'));
+      for (const key of ['FLOW_SELECTION_ID', 'FLOW_ID', 'MEDIA_TYPE', 'PARTICIPANT_PURPOSE', 'ORIGINAL_DIRECTION', 'USER_NAME', 'QUEUE_NAME', 'CAMPAIGN_NAME', 'CONTACT_LIST_NAME', 'WRAPUP_CODE_NAME']) {
+        const definition = definitions[key];
+        if (!definition) continue;
+        let row = rows.find((item: any) => item.param_key === key);
+        if (!row) {
+          row = { id: `extractor-${key}`, script_id: scriptId, param_key: key, param_value: definition.default || '', param_type: 'env', is_required: false, global_key: null };
+          rows.push(row);
+        }
+        row.control_type = definition.type;
+        row.label = definition.label;
+        row.options_json = definition.options ? JSON.stringify(definition.options) : null;
+      }
       const tagParams = new Set([
         'CONVERSATION_ID',
         'USER_ID',
@@ -463,7 +615,7 @@ router.get('/:id/parameters', requireAuth, requireScriptAccess('view'), async (r
       ]);
 
       for (const row of rows) {
-        if (tagParams.has(row.param_key)) {
+        if (tagParams.has(row.param_key) && !String(row.control_type).startsWith('genesys_')) {
           row.control_type = 'tags';
         }
       }

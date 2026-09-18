@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Empresa · Crear solicitud (QR)</title>
+
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+
+  <style>
+    body { font-family: 'Inter', system-ui, -apple-system, Segoe UI, Roboto, 'Helvetica Neue', Arial; background:#f7f9fb; }
+    .safe-bottom { padding-bottom: env(safe-area-inset-bottom); }
+  </style>
+</head>
+
+<body class="min-h-screen">
+  <header class="sticky top-0 z-30 bg-white/90 backdrop-blur border-b border-slate-200">
+    <div class="max-w-3xl mx-auto px-4 py-3">
+      <h1 class="text-xl sm:text-2xl font-bold text-indigo-700">Empresa · Solicitud de entrega</h1>
+      <p class="text-slate-600 text-sm mt-1">Al guardar, se mostrará un QR para el cliente.</p>
+    </div>
+  </header>
+
+  <main class="max-w-3xl mx-auto px-4 py-5 sm:py-8">
+    <form id="deliveryForm" class="space-y-6">
+      <section class="rounded-2xl border border-indigo-200 bg-indigo-50 p-4 sm:p-6 shadow-sm">
+        <h2 class="text-base sm:text-lg font-semibold text-indigo-700 mb-3 pb-2 border-b border-indigo-200">Detalles del paquete</h2>
+        <div class="grid gap-4">
+          <div>
+            <label for="cantidad_paquetes" class="block text-sm font-medium text-slate-700 mb-1">
+              Cantidad de paquetes <span class="text-rose-600">*</span>
+            </label>
+            <input type="number" id="cantidad_paquetes" min="1" inputmode="numeric" required placeholder="Mínimo 1"
+                   class="w-full px-3 py-3 rounded-xl border border-slate-300 bg-white focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
+          </div>
+          <label class="flex items-start gap-3 rounded-xl bg-white/60 p-3 border border-indigo-100 cursor-pointer">
+            <input id="es_fragil" type="checkbox" class="h-4 w-4 mt-1 text-indigo-600 rounded border-slate-300 focus:ring-indigo-500"/>
+            <span class="text-sm"><span class="font-medium text-slate-800">¿El paquete es frágil?</span><br/><span class="text-slate-500">Marca si requiere manejo especial.</span></span>
+          </label>
+        </div>
+      </section>
+
+      <section class="rounded-2xl border border-slate-200 bg-white p-4 sm:p-6 shadow-sm">
+        <h2 class="text-base sm:text-lg font-semibold text-slate-800 mb-3 pb-2 border-b">Información del cliente y destino</h2>
+        <div class="grid gap-4">
+          <div>
+            <label for="direccion_entrega" class="block text-sm font-medium text-slate-700 mb-1">Dirección de entrega <span class="text-rose-600">*</span></label>
+            <textarea id="direccion_entrega" rows="3" required
+                      placeholder="Calle, número, colonia, referencias…"
+                      class="w-full px-3 py-3 rounded-xl border border-slate-300 bg-white focus:outline-none focus:ring-2 focus:ring-indigo-500"></textarea>
+          </div>
+          <div>
+            <label for="nombre_cliente" class="block text-sm font-medium text-slate-700 mb-1">Nombre del cliente <span class="text-rose-600">*</span></label>
+            <input id="nombre_cliente" required placeholder="Ej: Juan Pérez"
+                   class="w-full px-3 py-3 rounded-xl border border-slate-300 bg-white focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
+          </div>
+          <div>
+            <label for="identificacion_cliente" class="block text-sm font-medium text-slate-700 mb-1">Identificación <span class="text-rose-600">*</span></label>
+            <input id="identificacion_cliente" required placeholder="DNI / Licencia / Pasaporte"
+                   class="w-full px-3 py-3 rounded-xl border border-slate-300 bg-white focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
+          </div>
+          <div>
+            <label for="numero_celular" class="block text-sm font-medium text-slate-700 mb-1">Celular <span class="text-rose-600">*</span></label>
+            <input id="numero_celular" type="tel" inputmode="numeric" pattern="[0-9]{8,15}" required placeholder="98765432"
+                   class="w-full px-3 py-3 rounded-xl border border-slate-300 bg-white focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
+          </div>
+        </div>
+      </section>
+
+      <div class="flex flex-col gap-2">
+        <button id="submitBtn" type="submit"
+                class="w-full py-3 rounded-xl text-white bg-indigo-600 hover:bg-indigo-700 active:scale-[.99] shadow-lg text-base font-semibold">
+          Solicitar entrega
+        </button>
+      </div>
+    </form>
+  </main>
+
+  <!-- Modal con QR -->
+  <div id="messageBox" class="hidden fixed inset-0 z-50 bg-black/40 flex items-end sm:items-center justify-center p-0 sm:p-4">
+    <div class="bg-white w-full sm:max-w-md sm:rounded-2xl sm:shadow-xl overflow-hidden safe-bottom">
+      <div class="px-5 py-4 border-b">
+        <h3 class="text-lg font-semibold text-green-600">¡Solicitud enviada!</h3>
+        <p class="text-slate-600 text-sm mt-1">Imprime o comparte este QR para que el cliente rastree su pedido.</p>
+      </div>
+      <div class="p-5 space-y-3">
+        <div id="qrBox" class="w-full flex items-center justify-center"></div>
+        <div id="trackUrl" class="rounded-lg bg-slate-50 border px-3 py-2 text-xs break-all">—</div>
+        <div class="grid gap-2">
+          <a id="openTrack" target="_blank" class="px-4 py-3 rounded-xl bg-indigo-600 text-white text-center">Abrir tracking</a>
+          <button id="btnPrint" class="px-4 py-3 rounded-xl bg-slate-900 text-white">Imprimir QR</button>
+          <button onclick="closeMessageBox()" class="px-4 py-3 rounded-xl bg-slate-100">Cerrar</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Libs -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+
+  <script>
+    const SUPABASE_URL = "https://zxheorryhmnttbtxrnyz.supabase.co";
+    const SUPABASE_ANON_KEY = "sb_publishable_o_8HqeCqz32uUvCCYNPe6A_4F8B-ydy";
+    // La página de tracking en tu repo:
+    const TRACKING_PATH = "tracking_cliente.html";
+
+    const supabaseClient = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+    function getEmpresaSolicitante(){
+      const params = new URLSearchParams(location.search);
+      return params.get('empresa') || 'Empresa PyME Demo';
+    }
+
+    function openQRModal(url){
+      const qrBox = document.getElementById('qrBox');
+      qrBox.innerHTML = "";
+      new QRCode(qrBox, { text: url, width: 180, height: 180 });
+      document.getElementById('trackUrl').textContent = url;
+      document.getElementById('openTrack').href = url;
+      document.getElementById('messageBox').classList.remove('hidden');
+
+      document.getElementById('btnPrint').onclick = () => {
+        const c = qrBox.querySelector('canvas');
+        const w = window.open("", "_blank");
+        w.document.write(`<img src="${c.toDataURL()}" style="width:260px;height:260px" /><br/><p style="font-family:sans-serif">${url}</p>`);
+        w.document.close(); w.focus(); w.print();
+      };
+    }
+
+    document.getElementById('deliveryForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const btn = document.getElementById('submitBtn');
+      const original = btn.textContent; btn.disabled = true; btn.textContent = 'Enviando…';
+
+      const payload = {
+        empresa_solicitante: getEmpresaSolicitante(),
+        cantidad_paquetes: parseInt(document.getElementById('cantidad_paquetes').value || '0', 10),
+        es_fragil: document.getElementById('es_fragil').checked,
+        direccion_entrega: document.getElementById('direccion_entrega').value.trim(),
+        nombre_cliente: document.getElementById('nombre_cliente').value.trim(),
+        identificacion_cliente: document.getElementById('identificacion_cliente').value.trim(),
+        numero_celular: document.getElementById('numero_celular').value.trim(),
+        estado_pedido: 'NUEVO'
+      };
+
+      const { data, error } = await supabaseClient.from('deliveries_demo').insert(payload).select('id').single();
+      btn.disabled = false; btn.textContent = original;
+
+      if (error) { console.error(error); alert('Error guardando la solicitud'); return; }
+
+      const base = new URL(TRACKING_PATH, location.href);
+      base.searchParams.set('id', data.id);
+      openQRModal(base.href);
+      e.target.reset();
+    });
+
+    function closeMessageBox(){ document.getElementById('messageBox').classList.add('hidden'); }
+  </script>
+</body>
+</html>

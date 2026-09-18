@@ -3,7 +3,7 @@
 # =========================================================
 #
 # Objetivo:
-#   Extraer transcripciones de llamadas de Genesys Cloud en texto plano.
+#   Extraer transcripciones disponibles de Genesys Cloud en texto plano.
 #
 # Modos:
 #   1) solo_transcript:
@@ -24,6 +24,9 @@
 #   - Si no se indican fechas, usa DAYS_BACK para extraer últimos N días cerrados.
 #   - No limita el rango máximo; usar filtros para controlar volumen.
 #   - Permite filtros por campaña, lista de contacto, conversationId, usuario, cola y conclusión.
+#   - Permite seleccionar flujo, medio, dirección original y propósito del participante.
+#   - FLOW_ID manual tiene prioridad sobre FLOW_SELECTION_ID del selector por nombre.
+#   - Sin filtro de propósito incluye conversaciones que no pasaron por agent.
 #   - Requiere que Speech and Text Analytics tenga transcripción disponible.
 #   - Siempre devuelve la conclusión original en columnas wrapUpCodeId y conclusion_original.
 # =========================================================
@@ -77,17 +80,21 @@ PYFLOW_PARAMS = {
         "options": ["ambas", "inbound", "outbound"],
         "default": "ambas"
     },
+    "FLOW_SELECTION_ID": {"type": "genesys_flow", "label": "Nombre de flujo (buscar y seleccionar)", "required": False},
+    "FLOW_ID": {"type": "text", "label": "ID del flujo (prioridad sobre el nombre seleccionado)", "required": False},
+    "MEDIA_TYPE": {"type": "select", "label": "Tipo de medio (voice = voz, message = mensaje)", "required": False, "options": ["todos", "voice", "message", "email", "chat", "callback", "cobrowse", "internalmessage", "screenmonitoring", "screenshare", "video", "unknown"], "default": "todos"},
+    "PARTICIPANT_PURPOSE": {"type": "select", "label": "Segmento / propósito del participante", "required": False, "options": ["todos", "acd", "agent", "api", "botflow", "campaign", "customer", "dialer", "external", "fax", "group", "inbound", "ivr", "manual", "outbound", "station", "user", "voicemail", "voicesurveyflow", "workflow"], "default": "todos"},
     "CONVERSATION_ID": {"type": "tags", "label": "Conversation ID específico", "required": False},
     "USER_ID": {"type": "tags", "label": "User ID del agente", "required": False},
-    "USER_NAME": {"type": "tags", "label": "Nombre/correo del agente", "required": False},
+    "USER_NAME": {"type": "genesys_users", "label": "Nombre/correo del agente", "required": False},
     "QUEUE_ID": {"type": "tags", "label": "Queue ID", "required": False},
-    "QUEUE_NAME": {"type": "tags", "label": "Nombre de cola", "required": False},
+    "QUEUE_NAME": {"type": "genesys_queues", "label": "Nombre de cola", "required": False},
     "CAMPAIGN_ID": {"type": "tags", "label": "Campaign ID", "required": False},
-    "CAMPAIGN_NAME": {"type": "tags", "label": "Nombre de campaña", "required": False},
+    "CAMPAIGN_NAME": {"type": "genesys_campaigns", "label": "Nombre de campaña", "required": False},
     "CONTACT_LIST_ID": {"type": "tags", "label": "Contact List ID", "required": False},
-    "CONTACT_LIST_NAME": {"type": "tags", "label": "Nombre lista de contacto", "required": False},
+    "CONTACT_LIST_NAME": {"type": "genesys_contactlists", "label": "Nombre lista de contacto", "required": False},
     "WRAPUP_CODE_ID": {"type": "tags", "label": "WrapUpCode ID opcional", "required": False},
-    "WRAPUP_CODE_NAME": {"type": "tags", "label": "Nombre de conclusión opcional", "required": False},
+    "WRAPUP_CODE_NAME": {"type": "genesys_wrapupcodes", "label": "Nombre de conclusión opcional", "required": False},
     "MAX_CONVERSATIONS": {"type": "number", "label": "Máximo conversaciones; vacío = todas", "required": False},
     "MAX_TRANSCRIPT_WORKERS": {"type": "number", "label": "Consultas paralelas de transcript", "required": False, "default": "6"},
     "OUTPUT_FORMAT": {"type": "select", "label": "Formato salida", "required": False, "options": ["xlsx", "csv"], "default": "xlsx"},
@@ -237,6 +244,9 @@ class Config:
     log_every_n: int
     transcript_debug: bool
     dry_run: bool
+    flow_id: str = ""
+    media_type: str = "todos"
+    participant_purpose: str = "todos"
 
 
 def load_config() -> Config:
@@ -248,6 +258,11 @@ def load_config() -> Config:
     original_direction = env_str("ORIGINAL_DIRECTION", "ambas").lower()
     if original_direction not in ("ambas", "inbound", "outbound"):
         raise ValueError("ORIGINAL_DIRECTION debe ser ambas, inbound u outbound")
+    media_type = env_str("MEDIA_TYPE", "todos").lower()
+    participant_purpose = env_str("PARTICIPANT_PURPOSE", "todos").lower()
+    for key, value in (("MEDIA_TYPE", media_type), ("PARTICIPANT_PURPOSE", participant_purpose)):
+        if value not in PYFLOW_PARAMS[key]["options"]:
+            raise ValueError(f"{key} no válido: {value}")
     output_format = env_str("OUTPUT_FORMAT", "xlsx").lower()
     if output_format not in ("xlsx", "csv"):
         raise ValueError("OUTPUT_FORMAT debe ser xlsx o csv")
@@ -260,6 +275,9 @@ def load_config() -> Config:
         days_back=env_int("DAYS_BACK", 30),
         output_mode=output_mode,
         original_direction=original_direction,
+        flow_id=env_str("FLOW_ID", "") or env_str("FLOW_SELECTION_ID", ""),
+        media_type=media_type,
+        participant_purpose=participant_purpose,
         conversation_id=env_str("CONVERSATION_ID", ""),
         user_id=env_str("USER_ID", ""),
         user_name=env_str("USER_NAME", ""),
@@ -640,6 +658,19 @@ def resolve_wrapup_code_id(config: Config, token: str, logger: logging.Logger) -
 
 def apply_resolved_filters(config: Config, token: str, logger: logging.Logger) -> Config:
     """Resuelve filtros por nombre a sus IDs y los coloca en el mismo config."""
+    # Los selectores guardan ID y nombre; los nombres antiguos siguen siendo compatibles.
+    for field in ("user", "queue", "campaign", "contact_list", "wrapup_code"):
+        raw = getattr(config, field + "_name")
+        if raw.lstrip().startswith("["):
+            selected = json.loads(raw)
+            if not isinstance(selected, list) or any(
+                not isinstance(item, dict) or not isinstance(item.get("id"), str) or not item["id"].strip()
+                for item in selected
+            ):
+                raise ValueError(f"Selección no válida: {field}")
+            if not getattr(config, field + "_id"):
+                setattr(config, field + "_id", join_filter_values([item["id"] for item in selected]))
+            setattr(config, field + "_name", "")
     config.queue_id = resolve_queue_id(config, token, logger)
     config.user_id = resolve_user_id(config, token, logger)
     config.campaign_id = resolve_campaign_id(config, token, logger)
@@ -650,6 +681,10 @@ def apply_resolved_filters(config: Config, token: str, logger: logging.Logger) -
 
 def validate_filter_safety(config: Config, logger: logging.Logger) -> None:
     filters = {
+        "FLOW_ID/FLOW_SELECTION_ID": config.flow_id,
+        "MEDIA_TYPE": "" if config.media_type == "todos" else config.media_type,
+        "PARTICIPANT_PURPOSE": "" if config.participant_purpose == "todos" else config.participant_purpose,
+        "ORIGINAL_DIRECTION": "" if config.original_direction == "ambas" else config.original_direction,
         "CONVERSATION_ID": config.conversation_id,
         "USER_ID/USER_NAME": config.user_id or config.user_name,
         "QUEUE_ID/QUEUE_NAME": config.queue_id or config.queue_name,
@@ -662,7 +697,7 @@ def validate_filter_safety(config: Config, logger: logging.Logger) -> None:
     if active:
         logger.info("Filtros activos: %s", ", ".join(active))
     else:
-        logger.warning("No hay filtros adicionales aparte del rango de fechas. Se respetará el rango máximo de un mes.")
+        logger.warning("No hay filtros adicionales aparte del rango de fechas.")
 
 
 def build_predicate(dimension: str, value: str, operator: str = "matches") -> Dict[str, str]:
@@ -690,14 +725,12 @@ def build_details_job_body(start_utc: str, end_utc: str, config: Config) -> Dict
     Además del filtro en el job, se hace una validación posterior por atributos
     para campaña/lista cuando esos datos vienen en participantes Dialer.
     """
-    segment_filters: List[Dict[str, Any]] = [
-        {
-            "type": "and",
-            "predicates": [build_predicate("mediaType", "voice", "matches")],
-        }
-    ]
+    segment_filters: List[Dict[str, Any]] = []
 
     for dimension, values in (
+        ("mediaType", "" if config.media_type == "todos" else config.media_type),
+        ("purpose", "" if config.participant_purpose == "todos" else config.participant_purpose),
+        ("flowId", config.flow_id),
         ("wrapUpCode", config.wrapup_code_id),
         ("queueId", config.queue_id),
         ("userId", config.user_id),
@@ -708,12 +741,16 @@ def build_details_job_body(start_utc: str, end_utc: str, config: Config) -> Dict
         if dimension_filter:
             segment_filters.append(dimension_filter)
 
-    return {
+    body = {
         "order": "asc",
         "orderBy": "conversationStart",
         "interval": f"{start_utc}/{end_utc}",
-        "segmentFilters": segment_filters,
     }
+    if segment_filters:
+        body["segmentFilters"] = segment_filters
+    if config.original_direction in ("inbound", "outbound"):
+        body["conversationFilters"] = [build_dimension_filter("originatingDirection", config.original_direction)]
+    return body
 
 
 def conversation_matches_post_filters(conversation: Dict[str, Any], config: Config) -> bool:
@@ -733,7 +770,18 @@ def conversation_matches_post_filters(conversation: Dict[str, Any], config: Conf
     if config.contact_list_id and not filter_contains(dialer.get("ContactListId", ""), config.contact_list_id):
         return False
 
-    if not conversation_was_agent_handled(conversation):
+    participants = conversation.get("participants") or []
+    sessions = [s for p in participants for s in p.get("sessions") or []]
+    # Flujo y agente pueden estar en sesiones diferentes de la conversación.
+    if config.participant_purpose != "todos" and not any(
+        p.get("purpose") == config.participant_purpose for p in participants
+    ):
+        return False
+    if config.media_type != "todos" and not any(s.get("mediaType") == config.media_type for s in sessions):
+        return False
+    if config.flow_id and not any(
+        filter_contains(str((s.get("flow") or {}).get("flowId") or ""), config.flow_id) for s in sessions
+    ):
         return False
 
     return True
@@ -975,7 +1023,7 @@ def extract_communication_ids(conversation: Dict[str, Any]) -> List[str]:
     return ids
 
 
-def obtener_session_ids_para_transcript(conversation_details: Dict[str, Any]) -> List[Dict[str, Any]]:
+def obtener_session_ids_para_transcript(conversation_details: Dict[str, Any], media_filter: str = "todos") -> List[Dict[str, Any]]:
     candidatos: List[Dict[str, Any]] = []
     seen = set()
 
@@ -992,7 +1040,7 @@ def obtener_session_ids_para_transcript(conversation_details: Dict[str, Any]) ->
 
         for session in participant.get("sessions") or []:
             media_type = str(session.get("mediaType") or "").lower()
-            if media_type != "voice":
+            if media_filter != "todos" and media_type != media_filter:
                 continue
 
             communication_id = session.get("sessionId") or session.get("communicationId")
@@ -1054,7 +1102,7 @@ def obtener_transcript_url(config: Config, token: str, conversation_id: str, com
 
 def buscar_transcript_url(config: Config, token: str, conversation_details: Dict[str, Any], logger: logging.Logger) -> Dict[str, Any]:
     conversation_id = conversation_details.get("conversationId") or conversation_details.get("id")
-    candidatos = obtener_session_ids_para_transcript(conversation_details)
+    candidatos = obtener_session_ids_para_transcript(conversation_details, config.media_type)
     intentos: List[Dict[str, Any]] = []
 
     if not conversation_id:
@@ -1067,8 +1115,8 @@ def buscar_transcript_url(config: Config, token: str, conversation_details: Dict
     if not candidatos:
         return {
             "conversation_id": conversation_id,
-            "estado": "SIN_CANDIDATOS_VOICE",
-            "error": "No se encontraron sessionId candidatos con mediaType=voice.",
+            "estado": "SIN_CANDIDATOS",
+            "error": "No se encontraron sessionId candidatos para el medio seleccionado.",
             "intentos": intentos,
         }
 
@@ -1319,7 +1367,7 @@ def process_conversation_transcripts(
     wrapup_ids = extract_wrapup_codes(conv)
     wrapup_names = wrapup_names_from_ids(wrapup_ids, wrapup_catalog)
     queue_ids, queue_names = extract_queue_info(conv, queue_catalog)
-    candidatos = obtener_session_ids_para_transcript(conv)
+    candidatos = obtener_session_ids_para_transcript(conv, config.media_type)
     start_utc = conv.get("conversationStart", "")
     end_utc = conv.get("conversationEnd", "")
     duration_sec = duration_seconds(start_utc, end_utc)
@@ -1457,6 +1505,7 @@ def main() -> int:
         logger.info("INICIO EXTRACTOR DE TRANSCRIPCIONES")
         log_params(logger, [
             "GENESYS_CLIENT_ID", "GENESYS_CLIENT_SECRET", "GENESYS_REGION", "DATE", "START_DATE", "END_DATE", "DAYS_BACK",
+            "FLOW_ID", "FLOW_SELECTION_ID", "MEDIA_TYPE", "PARTICIPANT_PURPOSE",
             "OUTPUT_MODE", "OUTPUT_FORMAT", "ORIGINAL_DIRECTION", "CONVERSATION_ID", "USER_ID", "USER_NAME",
             "QUEUE_ID", "QUEUE_NAME", "CAMPAIGN_ID", "CAMPAIGN_NAME", "CONTACT_LIST_ID", "CONTACT_LIST_NAME",
             "WRAPUP_CODE_ID", "WRAPUP_CODE_NAME", "MAX_CONVERSATIONS", "OUTPUT_CSV"

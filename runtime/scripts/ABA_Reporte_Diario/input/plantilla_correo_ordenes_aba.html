@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{REPORT_TITLE}}</title>
+  <style>
+    @media only screen and (max-width: 640px) {
+      .email-container { width: 100% !important; }
+      .mobile-block { display: block !important; width: 100% !important; }
+      .mobile-padding { padding-left: 18px !important; padding-right: 18px !important; }
+      .kpi-cell { display: block !important; width: 100% !important; padding: 5px 0 !important; }
+      .hide-mobile { display: none !important; }
+    }
+  </style>
+</head>
+<body style="margin:0; padding:0; background-color:#f3f4f6; font-family:Arial, Helvetica, sans-serif; color:#2f343a;">
+  <div style="display:none; max-height:0; overflow:hidden; opacity:0; color:transparent;">
+    Actualización diaria de órdenes de servicio CRM relacionadas con ABA al {{FECHA_REPORTE}}.
+  </div>
+
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background-color:#f3f4f6;">
+    <tr>
+      <td align="center" style="padding:24px 10px;">
+        <table role="presentation" class="email-container" width="680" cellspacing="0" cellpadding="0" border="0"
+               style="width:680px; max-width:680px; background-color:#ffffff; border-radius:14px; overflow:hidden; box-shadow:0 4px 18px rgba(0,0,0,0.08);">
+
+          <!-- Encabezado -->
+          <tr>
+            <td style="background-color:#da282d; padding:26px 32px;">
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+                <tr>
+                  <td valign="middle">
+                    <div style="font-size:12px; line-height:16px; color:#ffe9ea; letter-spacing:1.2px; text-transform:uppercase; font-weight:bold;">
+                      Reporte diario
+                    </div>
+                    <div style="font-size:25px; line-height:32px; color:#ffffff; font-weight:bold; margin-top:4px;">
+                      {{REPORT_TITLE}}
+                    </div>
+                    <div style="font-size:13px; line-height:19px; color:#ffe9ea; margin-top:7px;">
+                      Corte de información: {{FECHA_REPORTE}} · {{HORA_ACTUALIZACION}}
+                    </div>
+                  </td>
+                  <td align="right" valign="middle" width="190" class="hide-mobile">
+                    {{LOGO_HTML}}
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <!-- Mensaje -->
+          <tr>
+            <td class="mobile-padding" style="padding:28px 32px 12px 32px;">
+              <div style="font-size:15px; line-height:23px; color:#343a40;">
+                Buen día, equipo:
+              </div>
+              <div style="font-size:15px; line-height:23px; color:#555b61; margin-top:9px;">
+                Se comparte la actualización diaria de las <strong>órdenes de servicio CRM relacionadas con los ABA</strong>.
+                El archivo contiene el detalle disponible para el período del
+                <strong>{{FECHA_INICIO}}</strong> al <strong>{{FECHA_FIN}}</strong>.
+              </div>
+            </td>
+          </tr>
+
+          <!-- Información del archivo -->
+          <tr>
+            <td class="mobile-padding" style="padding:12px 32px 20px 32px;">
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0"
+                     style="background-color:#f7f7f8; border:1px solid #e3e5e8; border-radius:10px;">
+                <tr>
+                  <td class="mobile-block" width="50%" style="padding:14px 16px; border-right:1px solid #e3e5e8;">
+                    <div style="font-size:11px; color:#7a8087; text-transform:uppercase; font-weight:bold; letter-spacing:.6px;">
+                      Archivo compartido
+                    </div>
+                    <div style="font-size:14px; line-height:20px; color:#2f343a; font-weight:bold; margin-top:4px; word-break:break-word;">
+                      {{NOMBRE_ARCHIVO}}
+                    </div>
+                  </td>
+                  <td class="mobile-block" width="50%" style="padding:14px 16px;">
+                    <div style="font-size:11px; color:#7a8087; text-transform:uppercase; font-weight:bold; letter-spacing:.6px;">
+                      Registros incluidos
+                    </div>
+                    <div style="font-size:14px; line-height:20px; color:#2f343a; font-weight:bold; margin-top:4px;">
+                      {{TOTAL_REGISTROS_FORMATEADO}}
+                    </div>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <!-- KPIs -->
+          <tr>
+            <td class="mobile-padding" style="padding:0 32px 10px 32px;">
+              <div style="font-size:16px; line-height:22px; color:#2f343a; font-weight:bold; margin-bottom:12px;">
+                Resumen ejecutivo
+              </div>
+
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+                {{KPI_ROWS}}
+              </table>
+            </td>
+          </tr>
+
+          <!-- Alerta -->
+          {{RETURNED_ALERT}}
+
+          <!-- Distribución de estados -->
+          <tr>
+            <td class="mobile-padding" style="padding:0 32px 22px 32px;">
+              <div style="font-size:16px; line-height:22px; color:#2f343a; font-weight:bold; margin-bottom:11px;">
+                Distribución por estado
+              </div>
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0"
+                     style="border-collapse:separate; border-spacing:0; border:1px solid #e3e5e8; border-radius:10px; overflow:hidden;">
+                <tr>
+                  <th align="left" style="background-color:#f1f2f4; padding:10px 12px; font-size:12px; color:#5d636a;">Estado</th>
+                  <th align="right" style="background-color:#f1f2f4; padding:10px 12px; font-size:12px; color:#5d636a;">Cantidad</th>
+                  <th align="right" style="background-color:#f1f2f4; padding:10px 12px; font-size:12px; color:#5d636a;">Participación</th>
+                </tr>
+                {{ESTADOS_FILAS}}
+              </table>
+            </td>
+          </tr>
+
+          <!-- Dos columnas -->
+          <tr>
+            <td class="mobile-padding" style="padding:0 32px 22px 32px;">
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+                <tr>
+                  <td class="mobile-block" width="50%" valign="top" style="padding-right:8px;">
+                    <div style="font-size:16px; line-height:22px; color:#2f343a; font-weight:bold; margin-bottom:11px;">
+                      Responsables con mayor volumen
+                    </div>
+                    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0"
+                           style="border:1px solid #e3e5e8; border-radius:10px; overflow:hidden;">
+                      {{RESPONSABLES_FILAS}}
+                    </table>
+                  </td>
+
+                  <td class="mobile-block" width="50%" valign="top" style="padding-left:8px;">
+                    <div style="font-size:16px; line-height:22px; color:#2f343a; font-weight:bold; margin-bottom:11px;">
+                      Tendencia reciente
+                    </div>
+                    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0"
+                           style="border:1px solid #e3e5e8; border-radius:10px; overflow:hidden;">
+                      {{TENDENCIA_FILAS}}
+                    </table>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <!-- Observaciones -->
+          {{OBSERVACIONES_BLOQUE}}
+
+          <!-- Botón / adjunto -->
+          <tr>
+            <td class="mobile-padding" style="padding:0 32px 28px 32px;">
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+                <tr>
+                  <td style="font-size:13px; line-height:20px; color:#646a70;">
+                    El detalle completo se encuentra en el archivo adjunto.
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <!-- Pie -->
+          <tr>
+            <td style="background-color:#eceef0; padding:18px 32px; text-align:center;">
+              <div style="font-size:11px; line-height:17px; color:#777d83;">
+                Mensaje generado automáticamente. Favor no responder a este correo.
+              </div>
+              <div style="font-size:11px; line-height:17px; color:#94999e; margin-top:3px;">
+                {{NOMBRE_PROCESO}} · {{FECHA_REPORTE}}
+              </div>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>

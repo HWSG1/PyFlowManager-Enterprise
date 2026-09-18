@@ -4,11 +4,12 @@ import { FormsModule } from '@angular/forms';
 import { PyflowService } from '../../services/pyflow.service';
 import { environment } from '../../../environments/environment';
 import { ScriptGovernanceComponent } from '../script-governance/script-governance.component';
+import { GenesysFlowSelectComponent } from '../genesys-flow-select/genesys-flow-select.component';
 
 @Component({
   selector: 'app-script-detail',
   standalone: true,
-  imports: [CommonModule, FormsModule, ScriptGovernanceComponent],
+  imports: [CommonModule, FormsModule, ScriptGovernanceComponent, GenesysFlowSelectComponent],
   template: `
     <div class="h-full min-h-0 flex flex-col gap-4 overflow-hidden">
 
@@ -133,6 +134,30 @@ import { ScriptGovernanceComponent } from '../script-governance/script-governanc
               </div>
             } @else {
               <div class="flex flex-col gap-3">
+                @if (hasDynamicExcelParameters()) {
+                  <div class="rounded-lg border border-slate-800 bg-slate-900/50 p-3 text-[11px]">
+                    <div class="flex items-center justify-between gap-3">
+                      <div>
+                        @if (inputSchemaLoading) {
+                          <span class="text-slate-400">Leyendo el archivo de la carpeta input...</span>
+                        } @else if (inputSchemaError) {
+                          <span class="text-amber-300">{{ inputSchemaError }}</span>
+                        } @else {
+                          <span class="text-slate-400">Archivo detectado:</span>
+                          <span class="ml-1 text-slate-200 font-semibold">{{ inputSchemaFileName }}</span>
+                        }
+                      </div>
+                      <button
+                        type="button"
+                        (click)="loadInputSchema()"
+                        [disabled]="inputSchemaLoading"
+                        class="shrink-0 text-blue-400 hover:text-blue-300 disabled:opacity-50 font-semibold">
+                        Actualizar
+                      </button>
+                    </div>
+                  </div>
+                }
+
                 @for (param of scriptInputParams(); track param.id) {
                   <div>
                     <label class="text-xs text-slate-400 font-semibold block mb-1">
@@ -142,7 +167,20 @@ import { ScriptGovernanceComponent } from '../script-governance/script-governanc
                       }
                     </label>
 
-                    @if (param.control_type === 'select') {
+                    @if (param.control_type?.startsWith('genesys_')) {
+                      <app-genesys-flow-select [catalog]="param.control_type === 'genesys_flow' ? 'flows' : param.control_type.substring(8)" [scriptId]="script!.id" [(value)]="paramValues[param.param_key]" />
+                    } @else if (isDynamicExcelParameter(param)) {
+                      <select
+                        [(ngModel)]="paramValues[param.param_key]"
+                        (ngModelChange)="onDynamicExcelParameterChange(param.param_key, $event)"
+                        [disabled]="inputSchemaLoading || !!inputSchemaError"
+                        class="w-full bg-slate-900 border border-slate-800 rounded px-2.5 py-1.5 text-xs text-slate-300 focus:outline-none focus:border-blue-500 disabled:opacity-60">
+                        <option value="">Seleccione...</option>
+                        @for (opt of dynamicExcelOptions(param); track opt) {
+                          <option [value]="opt">{{ opt }}</option>
+                        }
+                      </select>
+                    } @else if (param.control_type === 'select') {
                       <select
                         [(ngModel)]="paramValues[param.param_key]"
                         class="w-full bg-slate-900 border border-slate-800 rounded px-2.5 py-1.5 text-xs text-slate-300 focus:outline-none focus:border-blue-500">
@@ -433,6 +471,11 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
   viewingExecutionParameters: number | null = null;
   paramValues: Record<string, any> = {};
   tagDraftValues: Record<string, string> = {};
+  inputSchemaLoading = false;
+  inputSchemaError = '';
+  inputSchemaFileName = '';
+  inputSchemaSheets: string[] = [];
+  inputSchemaColumns: string[] = [];
 
   private intervalId: ReturnType<typeof setInterval> | null = null;
   private eventSource: EventSource | null = null;
@@ -467,6 +510,65 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
     return String(param?.control_type || '').toLowerCase() === 'global' ||
       String(param?.param_type || '').toLowerCase() === 'global' ||
       !!String(param?.global_key || '').trim();
+  }
+
+  isDynamicExcelParameter(param: any): boolean {
+    return ['excel_sheet', 'excel_column'].includes(
+      String(param?.control_type || '').toLowerCase()
+    );
+  }
+
+  hasDynamicExcelParameters(): boolean {
+    return this.scriptParams.some(param => this.isDynamicExcelParameter(param));
+  }
+
+  dynamicExcelOptions(param: any): string[] {
+    return String(param?.control_type || '').toLowerCase() === 'excel_sheet'
+      ? this.inputSchemaSheets
+      : this.inputSchemaColumns;
+  }
+
+  onDynamicExcelParameterChange(key: string, value: string) {
+    if (key === 'SOURCE_SHEET' && value) {
+      this.paramValues['TRANSCRIPT_COLUMN'] = '';
+      this.loadInputSchema(value);
+    }
+  }
+
+  loadInputSchema(sheet?: string) {
+    const script = this.script;
+    if (!script || !this.hasDynamicExcelParameters()) return;
+
+    const selectedSheet = sheet ?? String(this.paramValues['SOURCE_SHEET'] || '');
+    this.inputSchemaLoading = true;
+    this.inputSchemaError = '';
+
+    this.svc.getScriptInputSchema(script.id, selectedSheet).subscribe({
+      next: schema => {
+        this.inputSchemaFileName = String(schema?.fileName || '');
+        this.inputSchemaSheets = Array.isArray(schema?.sheets)
+          ? schema.sheets.map((item: any) => String(item))
+          : [];
+        this.inputSchemaColumns = Array.isArray(schema?.columns)
+          ? schema.columns.map((item: any) => String(item))
+          : [];
+
+        const currentColumn = String(this.paramValues['TRANSCRIPT_COLUMN'] || '');
+        if (currentColumn && !this.inputSchemaColumns.includes(currentColumn)) {
+          this.paramValues['TRANSCRIPT_COLUMN'] = '';
+        }
+
+        this.inputSchemaLoading = false;
+      },
+      error: err => {
+        this.inputSchemaFileName = '';
+        this.inputSchemaSheets = [];
+        this.inputSchemaColumns = [];
+        this.inputSchemaError = err?.error?.message || err.message ||
+          'No se pudo leer el archivo de la carpeta input.';
+        this.inputSchemaLoading = false;
+      }
+    });
   }
 
   scriptInputParams(): any[] {
@@ -572,6 +674,10 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
           if (!this.isGlobalParam(p)) {
             this.paramValues[p.param_key] = p.param_value || '';
           }
+        }
+
+        if (this.hasDynamicExcelParameters()) {
+          this.loadInputSchema();
         }
       },
       error: err => {

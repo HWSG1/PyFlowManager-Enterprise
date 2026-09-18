@@ -859,19 +859,54 @@ def checkpoint_paths(output_dir: Path) -> Tuple[Path, Path]:
     return output_dir / "checkpoint_acierto_operadores.csv", output_dir / "checkpoint_acierto_operadores.jsonl"
 
 
+def replace_file_safely(temp_path: Path, final_path: Path, logger: logging.Logger) -> bool:
+    try:
+        os.replace(str(temp_path), str(final_path))
+        return True
+    except OSError as exc:
+        logger.warning("No se pudo reemplazar checkpoint %s. Detalle: %s", final_path.name, exc)
+        return False
+    finally:
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+        except OSError:
+            pass
+
+
 def guardar_checkpoint(rows: List[Dict[str, Any]], output_dir: Path, logger: logging.Logger) -> None:
     if not rows:
         return
-    csv_path, jsonl_path = checkpoint_paths(output_dir)
-    fieldnames = sorted({key for row in rows for key in row})
-    with csv_path.open("w", newline="", encoding="utf-8-sig") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(rows)
-    with jsonl_path.open("w", encoding="utf-8") as fh:
-        for row in rows:
-            fh.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
-    logger.info("Checkpoint guardado: %s registros", len(rows))
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        csv_path, jsonl_path = checkpoint_paths(output_dir)
+        stamp = f"{os.getpid()}_{int(time.time() * 1000)}"
+        tmp_csv_path = output_dir / f".checkpoint_acierto_operadores_{stamp}.csv.tmp"
+        tmp_jsonl_path = output_dir / f".checkpoint_acierto_operadores_{stamp}.jsonl.tmp"
+        fieldnames = sorted({key for row in rows for key in row})
+
+        with tmp_csv_path.open("w", newline="", encoding="utf-8-sig") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+        csv_ok = replace_file_safely(tmp_csv_path, csv_path, logger)
+    except Exception as exc:
+        logger.warning("No se pudo guardar checkpoint CSV; se continuara sin detener el proceso. Detalle: %s", exc)
+        csv_ok = False
+        tmp_jsonl_path = output_dir / f".checkpoint_acierto_operadores_{os.getpid()}_{int(time.time() * 1000)}.jsonl.tmp"
+        jsonl_path = output_dir / "checkpoint_acierto_operadores.jsonl"
+
+    try:
+        with tmp_jsonl_path.open("w", encoding="utf-8") as fh:
+            for row in rows:
+                fh.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+        replace_file_safely(tmp_jsonl_path, jsonl_path, logger)
+    except Exception as exc:
+        logger.warning(
+            "No se pudo guardar checkpoint JSONL; se continuara con el avance en memoria. Detalle: %s",
+            exc,
+        )
+    logger.info("Checkpoint %s: %s registros", "guardado" if csv_ok else "omitido temporalmente", len(rows))
 
 
 def cargar_checkpoint(output_dir: Path, logger: logging.Logger) -> List[Dict[str, Any]]:
@@ -879,16 +914,26 @@ def cargar_checkpoint(output_dir: Path, logger: logging.Logger) -> List[Dict[str
     if not csv_path.exists() and not jsonl_path.exists():
         return []
     rows = []
+    def cargar_csv() -> List[Dict[str, Any]]:
+        import pandas as pd
+        return pd.read_csv(csv_path, dtype=str, low_memory=False).fillna("").to_dict("records")
+
     try:
-        if jsonl_path.exists():
-            with jsonl_path.open("r", encoding="utf-8") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if line:
-                        rows.append(json.loads(line))
+        usar_jsonl = jsonl_path.exists() and (
+            not csv_path.exists() or jsonl_path.stat().st_mtime >= csv_path.stat().st_mtime
+        )
+        if usar_jsonl:
+            try:
+                with jsonl_path.open("r", encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if line:
+                            rows.append(json.loads(line))
+            except Exception as exc:
+                logger.warning("No se pudo cargar checkpoint JSONL; se intentara con CSV. Detalle: %s", exc)
+                rows = cargar_csv() if csv_path.exists() else []
         else:
-            import pandas as pd
-            rows = pd.read_csv(csv_path, dtype=str, low_memory=False).to_dict("records")
+            rows = cargar_csv()
         logger.info("Checkpoint cargado: %s registros", len(rows))
         return rows
     except Exception as exc:

@@ -489,6 +489,20 @@ export class PyflowService {
     return this.http.get<any[]>(`${this.apiUrl}/scripts/${scriptId}/parameters`);
   }
 
+  getGenesysCatalog(scriptId: number, catalog: string) {
+    return this.http.get<{ id: string; name: string; type: string }[]>(
+      `${this.apiUrl}/scripts/${scriptId}/genesys-catalog/${catalog}`);
+  }
+
+  getGenesysFlows(scriptId: number) {
+    return this.http.get<{ id: string; name: string; type: string }[]>(`${this.apiUrl}/scripts/${scriptId}/genesys-flows`);
+  }
+
+  getScriptInputSchema(scriptId: number, sheet = '') {
+    const query = sheet ? `?sheet=${encodeURIComponent(sheet)}` : '';
+    return this.http.get<any>(`${this.apiUrl}/scripts/${scriptId}/input-schema${query}`);
+  }
+
   getScriptGovernance(scriptId: number) {
     return this.http.get<any>(`${this.apiUrl}/governance/scripts/${scriptId}`);
   }
