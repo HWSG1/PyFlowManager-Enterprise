@@ -1256,10 +1256,8 @@ def convert_value(name: str, kind: str, nullable: bool, value: Any, config: Conf
                 return "true" in parts
         raise ValueError(f"Booleano no válido en {name}")
     text = json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str) if isinstance(value, (list, dict)) else str(value)
-    if kind.startswith("NVARCHAR"):
-        length = int(re.search(r"\((\d+)\)", kind).group(1))
-        if len(text.encode("utf-16-le")) // 2 > length:
-            raise ValueError(f"{name} supera {kind}; no se truncará información.")
+    # La longitud depende del destino: Excel valida su límite de celda y HANA
+    # valida la capacidad real consultada en SYS.TABLE_COLUMNS, no el modelo inicial.
     return text
 
 
@@ -1344,6 +1342,7 @@ class HanaWriter:
                 raise
 
     def validate_schema(self) -> None:
+        self.text_limits = {}
         cur = self.conn.cursor()
         try:
             for sheet, table_key in TABLE_KEYS.items():
@@ -1365,6 +1364,8 @@ class HanaWriter:
                         raise RuntimeError(f"Tipo HANA incompatible: {sheet}.{name}")
                     if base == "NVARCHAR" and int(row[2]) < int(re.search(r"\((\d+)\)", kind).group(1)):
                         raise RuntimeError(f"Longitud HANA inferior al modelo: {sheet}.{name}")
+                    if base == "NVARCHAR":
+                        self.text_limits[(sheet, name)] = int(row[2])
                     if base == "DECIMAL":
                         precision, scale = map(int, re.search(r"\((\d+),(\d+)\)", kind).groups())
                         if int(row[3]) < scale or int(row[2]) - int(row[3]) < precision - scale:
@@ -1381,6 +1382,18 @@ class HanaWriter:
     def add(self, rows: dict[str, list[dict[str, Any]]]) -> None:
         if self.config.dry_run:
             return
+        for sheet, items in rows.items():
+            for row in items:
+                for column, value in row.items():
+                    limit = self.text_limits.get((sheet, column))
+                    if limit is not None and isinstance(value, str):
+                        length = len(value.encode("utf-16-le")) // 2
+                        if length > limit:
+                            raise ValueError(
+                                f'{self.config.get(TABLE_KEYS[sheet])}.{hana_column(column)}: '
+                                f'longitud={length}, capacidad HANA={limit}; '
+                                f'conversationId={row.get("conversationId")}, sequence={row.get("sequence")}. '
+                                'No se truncará información.')
         self.buffer.append(rows)
         if len(self.buffer) >= self.config.batch_size:
             self.flush()
@@ -1792,6 +1805,11 @@ def self_test() -> int:
                 self.c.values["OUTPUT_DIR"] = directory
                 conv = self.conv()
                 conv["participants"][0]["attributes"] = {"SPD_IDENTIFICACION": "000123", "SPD_Comentario": "=1+1"}
+                for participant in conv["participants"]:
+                    for session in participant.get("sessions", []):
+                        for segment in session.get("segments", []):
+                            if segment.get("wrapUpCode"):
+                                segment["wrapUpCode"] = "LONG-CODE-" * 30
                 writer = ExcelWriter(self.c)
                 try:
                     writer.add(self.normalized(conv))
@@ -1808,12 +1826,31 @@ def self_test() -> int:
                 sheet = book["INTERACCIONES"]
                 self.assertEqual(sheet.cell(2, columns.index("SPD_IDENTIFICACION") + 1).value, "000123")
                 self.assertEqual(sheet.cell(2, columns.index("SPD_Comentario") + 1).data_type, "s")
+                self.assertEqual(sheet.cell(2, columns.index("wrapUpCode") + 1).value, "LONG-CODE-" * 30)
                 book.close()
+
+        def test_hana_actual_text_capacity(self) -> None:
+            writer = HanaWriter(self.c.__class__(**{**self.c.__dict__, "dry_run": True}))
+            writer.config = copy.deepcopy(self.c)
+            writer.config.dry_run = False
+            writer.config.batch_size = 100
+            writer.conn = Mock()
+            writer.text_limits = {("INTERACCIONES", "wrapUpCode"): 250}
+            rows = self.normalized(self.conv())
+            rows["INTERACCIONES"][0]["wrapUpCode"] = "x" * 250
+            writer.add(rows)
+            self.assertEqual(len(writer.buffer), 1)
+            rows["INTERACCIONES"][0]["wrapUpCode"] = "x" * 251
+            with self.assertRaisesRegex(ValueError, "longitud=251, capacidad HANA=250; conversationId="):
+                writer.add(rows)
+            self.assertEqual(len(writer.buffer), 1)
+            writer.conn.cursor.assert_not_called()
 
         def test_15_idempotent_hana_mock_and_rollback(self) -> None:
             rows = self.normalized(self.conv())
             writer = HanaWriter(self.c.__class__(**{**self.c.__dict__, "dry_run": True}))
             writer.config = copy.deepcopy(self.c)
+            writer.text_limits = {}
             writer.conn = Mock()
             stored: dict[str, dict[tuple[Any, Any], tuple[Any, ...]]] = defaultdict(dict)
             cursor = writer.conn.cursor.return_value
