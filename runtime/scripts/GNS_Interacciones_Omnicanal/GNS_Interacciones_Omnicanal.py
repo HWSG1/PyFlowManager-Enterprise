@@ -1324,6 +1324,29 @@ def merge_statement(config: Config, sheet: str) -> str:
             f'WHEN NOT MATCHED THEN INSERT ({", ".join(quoted)}) VALUES ({", ".join("S." + col for col in quoted)})')
 
 
+def cleanup_batches(config: Config, sheet: str, conversations: list) -> Iterator[tuple[str, tuple]]:
+    """Agrupar predicados completos; nunca partir el conjunto de secuencias de un ID."""
+    table = identifier(config.get("HANA_SCHEMA")) + "." + identifier(config.get(TABLE_KEYS[sheet]))
+    clauses, parameters = [], []
+    for conversation in conversations:
+        primary = conversation["INTERACCIONES"]
+        if not primary:
+            continue
+        cid = primary[0]["conversationId"]
+        sequences = sorted({row["sequence"] for row in conversation[sheet]})
+        values = (cid, *sequences)
+        if clauses and (len(clauses) >= 100 or len(parameters) + len(values) > 2000):
+            yield f'DELETE FROM {table} WHERE ' + ' OR '.join(clauses), tuple(parameters)
+            clauses, parameters = [], []
+        predicate = '"CONVERSATION_ID" = ?'
+        if sequences:
+            predicate += ' AND "SECUENCIA" NOT IN (' + ','.join('?' for _ in sequences) + ')'
+        clauses.append('(' + predicate + ')')
+        parameters.extend(values)
+    if clauses:
+        yield f'DELETE FROM {table} WHERE ' + ' OR '.join(clauses), tuple(parameters)
+
+
 class HanaWriter:
     """Una transacción para las cuatro tablas. Sin DDL; MERGE por claves del modelo."""
     def __init__(self, config: Config):
@@ -1405,31 +1428,26 @@ class HanaWriter:
             raise RuntimeError("Conexión de escritura no disponible.")
         cur = self.conn.cursor()
         batch_counts: Counter = Counter()
+        started = time.monotonic()
+        cleanup_queries = 0
         try:
             # Primero MERGE de principal y extensiones. Parámetros enlazados, sin SQL por dato.
             for sheet in SCHEMAS:
                 rows = [row for conversation in self.buffer for row in conversation[sheet]]
                 columns = [col[0] for col in SCHEMAS[sheet]]
+                sql = merge_statement(self.config, sheet)
                 for offset in range(0, len(rows), 500):
-                    cur.executemany(merge_statement(self.config, sheet),
+                    cur.executemany(sql,
                                     [tuple(row[col] for col in columns) for row in rows[offset:offset + 500]])
                 batch_counts[sheet] += len(rows)
             # El snapshot completo puede cambiar sus secuencias/medio al cerrar un email.
             # Quitar únicamente claves obsoletas de las conversaciones de ESTE lote.
-            for conversation in self.buffer:
-                primary = conversation["INTERACCIONES"]
-                if not primary:
-                    continue
-                cid = primary[0]["conversationId"]
-                for sheet in reversed(list(SCHEMAS)):
-                    sequences = [row["sequence"] for row in conversation[sheet]]
-                    table = identifier(self.config.get("HANA_SCHEMA")) + "." + identifier(self.config.get(TABLE_KEYS[sheet]))
-                    if sequences:
-                        marks = ",".join("?" for _ in sequences)
-                        cur.execute(f'DELETE FROM {table} WHERE "CONVERSATION_ID" = ? AND "SECUENCIA" NOT IN ({marks})',
-                                    (cid, *sequences))
-                    else:
-                        cur.execute(f'DELETE FROM {table} WHERE "CONVERSATION_ID" = ?', (cid,))
+            written_at = time.monotonic()
+            for sheet in reversed(list(SCHEMAS)):
+                for sql, parameters in cleanup_batches(self.config, sheet, self.buffer):
+                    cur.execute(sql, parameters)
+                    cleanup_queries += 1
+            cleaned_at = time.monotonic()
             self.conn.commit()
         except Exception:
             self.conn.rollback()
@@ -1437,6 +1455,9 @@ class HanaWriter:
         finally:
             cur.close()
         self.counts.update(batch_counts)
+        LOG.info("Tiempos lote HANA (%s conversaciones): escritura=%.2fs | limpieza=%.2fs (%s consultas) | commit=%.2fs",
+                 len(self.buffer), written_at - started, cleaned_at - written_at,
+                 cleanup_queries, time.monotonic() - cleaned_at)
         LOG.info("Registros escritos HANA por tabla: %s", dict(self.counts))
         self.buffer.clear()
 
@@ -1877,6 +1898,45 @@ def self_test() -> int:
             with self.assertRaises(RuntimeError):
                 writer.flush()
             writer.conn.rollback.assert_called_once()
+
+        def test_cleanup_batches_preserve_exact_keys(self) -> None:
+            import sqlite3
+            conn = sqlite3.connect(":memory:")
+            conn.execute('ATTACH DATABASE ":memory:" AS BI_SS')
+            sheet = "INTERACCIONES_EMAIL"
+            table = identifier(self.c.get("HANA_SCHEMA")) + "." + identifier(self.c.get(TABLE_KEYS[sheet]))
+            conn.execute(f'CREATE TABLE {table} (CONVERSATION_ID TEXT, SECUENCIA INTEGER)')
+            snapshots = []
+            expected = {("outside", 9)}
+            initial = [("outside", 9)]
+            for index in range(205):
+                cid = f"cid-{index}"
+                keep = [1, 3] if index % 2 else []
+                snapshots.append({"INTERACCIONES": [{"conversationId": cid}],
+                                  sheet: [{"conversationId": cid, "sequence": seq} for seq in keep]})
+                initial.extend((cid, seq) for seq in (1, 2, 3, 4))
+                expected.update((cid, seq) for seq in keep)
+            conn.executemany(f'INSERT INTO {table} VALUES (?, ?)', initial)
+            queries = list(cleanup_batches(self.c, sheet, snapshots))
+            self.assertEqual(len(queries), 3)
+            for sql, params in queries:
+                conn.execute(sql, params)
+            self.assertEqual(set(conn.execute(f'SELECT * FROM {table}')), expected)
+            conn.close()
+
+        def test_cleanup_failure_rolls_back_whole_batch(self) -> None:
+            writer = HanaWriter(self.c.__class__(**{**self.c.__dict__, "dry_run": True}))
+            writer.config = copy.deepcopy(self.c)
+            writer.text_limits = {}
+            writer.conn = Mock()
+            writer.conn.cursor.return_value.execute.side_effect = RuntimeError("cleanup failure")
+            writer.add(self.normalized(self.conv()))
+            with self.assertRaises(RuntimeError):
+                writer.flush()
+            writer.conn.commit.assert_not_called()
+            writer.conn.rollback.assert_called_once()
+            self.assertEqual(dict(writer.counts), {})
+            self.assertEqual(len(writer.buffer), 1)
 
         def test_16_dry_run_never_connects_writer(self) -> None:
             self.c.dry_run = True
