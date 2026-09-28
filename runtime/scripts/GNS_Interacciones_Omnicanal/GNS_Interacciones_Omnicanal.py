@@ -661,7 +661,7 @@ def load_catalogs(config: Config, api: GenesysClient) -> dict[str, dict[str, str
     definitions = {
         "users": ("HANA_USERS_TABLE", "ID", "NAME", "/api/v2/users"),
         "queues": ("HANA_QUEUES_TABLE", "ID", "QUEUE_NAME", "/api/v2/routing/queues"),
-        "wrapups": ("HANA_WRAPUPS_TABLE", "CONCLUSION_ID", "CONCLUSION", "/api/v2/routing/wrapupcodes"),
+        "wrapups": ("HANA_WRAPUPS_TABLE", "wrap_upcode", "wrap_upcode_name", "/api/v2/routing/wrapupcodes"),
     }
     catalogs: dict[str, dict[str, str]] = {}
     conn = None
@@ -677,11 +677,23 @@ def load_catalogs(config: Config, api: GenesysClient) -> dict[str, dict[str, str
             if conn is not None:
                 cursor = conn.cursor()
                 try:
+                    if name == "wrapups":
+                        # HANA conserva minúsculas solo cuando se crean entre comillas.
+                        cursor.execute('SELECT COLUMN_NAME FROM SYS.TABLE_COLUMNS WHERE SCHEMA_NAME = ? AND TABLE_NAME = ?',
+                                       (config.get("HANA_SCHEMA"), config.get(table_key)))
+                        columns = [row[0] for row in cursor.fetchall()]
+                        resolved = []
+                        for expected in (id_col, name_col):
+                            matches = [col for col in columns if col.lower() == expected]
+                            if len(matches) != 1:
+                                raise ValueError(f"Columna ausente o ambigua: {expected}")
+                            resolved.append(matches[0])
+                        id_col, name_col = resolved
                     cursor.execute(f'SELECT DISTINCT {identifier(id_col)}, {identifier(name_col)} '
                                    f'FROM {identifier(config.get("HANA_SCHEMA"))}.{identifier(config.get(table_key))}')
                     rows = cursor.fetchall()
                 except Exception:
-                    # El usuario creará GNS_API_CAT_CONCLUSIONES. No se crea ni altera aquí.
+                    # Los catálogos se consultan sin crear ni alterar tablas.
                     if config.output != "excel" and not config.dry_run:
                         raise RuntimeError(f"No se pudo leer {config.get(table_key)} ({id_col}, {name_col}).") from None
                     LOG.warning("Catálogo %s no disponible en HANA; se usará Genesys.", name)
@@ -1937,13 +1949,14 @@ def self_test() -> int:
             self.assertEqual(self.c.filters["USER_ID"], ["u1"])
             connection = Mock()
             cursor = connection.cursor.return_value
-            cursor.fetchall.side_effect = [[("u1", "Agente 1")], [("q1", "Cola 1")], [("w1", "Resuelto")]]
+            cursor.fetchall.side_effect = [[("u1", "Agente 1")], [("q1", "Cola 1")],
+                                          [("wrap_upcode",), ("wrap_upcode_name",), ("fecha_carga",)], [("w1", "Resuelto")]]
             with patch(__name__ + ".hana_connect", return_value=connection):
                 loaded = load_catalogs(self.c, self.api)
             self.assertEqual(loaded["wrapups"]["w1"], "Resuelto")
             sql = " ".join(call.args[0] for call in cursor.execute.call_args_list)
             self.assertIn('"BI_SS"."GNS_API_CAT_CONCLUSIONES"', sql)
-            self.assertIn('"CONCLUSION_ID", "CONCLUSION"', sql)
+            self.assertIn('"wrap_upcode", "wrap_upcode_name"', sql)
             self.assertIn('"QUEUE_NAME"', sql)
             self.api.entities.assert_not_called()
 

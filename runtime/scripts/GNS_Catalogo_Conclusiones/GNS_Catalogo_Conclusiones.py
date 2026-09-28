@@ -2,9 +2,10 @@
 
 Dependencias: requests, hdbcli; python-dotenv opcional.
 Ejecutar desde PyFlow o con Python; --dry-run consulta Genesys sin conectar a HANA.
-La tabla debe existir con CONCLUSION_ID y CONCLUSION de tipo VARCHAR/NVARCHAR.
+La tabla debe existir con wrap_upcode y wrap_upcode_name VARCHAR/NVARCHAR,
+y fecha_carga DATE/TIMESTAMP/SECONDDATE (fecha del servidor HANA).
 No crea tablas ni elimina conclusiones históricas. Conviene una clave única en
-CONCLUSION_ID y programar una sola ejecución a la vez.
+wrap_upcode y programar una sola ejecución a la vez.
 Solo carga los códigos visibles para el cliente OAuth; no inventa códigos
 eliminados o de sistema que no estén presentes en el catálogo de Genesys.
 Referencia API: https://developer.genesys.cloud/devapps/api-explorer
@@ -166,23 +167,36 @@ def save(connection, rows, schema, table, batch_size):
         cursor.execute('SELECT COLUMN_NAME, DATA_TYPE_NAME, LENGTH FROM SYS.TABLE_COLUMNS '
                        'WHERE SCHEMA_NAME = ? AND TABLE_NAME = ?', (schema, table))
         columns = {name: (kind, size) for name, kind, size in cursor.fetchall()}
-        for index, column in enumerate(("CONCLUSION_ID", "CONCLUSION")):
+        resolved = {}
+        for expected in ("wrap_upcode", "wrap_upcode_name", "fecha_carga"):
+            matches = [name for name in columns if name.lower() == expected]
+            if len(matches) != 1:
+                raise ValueError(f"{target}: falta la columna {expected} o su nombre es ambiguo. Columnas visibles: {', '.join(columns)}")
+            resolved[expected] = matches[0]
+        for index, column in enumerate((resolved["wrap_upcode"], resolved["wrap_upcode_name"])):
             if column not in columns or columns[column][0] not in ("VARCHAR", "NVARCHAR"):
                 raise ValueError(f"{target} debe existir y contener {column} VARCHAR/NVARCHAR.")
             if any(len(row[index]) > int(columns[column][1]) for row in rows):
                 raise ValueError(f"Un valor supera la longitud de {column}; no se truncarán datos.")
-        cursor.execute(f'SELECT "CONCLUSION_ID" FROM {target} GROUP BY "CONCLUSION_ID" HAVING COUNT(*) > 1')
+        date_type = columns[resolved["fecha_carga"]][0]
+        if date_type not in ("DATE", "TIMESTAMP", "SECONDDATE"):
+            raise ValueError(f"fecha_carga debe ser DATE, TIMESTAMP o SECONDDATE; tipo recibido: {date_type}.")
+        date_sql = "CURRENT_DATE" if date_type == "DATE" else "CURRENT_TIMESTAMP"
+        code_col = identifier(resolved["wrap_upcode"])
+        name_col = identifier(resolved["wrap_upcode_name"])
+        date_col = identifier(resolved["fecha_carga"])
+        cursor.execute(f'SELECT {code_col} FROM {target} GROUP BY {code_col} HAVING COUNT(*) > 1')
         if cursor.fetchone() is not None:
             raise ValueError("El catálogo destino contiene IDs duplicados; corrija los duplicados antes de cargar.")
-        id_length = int(columns["CONCLUSION_ID"][1])
-        name_length = int(columns["CONCLUSION"][1])
+        id_length = int(columns[resolved["wrap_upcode"]][1])
+        name_length = int(columns[resolved["wrap_upcode_name"]][1])
         sql = f'''MERGE INTO {target} AS T
-USING (SELECT CAST(? AS NVARCHAR({id_length})) AS "CONCLUSION_ID",
-              CAST(? AS NVARCHAR({name_length})) AS "CONCLUSION" FROM DUMMY) AS S
-ON T."CONCLUSION_ID" = S."CONCLUSION_ID"
-WHEN MATCHED THEN UPDATE SET T."CONCLUSION" = S."CONCLUSION"
-WHEN NOT MATCHED THEN INSERT ("CONCLUSION_ID", "CONCLUSION")
-VALUES (S."CONCLUSION_ID", S."CONCLUSION")'''
+USING (SELECT CAST(? AS NVARCHAR({id_length})) AS CODE,
+              CAST(? AS NVARCHAR({name_length})) AS NAME FROM DUMMY) AS S
+ON T.{code_col} = S.CODE
+WHEN MATCHED THEN UPDATE SET T.{name_col} = S.NAME, T.{date_col} = {date_sql}
+WHEN NOT MATCHED THEN INSERT ({code_col}, {name_col}, {date_col})
+VALUES (S.CODE, S.NAME, {date_sql})'''
         for start in range(0, len(rows), batch_size):
             cursor.executemany(sql, rows[start:start + batch_size])
             done = min(start + batch_size, len(rows))
