@@ -136,19 +136,19 @@ PYFLOW_PARAMS = {'GENESYS_CLIENT_ID': {'type': 'global',
                   'required': False,
                   'secret': True},
  'HANA_SCHEMA': {'type': 'text', 'label': 'HANA_SCHEMA', 'required': False, 'default': 'BI_SS'},
- 'HANA_MAIN_TABLE': {'type': 'text', 'label': 'HANA_MAIN_TABLE', 'required': False, 'default': 'GNS_INTERACCIONES'},
+ 'HANA_MAIN_TABLE': {'type': 'text', 'label': 'HANA_MAIN_TABLE', 'required': False, 'default': 'GNS_API_INTERACCIONES'},
  'HANA_VOICE_TABLE': {'type': 'text',
                       'label': 'HANA_VOICE_TABLE',
                       'required': False,
-                      'default': 'GNS_INTERACCIONES_VOICE'},
+                      'default': 'GNS_API_INTERACCIONES_VOICE'},
  'HANA_DIGITAL_TABLE': {'type': 'text',
                         'label': 'HANA_DIGITAL_TABLE',
                         'required': False,
-                        'default': 'GNS_INTERACCIONES_DIGITAL'},
+                        'default': 'GNS_API_INTERACCIONES_DIGITAL'},
  'HANA_EMAIL_TABLE': {'type': 'text',
                       'label': 'HANA_EMAIL_TABLE',
                       'required': False,
-                      'default': 'GNS_INTERACCIONES_EMAIL'},
+                      'default': 'GNS_API_INTERACCIONES_EMAIL'},
  'HANA_USERS_TABLE': {'type': 'text', 'label': 'HANA_USERS_TABLE', 'required': False, 'default': 'GNS_API_USUARIOS'},
  'HANA_QUEUES_TABLE': {'type': 'text', 'label': 'HANA_QUEUES_TABLE', 'required': False, 'default': 'GNS_API_COLAS'},
  'HANA_WRAPUPS_TABLE': {'type': 'text',
@@ -1296,21 +1296,32 @@ def normalize(conversation: dict[str, Any], attentions: list[Attention], attribu
     return result
 
 
+def hana_column(name: str) -> str:
+    """Nombres físicos verificados contra TABLE_COLUMNS_202609272148.csv.
+
+    Mantener los nombres API en normalización y Excel; traducir solo al escribir HANA.
+    """
+    if name == "sequence":
+        return "SECUENCIA"
+    name = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", name)
+    return re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name).upper()
+
+
 def merge_statement(config: Config, sheet: str) -> str:
     columns = [column[0] for column in SCHEMAS[sheet]]
     table = identifier(config.get("HANA_SCHEMA")) + "." + identifier(config.get(TABLE_KEYS[sheet]))
-    quoted = [identifier(col) for col in columns]
+    quoted = [identifier(hana_column(col)) for col in columns]
     source = ", ".join(f"? AS {col}" for col in quoted)
     updates = []
     for col in columns:
         if col in ("conversationId", "sequence"):
             continue
-        q = identifier(col)
+        q = identifier(hana_column(col))
         # No borrar identificación ya conocida si una consulta posterior no la devuelve.
         expression = f"COALESCE(S.{q}, T.{q})" if col in IDENTIFICATION_KEYS else f"S.{q}"
         updates.append(f"T.{q} = {expression}")
     return (f"MERGE INTO {table} AS T USING (SELECT {source} FROM DUMMY) AS S "
-            'ON T."conversationId" = S."conversationId" AND T."sequence" = S."sequence" '
+            'ON T."CONVERSATION_ID" = S."CONVERSATION_ID" AND T."SECUENCIA" = S."SECUENCIA" '
             f'WHEN MATCHED THEN UPDATE SET {", ".join(updates)} '
             f'WHEN NOT MATCHED THEN INSERT ({", ".join(quoted)}) VALUES ({", ".join("S." + col for col in quoted)})')
 
@@ -1340,9 +1351,14 @@ class HanaWriter:
                             "WHERE SCHEMA_NAME = ? AND TABLE_NAME = ? ORDER BY POSITION",
                             (self.config.get("HANA_SCHEMA"), self.config.get(table_key)))
                 actual = cur.fetchall()
-                if [str(row[0]) for row in actual] != [col[0] for col in SCHEMAS[sheet]]:
-                    raise RuntimeError(f"Columnas de {self.config.get(table_key)} distintas del modelo incorporado; no se escribirá.")
-                for expected, row in zip(SCHEMAS[sheet], actual):
+                by_name = {str(row[0]): row for row in actual}
+                expected_names = {hana_column(col[0]) for col in SCHEMAS[sheet]}
+                if set(by_name) != expected_names:
+                    missing = sorted(expected_names - set(by_name))
+                    extra = sorted(set(by_name) - expected_names)
+                    raise RuntimeError(f"Columnas de {self.config.get(table_key)} incompatibles: faltan={missing}, adicionales={extra}; no se escribirá.")
+                for expected in SCHEMAS[sheet]:
+                    row = by_name[hana_column(expected[0])]
                     name, kind, nullable, _ = expected
                     base = kind.split("(")[0]
                     if str(row[1]).upper() != base:
@@ -1357,7 +1373,7 @@ class HanaWriter:
                             "AND IS_PRIMARY_KEY = 'TRUE' ORDER BY POSITION",
                             (self.config.get("HANA_SCHEMA"), self.config.get(table_key)))
                 keys = {str(row[0]) for row in cur.fetchall()}
-                if keys != {"conversationId", "sequence"}:
+                if keys != {"CONVERSATION_ID", "SECUENCIA"}:
                     raise RuntimeError(f"Clave primaria incompatible en {self.config.get(table_key)}.")
         finally:
             cur.close()
@@ -1397,10 +1413,10 @@ class HanaWriter:
                     table = identifier(self.config.get("HANA_SCHEMA")) + "." + identifier(self.config.get(TABLE_KEYS[sheet]))
                     if sequences:
                         marks = ",".join("?" for _ in sequences)
-                        cur.execute(f'DELETE FROM {table} WHERE "conversationId" = ? AND "sequence" NOT IN ({marks})',
+                        cur.execute(f'DELETE FROM {table} WHERE "CONVERSATION_ID" = ? AND "SECUENCIA" NOT IN ({marks})',
                                     (cid, *sequences))
                     else:
-                        cur.execute(f'DELETE FROM {table} WHERE "conversationId" = ?', (cid,))
+                        cur.execute(f'DELETE FROM {table} WHERE "CONVERSATION_ID" = ?', (cid,))
             self.conn.commit()
         except Exception:
             self.conn.rollback()
@@ -1935,6 +1951,18 @@ def self_test() -> int:
                 run(self.c)
             self.assertEqual([call.args[2] for call in daily.call_args_list], [date(2026, 9, 20), date(2026, 9, 21)])
             self.assertEqual(sink.add.call_count, 1)
+
+        def test_hana_physical_column_names(self) -> None:
+            for source, target in {"conversationId": "CONVERSATION_ID", "sequence": "SECUENCIA",
+                                   "mediaStatsMinConversationRFactor": "MEDIA_STATS_MIN_CONVERSATION_R_FACTOR",
+                                   "SPD_Gestion_FH": "SPD_GESTION_FH", "SPD_tipoDeCanal": "SPD_TIPO_DE_CANAL"}.items():
+                self.assertEqual(hana_column(source), target)
+            for sheet in SCHEMAS:
+                sql = merge_statement(self.c, sheet)
+                self.assertIn('T."CONVERSATION_ID" = S."CONVERSATION_ID"', sql)
+                self.assertIn('T."SECUENCIA" = S."SECUENCIA"', sql)
+                self.assertNotIn('"conversationId"', sql)
+                self.assertNotIn('"sequence"', sql)
 
         def test_25_legacy_selectors_and_catalog_queries(self) -> None:
             self.c.values["USER_NAME"] = "Agente 1"
