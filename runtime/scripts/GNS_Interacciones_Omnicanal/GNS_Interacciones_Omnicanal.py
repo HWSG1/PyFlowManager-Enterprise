@@ -57,7 +57,6 @@ PYFLOW_PARAMS = {'GENESYS_CLIENT_ID': {'type': 'global',
                     'global_key': 'GENESYS_REGION',
                     'label': 'Genesys Region / Domain',
                     'required': True},
- 'DATE': {'type': 'date', 'label': 'Fecha específica local', 'required': False},
  'START_DATE': {'type': 'date', 'label': 'Fecha inicial local', 'required': False},
  'END_DATE': {'type': 'date', 'label': 'Fecha final local', 'required': False},
  'DAYS_BACK': {'type': 'number',
@@ -464,7 +463,7 @@ class Config:
 def load_config(argv: list[str] | None = None) -> Config:
     load_dotenv()
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    for name in ("date", "start-date", "end-date", "days-back", "media-type", "original-direction", "direction",
+    for name in ("start-date", "end-date", "days-back", "media-type", "original-direction", "direction",
                  "participant-purpose", "user-id", "queue-id", "wrapup-code-id", "flow-id", "campaign-id",
                  "contact-list-id", "conversation-id", "routing-type", "transfer-filter", "output-dir",
                  "max-conversations"):
@@ -474,21 +473,15 @@ def load_config(argv: list[str] | None = None) -> Config:
     parser.add_argument("--self-test", action="store_true", help="Pruebas sin conexiones externas")
     args = parser.parse_args(argv)
     values = {key: env_str(key, str(meta.get("default", ""))) for key, meta in PYFLOW_PARAMS.items()}
-    # Una fecha CLI explícita reemplaza el modo de fechas que provenga del entorno.
-    if args.date is not None:
+    # Días relativos explícitos reemplazan un rango guardado en el entorno.
+    if args.days_back is not None and args.start_date is None and args.end_date is None:
         values.update(START_DATE="", END_DATE="")
-    elif args.start_date is not None or args.end_date is not None or args.days_back is not None:
-        values["DATE"] = ""
-        if args.days_back is not None and args.start_date is None and args.end_date is None:
-            values.update(START_DATE="", END_DATE="")
     for key, value in vars(args).items():
         if value is not None and key not in ("output", "self_test"):
             values[key.upper()] = str(value)
     zone = values["GENESYS_TIMEZONE"] or "America/Tegucigalpa"
     ZoneInfo(zone)
-    if values["DATE"]:
-        first = last = parse_date(values["DATE"])
-    elif values["START_DATE"] or values["END_DATE"]:
+    if values["START_DATE"] or values["END_DATE"]:
         if not (values["START_DATE"] and values["END_DATE"]):
             raise ValueError("START_DATE y END_DATE deben informarse juntos.")
         first, last = parse_date(values["START_DATE"]), parse_date(values["END_DATE"])
