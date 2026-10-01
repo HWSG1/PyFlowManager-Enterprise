@@ -1200,12 +1200,25 @@ def pick(data, *names):
     return None
 
 
+def milliseconds_value(value):
+    """Desenvolver solo unidades explícitas; no adivinar segundos por magnitud."""
+    if isinstance(value, dict) and "milliseconds" in value:
+        return value["milliseconds"]
+    return value
+
+
 def local_time(value, zone="America/Tegucigalpa"):
+    value = milliseconds_value(value)
     if value is None or value == "":
         return None
-    if isinstance(value, (int, float)):
-        dt = datetime.fromtimestamp(value / 1000, timezone.utc)
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, (int, float, Decimal)) or isinstance(value, str) and re.fullmatch(r"[+-]?\d+(?:\.\d+)?", value.strip()):
+        ms = numeric_value(value, "BIGINT")
+        dt = datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(milliseconds=ms)
     else:
+        if not isinstance(value, str):
+            raise ValueError("Timestamp Genesys requiere ISO-8601 o milisegundos de época")
         dt = parse_genesys_datetime(value)
     if dt is None:
         raise ValueError("Timestamp Genesys inválido")
@@ -1300,6 +1313,16 @@ def transcript_units(payload):
         raise ValueError("Payload transcript no es objeto/lista")
 
 
+def duration_milliseconds(item):
+    """Genesys puede entregar durationMs o duration: {milliseconds: N}.
+
+    No interpretar unidades ambiguas ni reemplazar estructuras desconocidas por cero.
+    Los formatos desconocidos quedan para la validación con contexto de conversación.
+    """
+    value = pick(item, "durationMs", "duration")
+    return milliseconds_value(value)
+
+
 def field_row(item, fields):
     aliases = {
         "PARTICIPANT_PURPOSE": ("participantPurpose", "purpose"), "PARTICIPANT_NAME": ("participantName", "name"),
@@ -1310,7 +1333,9 @@ def field_row(item, fields):
     for column in fields:
         parts = column.lower().split("_")
         camel = parts[0] + "".join(p.title() for p in parts[1:])
-        result[column] = pick(item, *aliases.get(column, (camel,)))
+        result[column] = duration_milliseconds(item) if column == "DURATION_MS" else pick(item, *aliases.get(column, (camel,)))
+        if column in ("OFFSET_MS", "START_TIME_MS", "END_TIME_MS"):
+            result[column] = milliseconds_value(result[column])
     return result
 
 
@@ -1327,7 +1352,7 @@ def build_bundle(base, transcript, descriptor, purpose):
                   TRANSCRIPT_ERROR=None, MEDIA_TYPE=transcript.get("mediaType"), LANGUAGE=transcript.get("language"),
                   PROGRAM_ID=transcript.get("programId"), ENGINE_ID=transcript.get("engineId"),
                   TRANSCRIPT_START_TIME=local_time(pick(transcript, "startTime", "startTimeMs")),
-                  TRANSCRIPT_DURATION_MS=pick(transcript, "durationMs", "duration"),
+                  TRANSCRIPT_DURATION_MS=duration_milliseconds(transcript),
                   SUBJECT=transcript.get("subject"), MESSAGE_TYPE=transcript.get("messageType"))
     key = {k: parent[k] for k in KEYS}
     bundle = {table: [] for table in TABLES}
@@ -1335,14 +1360,24 @@ def build_bundle(base, transcript, descriptor, purpose):
     phrases = array(transcript.get("phrases"))
     if any(not isinstance(p, dict) for p in phrases):
         raise ValueError("phrases contiene elementos inválidos")
-    phrases = sorted(enumerate(phrases), key=lambda pair: (
-        float(pick(pair[1], "phraseIndex", "startTimeMs") if pick(pair[1], "phraseIndex", "startTimeMs") is not None else pair[0]), pair[0]))
+    indexed = []
+    used = set()
+    for original, phrase in enumerate(phrases):
+        try:
+            index = numeric_value(phrase.get("phraseIndex"), "INTEGER")
+            if index is not None and (index < 0 or index in used):
+                raise ValueError("phraseIndex negativo o duplicado")
+            if index is not None:
+                used.add(index)
+            start = numeric_value(milliseconds_value(phrase.get("startTimeMs")), "BIGINT")
+        except ValueError as exc:
+            raise ValueError(f"Frase {original}: {exc}") from exc
+        indexed.append((original, phrase, index, start))
+    phrases = sorted(indexed, key=lambda item: (item[2] if item[2] is not None else item[3] if item[3] is not None else item[0], item[0]))
     seen_indices, lines = set(), []
     fields = CHILD_SPECS["FRASES"][1]
-    for original, phrase in phrases:
-        index = phrase.get("phraseIndex")
+    for original, phrase, index, _ in phrases:
         if index is None:
-            used = {p.get("phraseIndex") for _, p in phrases if p.get("phraseIndex") is not None}
             index = original
             while index in used or index in seen_indices:
                 index += 1
@@ -1508,6 +1543,7 @@ def process_conversation_transcripts(conv, config, token, wrapups, queues, logge
         if not descriptors:
             bundles.append(state_bundle(base, comm, "SIN_TRANSCRIPCION_API", "Sin URLs disponibles", purpose))
         for descriptor in descriptors:
+            payload = None
             try:
                 payload = download_payload(config, descriptor["url"])
                 units = list(transcript_units(payload))
@@ -1532,6 +1568,9 @@ def process_conversation_transcripts(conv, config, token, wrapups, queues, logge
                             raise ValueError("Dos transcripts distintos comparten clave técnica; no se sobrescribirán")
                         continue
                     normalize_optional_scores(bundle, unit, config, logger)
+                    # Aislar problemas de formato por transcript antes de entregarlos
+                    # al coordinador. Longitudes se validan después con capacidad HANA real.
+                    validate_bundle(bundle, check_lengths=False)
                     seen[key] = fingerprint
                     if config.save_transcript_json or config.json_output_dir:
                         directory = Path(config.json_output_dir or Path(__file__).parent / "output" / "json")
@@ -1541,6 +1580,16 @@ def process_conversation_transcripts(conv, config, token, wrapups, queues, logge
                     bundles.append(bundle)
             except Exception as exc:
                 logger.warning("Transcript | conversationId=%s | communicationId=%s | %s", cid, comm, safe_error(exc))
+                if payload is not None:
+                    directory = Path(config.json_output_dir or env_str("OUTPUT_DIR", "") or Path(__file__).parent / "output") / "transcript_errors"
+                    directory.mkdir(parents=True, exist_ok=True)
+                    filename = hashlib.sha256(canonical([cid, comm, payload]).encode("utf-8")).hexdigest() + ".json"
+                    path = directory / filename
+                    temporary = path.with_suffix(".part.json")
+                    temporary.write_text(json.dumps({"conversationId": cid, "communicationId": comm,
+                        "error": safe_error(exc), "payload": payload}, ensure_ascii=False, indent=2), encoding="utf-8")
+                    os.replace(temporary, path)
+                    logger.warning("Fuente íntegra del transcript con error: %s", path)
                 bundles.append(state_bundle(base, comm, "ERROR", safe_error(exc), purpose, descriptor.get("recordingId")))
         if config.api_sleep_seconds:
             time.sleep(config.api_sleep_seconds)
@@ -1561,7 +1610,7 @@ def primary_keys(table):
     return KEYS + ([] if table == MAIN else [CHILD_SPECS[table[len(MAIN) + 1:]][0]])
 
 
-def validate_bundle(bundle, capacities=None):
+def validate_bundle(bundle, capacities=None, check_lengths=True):
     parent = bundle[MAIN][0]
     if any(not parent.get(k) for k in KEYS):
         raise ValueError("Clave técnica vacía")
@@ -1601,7 +1650,7 @@ def validate_bundle(bundle, capacities=None):
                                          f"communicationId={parent['COMMUNICATION_ID']}, transcript={parent['TRANSCRIPT_INSTANCE_ID']}") from exc
                 elif kind != "TIMESTAMP":
                     row[column] = json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value)
-                    if kind.startswith("NVARCHAR"):
+                    if check_lengths and kind.startswith("NVARCHAR"):
                         limit = (capacities or {}).get((table, column), int(re.search(r"\d+", kind).group()))
                         size = len(row[column].encode("utf-16-le")) // 2
                         if size > limit:
