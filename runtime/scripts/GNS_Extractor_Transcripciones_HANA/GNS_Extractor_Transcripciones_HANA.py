@@ -23,6 +23,8 @@
 #   - Dependencias: requests, hdbcli, openpyxl; python-dotenv y tzdata según entorno.
 #   - TEXT íntegro en HANA; si Excel no admite una celda, se genera .completo.csv.
 #   - Enriquecimiento dinámico de campaña en .campania.jsonl, sin columnas extras HANA.
+#   - Indicadores decimales opcionales incompatibles: NULL con advertencia y JSON
+#     íntegro en normalization_warnings; no se inventan valores numéricos.
 #   - --dry-run mantiene la consulta Genesys pero no conecta HANA ni genera Excel/CSV.
 #   - El enriquecimiento de campaña se hace contra Genesys Outbound Contact Lists.
 #   - Si no se indican fechas, usa DAYS_BACK para extraer últimos N días cerrados.
@@ -47,7 +49,7 @@ import traceback
 import hashlib
 import threading
 import re
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
 from urllib.parse import quote, urlparse
 from concurrent.futures import wait, FIRST_COMPLETED
@@ -1401,6 +1403,70 @@ def safe_error(exc):
     return f"{type(exc).__name__}: {text}"[:2000]
 
 
+def numeric_value(value, kind):
+    """Sin equivalencias inventadas para booleanos, etiquetas o porcentajes."""
+    if value is None or isinstance(value, str) and not value.strip():
+        return None
+    if isinstance(value, (bool, dict, list)):
+        raise ValueError("valor no numérico")
+    try:
+        number = Decimal(str(value).strip())
+        if not number.is_finite():
+            raise ValueError("valor no finito")
+        if kind.startswith("DECIMAL"):
+            if abs(number) >= Decimal("10000000000"):
+                raise ValueError("decimal fuera de rango")
+            with localcontext() as context:
+                context.prec = 32
+                result = number.quantize(Decimal("0.00000001"))
+            if abs(result) >= Decimal("10000000000"):
+                raise ValueError("decimal fuera de rango después del redondeo")
+            return result
+        bound = 2 ** (31 if kind == "INTEGER" else 63)
+        if number != number.to_integral_value() or not -bound <= number < bound:
+            raise ValueError("entero inválido o fuera de rango")
+        return int(number)
+    except InvalidOperation as exc:
+        raise ValueError("formato numérico inválido") from exc
+
+
+def normalize_optional_scores(bundle, original, config, logger):
+    """Conservar fuente antes de sustituir indicadores opcionales incompatibles."""
+    parent = bundle[MAIN][0]
+    warnings, changes = [], []
+    for table, fields in TABLES.items():
+        for row in bundle[table]:
+            for column, kind in fields:
+                if not kind.startswith("DECIMAL"):
+                    continue
+                value = row.get(column)
+                try:
+                    numeric_value(value, kind)
+                except ValueError as exc:
+                    warnings.append({"table": table, "column": column,
+                                     "key": {k: row.get(k) for k in primary_keys(table)},
+                                     "value": value, "reason": str(exc)})
+                    changes.append((row, column))
+    if not warnings:
+        return
+    directory = Path(config.json_output_dir or env_str("OUTPUT_DIR", "") or Path(__file__).parent / "output") / "normalization_warnings"
+    directory.mkdir(parents=True, exist_ok=True)
+    identity = [parent[k] for k in KEYS]
+    # Hash de fuente: nuevas variantes no sobrescriben diagnósticos anteriores.
+    filename = hashlib.sha256(canonical([identity, original]).encode("utf-8")).hexdigest() + ".json"
+    path = directory / filename
+    temporary = path.with_suffix(".part.json")
+    temporary.write_text(json.dumps({"keys": dict(zip(KEYS, identity)), "warnings": warnings,
+                                     "transcript": original}, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temporary, path)
+    for row, column in changes:
+        row[column] = None
+    columns = sorted({w["column"] for w in warnings})
+    parent["TRANSCRIPT_ERROR"] = f"Advertencia: {len(warnings)} indicadores opcionales no numéricos/fuera de rango guardados como NULL ({', '.join(columns)}). Diagnóstico: {filename}"
+    logger.warning("Normalización numérica | conversationId=%s | communicationId=%s | transcript=%s | campos=%s | incidencias=%s | fuente íntegra=%s",
+                   *identity, ",".join(columns), len(warnings), path)
+
+
 def process_conversation_transcripts(conv, config, token, wrapups, queues, logger):
     cid = str(conv.get("conversationId") or conv.get("id") or "")
     if not cid:
@@ -1465,6 +1531,7 @@ def process_conversation_transcripts(conv, config, token, wrapups, queues, logge
                         if seen[key] != fingerprint:
                             raise ValueError("Dos transcripts distintos comparten clave técnica; no se sobrescribirán")
                         continue
+                    normalize_optional_scores(bundle, unit, config, logger)
                     seen[key] = fingerprint
                     if config.save_transcript_json or config.json_output_dir:
                         directory = Path(config.json_output_dir or Path(__file__).parent / "output" / "json")
@@ -1524,17 +1591,14 @@ def validate_bundle(bundle, capacities=None):
                 value = row.get(column)
                 if value is None:
                     continue
-                if kind.startswith("DECIMAL"):
-                    number = Decimal(str(value))
-                    if not number.is_finite() or abs(number) >= Decimal("10000000000"):
-                        raise ValueError(f"{table}.{column}: decimal fuera de rango")
-                    row[column] = number.quantize(Decimal("0.00000001"))
-                elif kind in ("INTEGER", "BIGINT"):
-                    number = Decimal(str(value))
-                    bound = 2 ** (31 if kind == "INTEGER" else 63)
-                    if not number.is_finite() or number != number.to_integral_value() or not -bound <= number < bound:
-                        raise ValueError(f"{table}.{column}: entero inválido")
-                    row[column] = int(number)
+                if kind.startswith("DECIMAL") or kind in ("INTEGER", "BIGINT"):
+                    try:
+                        row[column] = numeric_value(value, kind)
+                        if column in primary_keys(table) and row[column] is None:
+                            raise ValueError("clave numérica vacía")
+                    except ValueError as exc:
+                        raise ValueError(f"{table}.{column}: {exc}; conversationId={parent['CONVERSATION_ID']}, "
+                                         f"communicationId={parent['COMMUNICATION_ID']}, transcript={parent['TRANSCRIPT_INSTANCE_ID']}") from exc
                 elif kind != "TIMESTAMP":
                     row[column] = json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value)
                     if kind.startswith("NVARCHAR"):
