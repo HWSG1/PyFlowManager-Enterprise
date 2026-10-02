@@ -6,6 +6,7 @@
 #   Extraer transcripciones disponibles de Genesys Cloud en texto plano.
 #   Una fila principal por CONVERSATION_ID; detalle por transcript en tablas hijas.
 #   Principal V3: 18 columnas; dirección y medio como valores únicos separados por /.
+#   Solo se cargan/exportan interacciones con TEXT no vacío.
 #
 # Modos:
 #   1) solo_transcript:
@@ -1810,6 +1811,11 @@ def validate_bundle(bundle, capacities=None, check_lengths=True, aggregate=False
                             raise ValueError(f"{table}.{column}: longitud={size}, capacidad={limit}, conversationId={parent['CONVERSATION_ID']}. Sin truncar.")
 
 
+def has_transcript_text(bundle):
+    text = bundle[MAIN][0].get("TEXT")
+    return isinstance(text, str) and bool(text.strip())
+
+
 class HanaTranscriptWriter:
     """Solo el hilo coordinador usa esta conexión. Sin DDL ni pandas."""
     def __init__(self, logger):
@@ -1853,6 +1859,8 @@ class HanaTranscriptWriter:
             cur.close()
 
     def add(self, bundle):
+        if not has_transcript_text(bundle):
+            return
         validate_bundle(bundle, self.capacities, aggregate=True)
         self.buffer.append(bundle)
         if len(self.buffer) >= 20:
@@ -1918,6 +1926,8 @@ class OutputWriter:
         self.count = 0
 
     def add(self, bundle):
+        if not has_transcript_text(bundle):
+            return
         row = bundle[MAIN][0]
         self.writer.writerow({n: row.get(n) for n in self.columns})
         self.count += 1
@@ -1995,7 +2005,7 @@ def main():
     logger = setup_logger()
     started = time.monotonic()
     hana = output = None
-    error_count = total_rows = 0
+    error_count = total_rows = skipped_without_text = 0
     try:
         config = load_config()
         config.dry_run = config.dry_run or args.dry_run
@@ -2050,21 +2060,22 @@ def main():
                     # Errores inesperados no se silencian ni se convierten en éxito.
                     bundles, campaign = future.result()
                     bundle = aggregate_conversation(bundles)
-                    validate_bundle(bundle, hana.capacities if hana else None, aggregate=True)
-                    if bundle[MAIN][0]["TRANSCRIPT_ESTADO"] in ("SIN_CANDIDATOS", "SIN_TRANSCRIPCION_API"):
-                        logger.info("Sin transcripción disponible | conversationId=%s | estado=%s | búsqueda finalizada",
-                                    bundle[MAIN][0]["CONVERSATION_ID"], bundle[MAIN][0]["TRANSCRIPT_ESTADO"])
-                    if hana:
-                        hana.add(bundle)
-                        output.add(bundle)
                     error_count += bundle[MAIN][0]["TRANSCRIPT_ESTADO"] in ("ERROR", "PARCIAL")
-                    total_rows += 1
-                    if output:
-                        output.campaign(conv.get("conversationId") or conv["id"], campaign)
+                    if has_transcript_text(bundle):
+                        validate_bundle(bundle, hana.capacities if hana else None, aggregate=True)
+                        if hana:
+                            hana.add(bundle)
+                        if output:
+                            output.add(bundle)
+                            output.campaign(conv.get("conversationId") or conv["id"], campaign)
+                        total_rows += 1
+                    else:
+                        skipped_without_text += 1
                     completed += 1
                     now = time.monotonic()
                     if completed == 1 or completed == total or now - last_progress >= 30:
-                        logger.info("Avance %s/%s | interacciones=%s | errores=%s", completed, total, total_rows, error_count)
+                        logger.info("Avance %s/%s | con texto=%s | omitidas sin texto=%s | errores=%s",
+                                    completed, total, total_rows, skipped_without_text, error_count)
                         print(f"PYFLOW_PROGRESS={int(90 * completed / max(1, total))}", flush=True)
                         last_progress = now
                     submit_one()
@@ -2072,7 +2083,8 @@ def main():
             hana.flush()
             output.finish()
         print("PYFLOW_PROGRESS=100", flush=True)
-        logger.info("Finalizado | filas=%s | errores=%s | dry_run=%s", total_rows, error_count, config.dry_run)
+        logger.info("Finalizado | filas con texto=%s | omitidas sin texto=%s | errores=%s | dry_run=%s",
+                    total_rows, skipped_without_text, error_count, config.dry_run)
         return 1 if error_count else 0
     except Exception as exc:
         logger.error("Proceso fallido: %s", safe_error(exc))
