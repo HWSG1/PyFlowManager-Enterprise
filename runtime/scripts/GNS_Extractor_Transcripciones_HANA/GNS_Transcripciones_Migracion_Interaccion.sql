@@ -1,8 +1,7 @@
 -- MODELO V3: 18 columnas y una fila por CONVERSATION_ID.
 -- Ejecutar manualmente con el extractor detenido. DROP elimina los datos de la principal.
--- Las cuatro tablas hijas mantienen su estructura y contenido.
--- Recargar los rangos históricos: cada interacción recargada reemplaza también su detalle.
--- Si se desea reiniciar todo el histórico, vaciar también las cuatro tablas hijas.
+-- El extractor utiliza solo esta tabla; no consulta ni modifica las antiguas tablas hijas.
+-- No ejecutar este archivo si la tabla de 18 columnas ya existe: no se requiere migración.
 -- Restituir permisos del usuario de carga si es distinto del creador.
 
 DROP TABLE BI_SS.GNS_API_TRANSCRIPCIONES;

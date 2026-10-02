@@ -4,7 +4,7 @@
 #
 # Objetivo:
 #   Extraer transcripciones disponibles de Genesys Cloud en texto plano.
-#   Una fila principal por CONVERSATION_ID; detalle por transcript en tablas hijas.
+#   Una fila por CONVERSATION_ID; solo se utiliza GNS_API_TRANSCRIPCIONES.
 #   Principal V3: 18 columnas; dirección y medio como valores únicos separados por /.
 #   Solo se cargan/exportan interacciones con TEXT no vacío.
 #
@@ -12,16 +12,14 @@
 #   1) solo_transcript:
 #      Extrae conversación, comunicación y texto transcrito.
 #
-#   2) transcript_campania:
-#      Además de la transcripción, intenta enriquecer con datos de campaña
-#      usando ContactId y ContactListId del participante Dialer.
+#   ContactId, ContactListId y CampaignId se obtienen del detalle de Analytics.
 #
 # Ejemplos:
 #   py .\GNS_Extractor_Transcripciones_PyFlow.py --start-date 2026-06-01 --end-date 2026-06-03
 #   py .\GNS_Extractor_Transcripciones_PyFlow.py --date 2026-06-01
 ##
 # Notas:
-#   - Carga las cinco tablas BI_SS.GNS_API_TRANSCRIPCIONES* ya creadas con el SQL adjunto.
+#   - Carga únicamente BI_SS.GNS_API_TRANSCRIPCIONES (18 columnas).
 #   - HPR_HOST/HPR_PORT/HPR_USER/HPR_PASSWORD del entorno; no escribe al espejo.
 #   - Dependencias: requests, hdbcli, openpyxl; python-dotenv y tzdata según entorno.
 #   - TEXT íntegro en HANA; si Excel no admite una celda, se genera .completo.csv.
@@ -86,7 +84,7 @@ PYFLOW_PARAMS = {
         "type": "select",
         "label": "Salida requerida",
         "required": True,
-        "options": ["solo_transcript", "transcript_campania"],
+        "options": ["solo_transcript"],
         "default": "solo_transcript"
     },
     "ORIGINAL_DIRECTION": {
@@ -121,6 +119,30 @@ PYFLOW_PARAMS = {
 LOGGER_NAME = "gns_extractor_transcripciones_pyflow"
 TOKEN_LOCK = threading.Lock()
 LATEST_TOKEN = ""
+HTTP_LOCAL = threading.local()
+HTTP_SESSIONS = []
+HTTP_SESSIONS_LOCK = threading.Lock()
+
+
+def http_session(download=False):
+    # Conexión por hilo y por destino: nunca compartir Authorization con URLs firmadas.
+    name = "download" if download else "api"
+    session = getattr(HTTP_LOCAL, name, None)
+    if session is None:
+        session = requests.Session()
+        setattr(HTTP_LOCAL, name, session)
+        with HTTP_SESSIONS_LOCK:
+            HTTP_SESSIONS.append(session)
+    return session
+
+
+def close_http_sessions():
+    global HTTP_LOCAL
+    with HTTP_SESSIONS_LOCK:
+        for session in HTTP_SESSIONS:
+            session.close()
+        HTTP_SESSIONS.clear()
+    HTTP_LOCAL = threading.local()
 
 
 class TranscriptNotFound(Exception):
@@ -333,7 +355,7 @@ def load_config() -> Config:
         genesys_login_url=genesys_login_url_from_region(region),
         timezone_name=env_str("GENESYS_TIMEZONE", "America/Tegucigalpa"),
         days_back=env_int("DAYS_BACK", 30),
-        output_mode=output_mode,
+        output_mode="solo_transcript",  # Compatibilidad con ejecuciones guardadas del modo anterior.
         original_direction=original_direction,
         flow_id=env_str("FLOW_ID", "") or env_str("FLOW_SELECTION_ID", ""),
         media_type=media_type,
@@ -499,7 +521,7 @@ def request_with_retry(method: str, url: str, config: Config, logger: logging.Lo
         try:
             if is_api and LATEST_TOKEN:
                 kwargs["headers"] = {**kwargs.get("headers", {}), "Authorization": "Bearer " + LATEST_TOKEN}
-            response = requests.request(method, url, timeout=config.request_timeout, **kwargs)
+            response = http_session().request(method, url, timeout=config.request_timeout, **kwargs)
 
             if is_api and response.status_code == 401 and attempt < config.max_retries:
                 old_token = kwargs.get("headers", {}).get("Authorization", "")
@@ -1142,29 +1164,6 @@ def obtener_session_ids_para_transcript(conversation_details: Dict[str, Any], me
     return sorted(candidatos, key=lambda item: (item["prioridad"], item["communication_id"]))
 
 
-def fetch_contact_from_genesys(config: Config, token: str, contact_list_id: str, contact_id: str, logger: logging.Logger) -> Dict[str, Any]:
-    if not contact_list_id or not contact_id:
-        return {}
-    url = f"{config.genesys_api_url}/api/v2/outbound/contactlists/{contact_list_id}/contacts/{contact_id}"
-    response = request_with_retry("GET", url, config, logger, headers=genesys_headers(token))
-    data = response.json() if response.text else {}
-    return data
-
-
-def flatten_contact_data(contact: Dict[str, Any]) -> Dict[str, Any]:
-    if not contact:
-        return {}
-    out: Dict[str, Any] = {}
-    out["contact_callable"] = contact.get("callable")
-    out["contact_phone_number_status"] = json.dumps(contact.get("phoneNumberStatus") or {}, ensure_ascii=False)
-    data = contact.get("data") or {}
-    if isinstance(data, dict):
-        for key, value in data.items():
-            safe_key = "camp_" + "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in str(key))[:80]
-            out[safe_key] = value
-    return out
-
-
 def default_output_path(output_format: str = "xlsx") -> str:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = env_str("OUTPUT_DIR", "") or os.path.join(os.getcwd(), "output")
@@ -1185,70 +1184,21 @@ def resolve_output_path(output_path: str, output_format: str) -> str:
     return output_path
 
 
-# Modelo interno por transcript; STORAGE_TABLES define las columnas físicas.
+# Única tabla persistida. El detalle de frases solo se usa en memoria para ordenar TEXT.
 KEYS = ["CONVERSATION_ID", "COMMUNICATION_ID", "TRANSCRIPT_INSTANCE_ID"]
 MAIN = "GNS_API_TRANSCRIPCIONES"
-TABLES = {
-    MAIN: [(n, "NVARCHAR(250)") for n in KEYS] + [
-        ("TRANSCRIPT_ID", "NVARCHAR(250)"), ("RECORDING_ID", "NVARCHAR(250)"),
-        ("CONVERSATION_START", "TIMESTAMP"), ("CONVERSATION_END", "TIMESTAMP"),
-        ("DURATION_MS", "BIGINT"), ("ORIGINATING_DIRECTION", "NVARCHAR(50)"),
-        ("QUEUE_ID", "NVARCHAR(2100)"), ("QUEUE_NAME", "NVARCHAR(2100)"),
-        ("WRAP_UP_CODE_ID", "NVARCHAR(2100)"), ("WRAP_UP_CODE_ID_ULTIMA", "NVARCHAR(250)"),
-        ("CONCLUSION_ORIGINAL", "NVARCHAR(2100)"), ("CONCLUSION_ULTIMA", "NVARCHAR(500)"),
-        ("CONTACT_ID", "NVARCHAR(250)"), ("CONTACT_LIST_ID", "NVARCHAR(250)"), ("CAMPAIGN_ID", "NVARCHAR(250)"),
-        ("COMMUNICATION_PURPOSE", "NVARCHAR(100)"), ("TRANSCRIPT_ESTADO", "NVARCHAR(100)"),
-        ("TRANSCRIPT_ERROR", "NVARCHAR(2100)"), ("MEDIA_TYPE", "NVARCHAR(100)"),
-        ("LANGUAGE", "NVARCHAR(100)"), ("PROGRAM_ID", "NVARCHAR(250)"), ("ENGINE_ID", "NVARCHAR(250)"),
-        ("TRANSCRIPT_START_TIME", "TIMESTAMP"), ("TRANSCRIPT_DURATION_MS", "BIGINT"),
-        ("SUBJECT", "NVARCHAR(2100)"), ("MESSAGE_TYPE", "NVARCHAR(100)"),
-        ("PHRASES_COUNT", "INTEGER"), ("TEXT", "NCLOB"), ("ACOUSTIC_COUNT", "INTEGER"),
-        ("ACOUSTIC_JSON", "NCLOB"), ("FECHA_CARGA", "TIMESTAMP")],
-}
-CHILD_SPECS = {
-    "PARTICIPANTES": ("PARTICIPANT_SEQ", {
-        "PARTICIPANT_PURPOSE": "NVARCHAR(100)", "PARTICIPANT_NAME": "NVARCHAR(500)",
-        **{n: "NVARCHAR(250)" for n in ("USER_ID", "TEAM_ID", "QUEUE_ID", "FLOW_ID", "DIVISION_ID")},
-        "FLOW_VERSION": "NVARCHAR(100)", "INITIAL_DIRECTION": "NVARCHAR(100)", "MESSAGE_TYPE": "NVARCHAR(100)",
-        "ANI": "NVARCHAR(2100)", "DNIS": "NVARCHAR(2100)", "ADDRESS_TO": "NVARCHAR(2100)",
-        "ADDRESS_FROM": "NVARCHAR(2100)", "START_TIME_MS": "BIGINT", "END_TIME_MS": "BIGINT"}),
-    "FRASES": ("PHRASE_INDEX", {
-        "PARTICIPANT_PURPOSE": "NVARCHAR(100)", "TEXT": "NCLOB", "DECORATED_TEXT": "NCLOB",
-        "STABILITY": "DECIMAL(18,8)", "CONFIDENCE": "DECIMAL(18,8)",
-        "OFFSET_MS": "BIGINT", "START_TIME_MS": "BIGINT", "DURATION_MS": "BIGINT", "TYPE": "NVARCHAR(100)",
-        "WORDS_COUNT": "INTEGER", "WORDS_JSON": "NCLOB", "ALTERNATIVES_COUNT": "INTEGER", "ALTERNATIVES_JSON": "NCLOB"}),
-    "SENTIMIENTO": ("SENTIMENT_SEQ", {
-        "PARTICIPANT": "NVARCHAR(500)", "PHRASE": "NCLOB", "PHRASE_INDEX": "INTEGER",
-        "OFFSET_MS": "BIGINT", "START_TIME_MS": "BIGINT", "DURATION_MS": "BIGINT",
-        "SENTIMENT": "NVARCHAR(100)", "TYPE": "NVARCHAR(100)", "SENTIMENT_SCORE": "DECIMAL(18,8)"}),
-    "TOPICS": ("TOPIC_SEQ", {
-        "PARTICIPANT": "NVARCHAR(500)", "TOPIC_ID": "NVARCHAR(250)", "TOPIC_NAME": "NVARCHAR(500)",
-        "TOPIC_PHRASE": "NCLOB", "TRANSCRIPT_PHRASE": "NCLOB", "CONFIDENCE": "DECIMAL(18,8)",
-        "OFFSET_MS": "BIGINT", "START_TIME_MS": "BIGINT", "DURATION_MS": "BIGINT", "TYPE": "NVARCHAR(100)"}),
-}
-for suffix, (seq, fields) in CHILD_SPECS.items():
-    TABLES[MAIN + "_" + suffix] = [(n, "NVARCHAR(250)") for n in KEYS] + [(seq, "INTEGER")] + list(fields.items()) + [("FECHA_CARGA", "TIMESTAMP")]
-
-# Modelo interno: conserva metadatos técnicos para agrupar y validar transcripts.
-MULTI_COLUMNS = {"COMMUNICATION_ID", "TRANSCRIPT_INSTANCE_ID", "TRANSCRIPT_ID", "RECORDING_ID",
-                "COMMUNICATION_PURPOSE", "MEDIA_TYPE", "LANGUAGE", "PROGRAM_ID", "ENGINE_ID",
-                "SUBJECT", "MESSAGE_TYPE"}
-TABLES[MAIN] = [(name, "NCLOB" if name in MULTI_COLUMNS or name == "TRANSCRIPT_ERROR" else kind)
-                for name, kind in TABLES[MAIN]]
-
-# Modelo público V3: exactamente estas 18 columnas en HANA y Excel/CSV.
-MAIN_COLUMNS = (
-    "CONVERSATION_ID", "CONVERSATION_START", "CONVERSATION_END", "DURATION_MS",
-    "ORIGINATING_DIRECTION", "QUEUE_ID", "QUEUE_NAME", "WRAP_UP_CODE_ID",
-    "WRAP_UP_CODE_ID_ULTIMA", "CONCLUSION_ORIGINAL", "CONCLUSION_ULTIMA",
-    "CONTACT_ID", "CONTACT_LIST_ID", "CAMPAIGN_ID", "MEDIA_TYPE", "PHRASES_COUNT",
-    "TEXT", "FECHA_CARGA",
-)
-STORAGE_TABLES = dict(TABLES)
-STORAGE_TABLES[MAIN] = [
-    (name, "NVARCHAR(250)" if name in ("ORIGINATING_DIRECTION", "MEDIA_TYPE") else dict(TABLES[MAIN])[name])
-    for name in MAIN_COLUMNS
-]
+STORAGE_TABLES = {MAIN: [
+    ("CONVERSATION_ID", "NVARCHAR(250)"), ("CONVERSATION_START", "TIMESTAMP"),
+    ("CONVERSATION_END", "TIMESTAMP"), ("DURATION_MS", "BIGINT"),
+    ("ORIGINATING_DIRECTION", "NVARCHAR(250)"), ("QUEUE_ID", "NVARCHAR(2100)"),
+    ("QUEUE_NAME", "NVARCHAR(2100)"), ("WRAP_UP_CODE_ID", "NVARCHAR(2100)"),
+    ("WRAP_UP_CODE_ID_ULTIMA", "NVARCHAR(250)"), ("CONCLUSION_ORIGINAL", "NVARCHAR(2100)"),
+    ("CONCLUSION_ULTIMA", "NVARCHAR(500)"), ("CONTACT_ID", "NVARCHAR(250)"),
+    ("CONTACT_LIST_ID", "NVARCHAR(250)"), ("CAMPAIGN_ID", "NVARCHAR(250)"),
+    ("MEDIA_TYPE", "NVARCHAR(250)"), ("PHRASES_COUNT", "INTEGER"),
+    ("TEXT", "NCLOB"), ("FECHA_CARGA", "TIMESTAMP"),
+]}
+MAIN_COLUMNS = tuple(name for name, _ in STORAGE_TABLES[MAIN])
 
 
 def slash_values(values):
@@ -1361,7 +1311,7 @@ def download_payload(config, url):
     for attempt in range(config.max_retries):
         response = None
         try:
-            response = requests.get(url, timeout=config.request_timeout)
+            response = http_session(download=True).get(url, timeout=config.request_timeout)
             if response.status_code == 200:
                 return response.json()
             if response.status_code != 429 and response.status_code < 500:
@@ -1398,121 +1348,53 @@ def transcript_units(payload):
         raise ValueError("Payload transcript no es objeto/lista")
 
 
-def duration_milliseconds(item):
-    """Genesys puede entregar durationMs o duration: {milliseconds: N}.
-
-    No interpretar unidades ambiguas ni reemplazar estructuras desconocidas por cero.
-    Los formatos desconocidos quedan para la validación con contexto de conversación.
-    """
-    value = pick(item, "durationMs", "duration")
-    return milliseconds_value(value)
-
-
-def field_row(item, fields):
-    aliases = {
-        "PARTICIPANT_PURPOSE": ("participantPurpose", "purpose"), "PARTICIPANT_NAME": ("participantName", "name"),
-        "OFFSET_MS": ("offsetMs", "offset"), "DURATION_MS": ("durationMs", "duration"),
-        "SENTIMENT_SCORE": ("sentimentScore", "score"),
-    }
-    result = {}
-    for column in fields:
-        parts = column.lower().split("_")
-        camel = parts[0] + "".join(p.title() for p in parts[1:])
-        result[column] = duration_milliseconds(item) if column == "DURATION_MS" else pick(item, *aliases.get(column, (camel,)))
-        if column in ("OFFSET_MS", "START_TIME_MS", "END_TIME_MS"):
-            result[column] = milliseconds_value(result[column])
-    return result
-
-
 def build_bundle(base, transcript, descriptor, purpose):
-    transcript = dict(transcript)
-    recording = transcript.get("recordingId") or descriptor.get("recordingId")
-    tid = transcript.get("transcriptId")
-    instance = tid or recording or hashlib.sha256(canonical(transcript).encode("utf-8")).hexdigest()
-    comm = transcript.get("communicationId") or descriptor["communicationId"]
-    parent = {n: None for n, _ in TABLES[MAIN]}
-    parent.update(base)
-    parent.update(COMMUNICATION_ID=comm, TRANSCRIPT_INSTANCE_ID=str(instance), TRANSCRIPT_ID=tid,
-                  RECORDING_ID=recording, COMMUNICATION_PURPOSE=purpose, TRANSCRIPT_ESTADO="OK",
-                  TRANSCRIPT_ERROR=None, MEDIA_TYPE=transcript.get("mediaType"), LANGUAGE=transcript.get("language"),
-                  PROGRAM_ID=transcript.get("programId"), ENGINE_ID=transcript.get("engineId"),
-                  TRANSCRIPT_START_TIME=local_time(pick(transcript, "startTime", "startTimeMs")),
-                  TRANSCRIPT_DURATION_MS=duration_milliseconds(transcript),
-                  SUBJECT=transcript.get("subject"), MESSAGE_TYPE=transcript.get("messageType"))
-    key = {k: parent[k] for k in KEYS}
-    bundle = {table: [] for table in TABLES}
-    bundle[MAIN] = [parent]
+    """Lee únicamente el texto, sus tiempos y los IDs necesarios para deduplicarlo."""
     phrases = array(transcript.get("phrases"))
     if any(not isinstance(p, dict) for p in phrases):
         raise ValueError("phrases contiene elementos inválidos")
-    indexed = []
-    used = set()
+    used, indexed = set(), []
     for original, phrase in enumerate(phrases):
-        try:
-            index = numeric_value(phrase.get("phraseIndex"), "INTEGER")
-            if index is not None and (index < 0 or index in used):
+        index = numeric_value(phrase.get("phraseIndex"), "INTEGER")
+        if index is not None:
+            if index < 0 or index in used:
                 raise ValueError("phraseIndex negativo o duplicado")
-            if index is not None:
-                used.add(index)
-            start = numeric_value(milliseconds_value(phrase.get("startTimeMs")), "BIGINT")
-        except ValueError as exc:
-            raise ValueError(f"Frase {original}: {exc}") from exc
-        indexed.append((original, phrase, index, start))
-    phrases = sorted(indexed, key=lambda item: (item[2] if item[2] is not None else item[3] if item[3] is not None else item[0], item[0]))
-    seen_indices, lines = set(), []
-    fields = CHILD_SPECS["FRASES"][1]
-    for original, phrase, index, _ in phrases:
+            used.add(index)
+        indexed.append((original, index, phrase))
+    lightweight = []
+    for original, index, phrase in indexed:
         if index is None:
             index = original
-            while index in used or index in seen_indices:
+            while index in used:
                 index += 1
-        if index in seen_indices:
-            raise ValueError("phraseIndex duplicado; no se sobrescribirán frases")
-        seen_indices.add(index)
-        words, alternatives = array(phrase.get("words")), array(phrase.get("alternatives"))
-        row = {**key, **field_row(phrase, fields), "PHRASE_INDEX": index,
-               "WORDS_COUNT": len(words), "WORDS_JSON": json.dumps(words, ensure_ascii=False),
-               "ALTERNATIVES_COUNT": len(alternatives), "ALTERNATIVES_JSON": json.dumps(alternatives, ensure_ascii=False),
-               "FECHA_CARGA": parent["FECHA_CARGA"]}
-        if row["TEXT"] is not None and str(row["TEXT"]).strip():
-            lines.append(f'{row["PARTICIPANT_PURPOSE"]}: {row["TEXT"]}' if row["PARTICIPANT_PURPOSE"] else str(row["TEXT"]))
-        bundle[MAIN + "_FRASES"].append(row)
-    parent["TEXT"] = "\n".join(lines) or None
-    parent["PHRASES_COUNT"] = len(phrases)
-    analytics = transcript.get("analytics") or {}
-    if isinstance(analytics, list):
-        merged = {}
-        for entry in analytics:
-            if isinstance(entry, dict):
-                for field in ("sentiment", "topics", "acoustic"):
-                    merged.setdefault(field, []).extend(array(entry.get(field)))
-        analytics = merged
-    acoustic = array(analytics.get("acoustic"))
-    parent.update(ACOUSTIC_COUNT=len(acoustic), ACOUSTIC_JSON=json.dumps(acoustic, ensure_ascii=False))
-    for suffix, source in (("PARTICIPANTES", transcript.get("participants")),
-                           ("SENTIMIENTO", analytics.get("sentiment")), ("TOPICS", analytics.get("topics"))):
-        seq, fields = CHILD_SPECS[suffix]
-        for number, item in enumerate(array(source), 1):
-            if not isinstance(item, dict):
-                raise ValueError(f"Elemento {suffix} inválido")
-            row = {**key, **field_row(item, fields), seq: number, "FECHA_CARGA": parent["FECHA_CARGA"]}
-            if suffix == "SENTIMIENTO" and isinstance(item.get("sentiment"), (int, float)):
-                row["SENTIMENT_SCORE"] = item.get("sentimentScore", item.get("score", item["sentiment"]))
-            bundle[MAIN + "_" + suffix].append(row)
-    return bundle
+            used.add(index)
+        lightweight.append({
+            "PHRASE_INDEX": index, "TEXT": phrase.get("text"),
+            "PARTICIPANT_PURPOSE": pick(phrase, "participantPurpose", "purpose"),
+            "START_TIME_MS": numeric_value(milliseconds_value(phrase.get("startTimeMs")), "BIGINT"),
+            "OFFSET_MS": numeric_value(milliseconds_value(pick(phrase, "offsetMs", "offset")), "BIGINT"),
+        })
+    lightweight.sort(key=lambda p: p["PHRASE_INDEX"])
+    start = local_time(pick(transcript, "startTime", "startTimeMs"))
+    recording = transcript.get("recordingId") or descriptor.get("recordingId")
+    tid = transcript.get("transcriptId")
+    instance = tid or hashlib.sha256(canonical([recording, str(start), lightweight]).encode("utf-8")).hexdigest()
+    parent = {name: None for name in MAIN_COLUMNS}
+    parent.update(base)
+    parent.update(COMMUNICATION_ID=transcript.get("communicationId") or descriptor["communicationId"],
+                  TRANSCRIPT_INSTANCE_ID=str(instance), TRANSCRIPT_ID=tid, RECORDING_ID=recording,
+                  TRANSCRIPT_ESTADO="OK", TRANSCRIPT_ERROR=None, TRANSCRIPT_START_TIME=start,
+                  MEDIA_TYPE=slash_values(transcript.get("mediaType")), PHRASES_COUNT=len(lightweight))
+    return {MAIN: [parent], "_phrases": lightweight}
 
 
 def state_bundle(base, comm, state, detail, purpose=None, recording=None):
-    # Marcadores técnicos reservados; no representan IDs reales de Genesys.
-    bundle = {table: [] for table in TABLES}
-    row = {name: None for name, _ in TABLES[MAIN]}
-    row.update(base)
+    parent = {name: None for name in MAIN_COLUMNS}
+    parent.update(base)
     marker = "__STATUS__:" + hashlib.sha256((comm + ":" + (recording or "")).encode()).hexdigest()
-    row.update(COMMUNICATION_ID=comm or "__NO_COMMUNICATION__", TRANSCRIPT_INSTANCE_ID=marker,
-               RECORDING_ID=recording, COMMUNICATION_PURPOSE=purpose, TRANSCRIPT_ESTADO=state,
-               TRANSCRIPT_ERROR=detail, PHRASES_COUNT=0, ACOUSTIC_COUNT=0)
-    bundle[MAIN] = [row]
-    return bundle
+    parent.update(COMMUNICATION_ID=comm or "__NO_COMMUNICATION__", TRANSCRIPT_INSTANCE_ID=marker,
+                  TRANSCRIPT_ESTADO=state, TRANSCRIPT_ERROR=detail, PHRASES_COUNT=0)
+    return {MAIN: [parent], "_phrases": []}
 
 
 def safe_error(exc):
@@ -1550,43 +1432,6 @@ def numeric_value(value, kind):
         raise ValueError("formato numérico inválido") from exc
 
 
-def normalize_optional_scores(bundle, original, config, logger):
-    """Conservar fuente antes de sustituir indicadores opcionales incompatibles."""
-    parent = bundle[MAIN][0]
-    warnings, changes = [], []
-    for table, fields in TABLES.items():
-        for row in bundle[table]:
-            for column, kind in fields:
-                if not kind.startswith("DECIMAL"):
-                    continue
-                value = row.get(column)
-                try:
-                    numeric_value(value, kind)
-                except ValueError as exc:
-                    warnings.append({"table": table, "column": column,
-                                     "key": {k: row.get(k) for k in primary_keys(table)},
-                                     "value": value, "reason": str(exc)})
-                    changes.append((row, column))
-    if not warnings:
-        return
-    directory = Path(config.json_output_dir or env_str("OUTPUT_DIR", "") or Path(__file__).parent / "output") / "normalization_warnings"
-    directory.mkdir(parents=True, exist_ok=True)
-    identity = [parent[k] for k in KEYS]
-    # Hash de fuente: nuevas variantes no sobrescriben diagnósticos anteriores.
-    filename = hashlib.sha256(canonical([identity, original]).encode("utf-8")).hexdigest() + ".json"
-    path = directory / filename
-    temporary = path.with_suffix(".part.json")
-    temporary.write_text(json.dumps({"keys": dict(zip(KEYS, identity)), "warnings": warnings,
-                                     "transcript": original}, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(temporary, path)
-    for row, column in changes:
-        row[column] = None
-    columns = sorted({w["column"] for w in warnings})
-    parent["TRANSCRIPT_ERROR"] = f"Advertencia: {len(warnings)} indicadores opcionales no numéricos/fuera de rango guardados como NULL ({', '.join(columns)}). Diagnóstico: {filename}"
-    logger.warning("Normalización numérica | conversationId=%s | communicationId=%s | transcript=%s | campos=%s | incidencias=%s | fuente íntegra=%s",
-                   *identity, ",".join(columns), len(warnings), path)
-
-
 def process_conversation_transcripts(conv, config, token, wrapups, queues, logger):
     cid = str(conv.get("conversationId") or conv.get("id") or "")
     if not cid:
@@ -1607,17 +1452,10 @@ def process_conversation_transcripts(conv, config, token, wrapups, queues, logge
                 CONCLUSION_ORIGINAL=names, CONCLUSION_ULTIMA=wrapups.get(wrap_ids[-1]) if wrap_ids else None,
                 CONTACT_ID=dialer.get("ContactId"), CONTACT_LIST_ID=dialer.get("ContactListId"), CAMPAIGN_ID=dialer.get("CampaignId"),
                 FECHA_CARGA=datetime.now(ZoneInfo("America/Tegucigalpa")).replace(tzinfo=None))
-    campaign = {}
-    if config.output_mode == "transcript_campania":
-        try:
-            list_id = dialer.get("ContactListId") or (split_filter_values(config.contact_list_id) or [""])[0]
-            campaign = flatten_contact_data(fetch_contact_from_genesys(config, token, list_id, dialer.get("ContactId"), logger))
-        except Exception as exc:
-            logger.warning("Enriquecimiento campaña | %s | %s", cid, safe_error(exc))
     candidates = obtener_session_ids_para_transcript(conv, config.media_type)
     if not candidates:
-        return [state_bundle(base, "", "SIN_CANDIDATOS", "Sin sesiones candidatas")], campaign
-    bundles, seen = [], {}
+        return [state_bundle(base, "", "SIN_CANDIDATOS", "Sin sesiones candidatas")]
+    bundles, seen, downloaded = [], {}, {}
     for candidate in candidates:
         comm, purpose = candidate["communication_id"], candidate["purpose"]
         try:
@@ -1630,7 +1468,13 @@ def process_conversation_transcripts(conv, config, token, wrapups, queues, logge
         for descriptor in descriptors:
             payload = None
             try:
-                payload = download_payload(config, descriptor["url"])
+                url = descriptor["url"]
+                if url not in downloaded:
+                    # No retener todos los JSON grandes de una conversación extensa.
+                    if len(downloaded) >= 4:
+                        downloaded.pop(next(iter(downloaded)))
+                    downloaded[url] = download_payload(config, url)
+                payload = downloaded[url]
                 units = list(transcript_units(payload))
                 if not units:
                     bundles.append(state_bundle(base, comm, "SIN_TRANSCRIPCION_API", "Payload sin transcripts", purpose, descriptor.get("recordingId")))
@@ -1638,24 +1482,12 @@ def process_conversation_transcripts(conv, config, token, wrapups, queues, logge
                     bundle = build_bundle(base, unit, descriptor, purpose)
                     row = bundle[MAIN][0]
                     row["MEDIA_TYPE"] = slash_values(row["MEDIA_TYPE"] or candidate.get("media_type"))
-                    # Una grabación puede incluir varios transcripts sin transcriptId.
-                    # Desambiguar determinísticamente sin mezclar textos ni usar la URL.
-                    if not unit.get("transcriptId") and row["RECORDING_ID"] and len(units) > 1:
-                        row["TRANSCRIPT_INSTANCE_ID"] = hashlib.sha256(
-                            canonical([row["RECORDING_ID"], unit]).encode("utf-8")).hexdigest()
-                        for table in TABLES:
-                            for child in bundle[table]:
-                                child["TRANSCRIPT_INSTANCE_ID"] = row["TRANSCRIPT_INSTANCE_ID"]
                     key = tuple(row[k] for k in KEYS)
-                    fingerprint = hashlib.sha256(canonical(unit).encode()).hexdigest()
+                    fingerprint = canonical([str(row.get("TRANSCRIPT_START_TIME")), bundle["_phrases"]])
                     if key in seen:
                         if seen[key] != fingerprint:
                             raise ValueError("Dos transcripts distintos comparten clave técnica; no se sobrescribirán")
                         continue
-                    normalize_optional_scores(bundle, unit, config, logger)
-                    # Aislar problemas de formato por transcript antes de entregarlos
-                    # al coordinador. Longitudes se validan después con capacidad HANA real.
-                    validate_bundle(bundle, check_lengths=False)
                     seen[key] = fingerprint
                     if config.save_transcript_json or config.json_output_dir:
                         directory = Path(config.json_output_dir or Path(__file__).parent / "output" / "json")
@@ -1688,127 +1520,76 @@ def process_conversation_transcripts(conv, config, token, wrapups, queues, logge
         key = tuple(row[k] for k in KEYS)
         if key not in unique or row["TRANSCRIPT_ESTADO"] == "ERROR":
             unique[key] = b
-    return list(unique.values()), campaign
+    return list(unique.values())
 
 
 def primary_keys(table):
-    return ["CONVERSATION_ID"] if table == MAIN else KEYS + [CHILD_SPECS[table[len(MAIN) + 1:]][0]]
+    if table != MAIN:
+        raise ValueError("Solo se admite la tabla principal")
+    return ["CONVERSATION_ID"]
 
 
 def aggregate_conversation(bundles):
-    """No deduplicar por texto: una frase repetida puede ser legítima."""
-    if not bundles:
-        raise ValueError("Interacción sin resultados ni estado")
-    ids = {b[MAIN][0]["CONVERSATION_ID"] for b in bundles}
-    if len(ids) != 1:
-        raise ValueError("No se pueden mezclar conversaciones")
+    if not bundles or len({b[MAIN][0]["CONVERSATION_ID"] for b in bundles}) != 1:
+        raise ValueError("Se requiere una sola conversación")
     ordered = sorted(bundles, key=lambda b: tuple(str(b[MAIN][0].get(k) or "") for k in KEYS))
     selected, seen = [], {}
     for bundle in ordered:
         row = bundle[MAIN][0]
         identity = row.get("TRANSCRIPT_ID") or (row["COMMUNICATION_ID"], row["TRANSCRIPT_INSTANCE_ID"])
         if row["TRANSCRIPT_ESTADO"] == "OK":
-            content = {table: [{k: str(v) if isinstance(v, (Decimal, datetime)) else v for k, v in child.items()
-                               if k not in KEYS and k != "FECHA_CARGA"} for child in bundle[table]]
-                       for table in TABLES if table != MAIN}
-            content["acoustic"] = json.loads(row.get("ACOUSTIC_JSON") or "[]")
-            fingerprint = canonical(content)
+            fingerprint = canonical([str(row.get("TRANSCRIPT_START_TIME")), bundle["_phrases"]])
             if identity in seen:
                 if seen[identity] != fingerprint:
-                    raise ValueError("Un transcriptId tiene contenidos distintos; no se descartará ninguno silenciosamente")
+                    raise ValueError("Un transcriptId tiene textos/tiempos distintos; no se descartará información")
                 continue
             seen[identity] = fingerprint
         selected.append(bundle)
     success = [b for b in selected if b[MAIN][0]["TRANSCRIPT_ESTADO"] == "OK"]
     parent = dict(ordered[0][MAIN][0])
-    result = {table: [] for table in TABLES}
-    for column in MULTI_COLUMNS:
-        values = []
-        for b in ordered:
-            value = b[MAIN][0].get(column)
-            if value is not None and not str(value).startswith(("__STATUS__:", "__NO_COMMUNICATION__")) and value not in values:
-                values.append(value)
-        parent[column] = json.dumps(values, ensure_ascii=False)
     for column in ("ORIGINATING_DIRECTION", "MEDIA_TYPE"):
         parent[column] = slash_values([b[MAIN][0].get(column) for b in ordered])
-    errors = [b[MAIN][0].get("TRANSCRIPT_ERROR") for b in selected if b[MAIN][0].get("TRANSCRIPT_ERROR")]
     has_error = any(b[MAIN][0]["TRANSCRIPT_ESTADO"] == "ERROR" for b in selected)
-    parent["TRANSCRIPT_ESTADO"] = "PARCIAL" if success and has_error else "ERROR" if has_error else "OK" if success else ordered[0][MAIN][0]["TRANSCRIPT_ESTADO"]
-    parent["TRANSCRIPT_ERROR"] = "\n".join(dict.fromkeys(errors)) or None
-    acoustic, timeline = [], []
-    for b in success:
-        row = b[MAIN][0]
-        acoustic.extend(json.loads(row.get("ACOUSTIC_JSON") or "[]"))
-        for table in TABLES:
-            if table != MAIN:
-                result[table].extend(b[table])
-        for phrase in b[MAIN + "_FRASES"]:
-            start = phrase.get("START_TIME_MS")
+    parent["TRANSCRIPT_ESTADO"] = "PARCIAL" if success and has_error else "ERROR" if has_error else "OK" if success else parent["TRANSCRIPT_ESTADO"]
+    timeline = []
+    for bundle in success:
+        row = bundle[MAIN][0]
+        for phrase in bundle["_phrases"]:
+            start = phrase["START_TIME_MS"]
             if start is None and row.get("TRANSCRIPT_START_TIME") is not None:
                 anchor = row["TRANSCRIPT_START_TIME"].replace(tzinfo=ZoneInfo("America/Tegucigalpa"))
-                start = round(anchor.timestamp() * 1000) + (phrase.get("OFFSET_MS") or 0)
+                start = round(anchor.timestamp() * 1000) + (phrase["OFFSET_MS"] or 0)
             timeline.append((start is None, start or 0, row["COMMUNICATION_ID"], row["TRANSCRIPT_INSTANCE_ID"], phrase["PHRASE_INDEX"], phrase))
     lines = []
     for *_, phrase in sorted(timeline, key=lambda item: item[:-1]):
-        if phrase.get("TEXT") is not None and str(phrase["TEXT"]).strip():
-            lines.append(f'{phrase["PARTICIPANT_PURPOSE"]}: {phrase["TEXT"]}' if phrase.get("PARTICIPANT_PURPOSE") else str(phrase["TEXT"]))
+        text = phrase["TEXT"]
+        if text is not None and str(text).strip():
+            lines.append(f'{phrase["PARTICIPANT_PURPOSE"]}: {text}' if phrase["PARTICIPANT_PURPOSE"] else str(text))
     parent["TEXT"] = "\n".join(lines) or None
-    parent["PHRASES_COUNT"] = len(result[MAIN + "_FRASES"])
-    parent["ACOUSTIC_JSON"] = json.dumps(acoustic, ensure_ascii=False)
-    parent["ACOUSTIC_COUNT"] = len(acoustic)
-    starts = [b[MAIN][0]["TRANSCRIPT_START_TIME"] for b in success if b[MAIN][0].get("TRANSCRIPT_START_TIME") is not None]
-    parent["TRANSCRIPT_START_TIME"] = min(starts) if starts else None
-    # No sumar duraciones potencialmente solapadas de grabaciones diferentes.
-    parent["TRANSCRIPT_DURATION_MS"] = success[0][MAIN][0].get("TRANSCRIPT_DURATION_MS") if len(success) == 1 else None
-    result[MAIN] = [parent]
-    return result
+    parent["PHRASES_COUNT"] = len(timeline)
+    # Liberar frases/metadata auxiliar antes de acumular el lote de escritura.
+    return {MAIN: [parent]}
 
 
 def validate_bundle(bundle, capacities=None, check_lengths=True, aggregate=False):
-    parent = bundle[MAIN][0]
-    if any(not parent.get(k) for k in KEYS):
-        raise ValueError("Clave técnica vacía")
-    if parent.get("DURATION_MS") is not None and parent["DURATION_MS"] < 0:
-        raise ValueError("DURATION_MS negativo")
-    phrases = bundle[MAIN + "_FRASES"]
-    if parent["PHRASES_COUNT"] != len(phrases):
-        raise ValueError("PHRASES_COUNT inconsistente")
-    if parent["ACOUSTIC_COUNT"] != len(json.loads(parent.get("ACOUSTIC_JSON") or "[]")):
-        raise ValueError("ACOUSTIC_COUNT inconsistente")
-    if parent.get("TEXT") and not any(p.get("TEXT") for p in phrases):
-        raise ValueError("TEXT sin frases reales")
-    for phrase in phrases:
-        for count, data in (("WORDS_COUNT", "WORDS_JSON"), ("ALTERNATIVES_COUNT", "ALTERNATIVES_JSON")):
-            if phrase[count] != len(json.loads(phrase[data])):
-                raise ValueError(f"{count} inconsistente")
-    for table, rows in bundle.items():
-        keys = set()
-        for row in rows:
-            key = tuple(row.get(k) for k in primary_keys(table))
-            if key in keys:
-                raise ValueError(f"Clave duplicada: {table}")
-            keys.add(key)
-            if any(row.get(k) != parent[k] for k in (["CONVERSATION_ID"] if aggregate else KEYS)):
-                raise ValueError("Registro hijo sin relación con su transcript")
-            for column, kind in (STORAGE_TABLES if aggregate else TABLES)[table]:
-                value = row.get(column)
-                if value is None:
-                    continue
-                if kind.startswith("DECIMAL") or kind in ("INTEGER", "BIGINT"):
-                    try:
-                        row[column] = numeric_value(value, kind)
-                        if column in primary_keys(table) and row[column] is None:
-                            raise ValueError("clave numérica vacía")
-                    except ValueError as exc:
-                        raise ValueError(f"{table}.{column}: {exc}; conversationId={parent['CONVERSATION_ID']}, "
-                                         f"communicationId={parent['COMMUNICATION_ID']}, transcript={parent['TRANSCRIPT_INSTANCE_ID']}") from exc
-                elif kind != "TIMESTAMP":
-                    row[column] = json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value)
-                    if check_lengths and kind.startswith("NVARCHAR"):
-                        limit = (capacities or {}).get((table, column), int(re.search(r"\d+", kind).group()))
-                        size = len(row[column].encode("utf-16-le")) // 2
-                        if size > limit:
-                            raise ValueError(f"{table}.{column}: longitud={size}, capacidad={limit}, conversationId={parent['CONVERSATION_ID']}. Sin truncar.")
+    row = bundle[MAIN][0]
+    if not row.get("CONVERSATION_ID"):
+        raise ValueError("CONVERSATION_ID vacío")
+    for column, kind in STORAGE_TABLES[MAIN]:
+        value = row.get(column)
+        if value is None:
+            continue
+        if kind in ("INTEGER", "BIGINT"):
+            row[column] = numeric_value(value, kind)
+            if column in ("DURATION_MS", "PHRASES_COUNT") and row[column] is not None and row[column] < 0:
+                raise ValueError(f"{column} negativo; conversationId={row['CONVERSATION_ID']}")
+        elif kind != "TIMESTAMP":
+            row[column] = str(value)
+            if check_lengths and kind.startswith("NVARCHAR"):
+                limit = (capacities or {}).get((MAIN, column), int(re.search(r"\d+", kind).group()))
+                size = len(row[column].encode("utf-16-le")) // 2
+                if size > limit:
+                    raise ValueError(f"{MAIN}.{column}: longitud={size}, capacidad={limit}, conversationId={row['CONVERSATION_ID']}. Sin truncar.")
 
 
 def has_transcript_text(bundle):
@@ -1821,7 +1602,10 @@ class HanaTranscriptWriter:
     def __init__(self, logger):
         from hdbcli import dbapi
         self.logger, self.buffer, self.capacities = logger, [], {}
-        self.written_counts = {table: 0 for table in TABLES}
+        self.written_counts = {table: 0 for table in STORAGE_TABLES}
+        self.batch_size = max(1, min(500, env_int("HANA_BATCH_SIZE", 100)))
+        self.batch_text_limit = max(1, env_int("HANA_BATCH_TEXT_CHARS", 8000000))
+        self.buffer_text_chars = 0
         self.conn = dbapi.connect(address=env_str("HPR_HOST", required=True), port=env_int("HPR_PORT", 30015),
                                  user=env_str("HPR_USER", required=True), password=env_str("HPR_PASSWORD", required=True),
                                  connectTimeout=15000)
@@ -1863,7 +1647,8 @@ class HanaTranscriptWriter:
             return
         validate_bundle(bundle, self.capacities, aggregate=True)
         self.buffer.append(bundle)
-        if len(self.buffer) >= 20:
+        self.buffer_text_chars += len(bundle[MAIN][0]["TEXT"])
+        if len(self.buffer) >= self.batch_size or self.buffer_text_chars >= self.batch_text_limit:
             self.flush()
 
     def flush(self):
@@ -1872,7 +1657,7 @@ class HanaTranscriptWriter:
         cur = self.conn.cursor()
         counts = {}
         try:
-            # Reemplazo atómico por interacción, incluyendo todas sus filas hijas.
+            # Reemplazo atómico de la única tabla, por interacción.
             instances = {b[MAIN][0]["CONVERSATION_ID"]: b for b in self.buffer}
             incomplete = [cid for cid, b in instances.items() if b[MAIN][0]["TRANSCRIPT_ESTADO"] != "OK"]
             if incomplete:
@@ -1881,7 +1666,7 @@ class HanaTranscriptWriter:
                 for (cid,) in cur.fetchall():
                     instances.pop(cid, None)
                     self.logger.warning("HANA | %s: se conserva la versión existente ante descarga incompleta/sin transcript", cid)
-            for table in reversed(list(TABLES)):
+            for table in reversed(list(STORAGE_TABLES)):
                 keys = list(instances)
                 for offset in range(0, len(keys), 100):
                     batch = keys[offset:offset + 100]
@@ -1897,12 +1682,13 @@ class HanaTranscriptWriter:
             self.conn.commit()
         except Exception as exc:
             self.conn.rollback()
-            raise RuntimeError("Rollback de las cinco tablas; lotes anteriores confirmados. " + safe_error(exc)) from exc
+            raise RuntimeError("Rollback del lote de transcripciones; lotes anteriores confirmados. " + safe_error(exc)) from exc
         finally:
             cur.close()
         for table, count in counts.items():
             self.written_counts[table] += count
         self.buffer.clear()
+        self.buffer_text_chars = 0
 
     def close(self):
         try:
@@ -1922,7 +1708,6 @@ class OutputWriter:
         self.columns = list(MAIN_COLUMNS)
         self.writer = csv.DictWriter(self.stream, fieldnames=self.columns)
         self.writer.writeheader()
-        self.campaign_file = None
         self.count = 0
 
     def add(self, bundle):
@@ -1931,13 +1716,6 @@ class OutputWriter:
         row = bundle[MAIN][0]
         self.writer.writerow({n: row.get(n) for n in self.columns})
         self.count += 1
-
-    def campaign(self, cid, fields):
-        if not fields:
-            return
-        if self.campaign_file is None:
-            self.campaign_file = self.path.with_suffix(".campania.jsonl").open("w", encoding="utf-8")
-        self.campaign_file.write(json.dumps({"CONVERSATION_ID": cid, **fields}, ensure_ascii=False) + "\n")
 
     def finish(self):
         self.stream.close()
@@ -1991,8 +1769,6 @@ class OutputWriter:
 
     def close(self):
         self.stream.close()
-        if self.campaign_file is not None:
-            self.campaign_file.close()
 
 
 def main():
@@ -2058,16 +1834,16 @@ def main():
                 for future in done:
                     conv = pending.pop(future)
                     # Errores inesperados no se silencian ni se convierten en éxito.
-                    bundles, campaign = future.result()
+                    bundles = future.result()
                     bundle = aggregate_conversation(bundles)
                     error_count += bundle[MAIN][0]["TRANSCRIPT_ESTADO"] in ("ERROR", "PARCIAL")
                     if has_transcript_text(bundle):
-                        validate_bundle(bundle, hana.capacities if hana else None, aggregate=True)
                         if hana:
                             hana.add(bundle)
+                        else:
+                            validate_bundle(bundle, aggregate=True)
                         if output:
                             output.add(bundle)
-                            output.campaign(conv.get("conversationId") or conv["id"], campaign)
                         total_rows += 1
                     else:
                         skipped_without_text += 1
@@ -2090,6 +1866,7 @@ def main():
         logger.error("Proceso fallido: %s", safe_error(exc))
         return 1
     finally:
+        close_http_sessions()
         if output:
             output.close()
         if hana:
