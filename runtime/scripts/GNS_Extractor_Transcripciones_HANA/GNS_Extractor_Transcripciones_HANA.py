@@ -124,6 +124,34 @@ HTTP_SESSIONS = []
 HTTP_SESSIONS_LOCK = threading.Lock()
 
 
+class ApiThrottle:
+    """Todos los workers respetan el Retry-After y espacian solicitudes tras un 429."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.until = self.next_request = self.interval = 0.0
+
+    def wait(self):
+        while True:
+            with self.lock:
+                now = time.monotonic()
+                delay = max(self.until, self.next_request) - now
+                if delay <= 0:
+                    self.next_request = now + self.interval
+                    return
+            time.sleep(delay)
+
+    def limited(self, seconds):
+        with self.lock:
+            now = time.monotonic()
+            # Varios 429 simultáneos pertenecen a la misma pausa, no multiplicar por hilo.
+            if now >= self.until:
+                self.interval = min(5.0, max(0.25, self.interval * 1.5))
+            self.until = max(self.until, now + seconds)
+
+
+API_THROTTLE = ApiThrottle()
+
+
 def http_session(download=False):
     # Conexión por hilo y por destino: nunca compartir Authorization con URLs firmadas.
     name = "download" if download else "api"
@@ -242,7 +270,7 @@ class CompactConsoleFilter(logging.Filter):
         "HTTP %s sin reintento", "HTTP 429", "HTTP %s | intento", "Error request",
         "Job conversaciones estado", "Conversaciones recuperadas página",
         "Catálogo conclusiones página", "Consultando conversación específica",
-        "Normalización numérica", "Enriquecimiento campaña", "Transcript |",
+        "Normalización numérica", "Enriquecimiento campaña", "Transcript |", "Orden de transcript |",
         "Fuente íntegra del transcript", "HANA | %s:", "Sin transcripción disponible |",
     )
 
@@ -519,6 +547,8 @@ def request_with_retry(method: str, url: str, config: Config, logger: logging.Lo
 
     for attempt in range(1, config.max_retries + 1):
         try:
+            if is_api:
+                API_THROTTLE.wait()
             if is_api and LATEST_TOKEN:
                 kwargs["headers"] = {**kwargs.get("headers", {}), "Authorization": "Bearer " + LATEST_TOKEN}
             response = http_session().request(method, url, timeout=config.request_timeout, **kwargs)
@@ -538,9 +568,19 @@ def request_with_retry(method: str, url: str, config: Config, logger: logging.Lo
 
             if response.status_code == 429:
                 retry_after = response.headers.get("Retry-After")
-                wait = int(retry_after) if retry_after and retry_after.isdigit() else min(60, 5 * attempt)
-                logger.warning("HTTP 429 | intento %s/%s | esperando %ss", attempt, config.max_retries, wait)
-                time.sleep(wait)
+                try:
+                    wait = float(retry_after)
+                    if not 0 <= wait < float("inf"):
+                        raise ValueError("Retry-After inválido")
+                except (TypeError, ValueError):
+                    wait = min(60, 5 * attempt)
+                wait = max(0.1, wait)
+                last_error = RuntimeError(f"HTTP 429; Retry-After={wait}s")
+                logger.warning("HTTP 429 | intento %s/%s | pausa compartida %ss", attempt, config.max_retries, wait)
+                if is_api:
+                    API_THROTTLE.limited(wait)
+                else:
+                    time.sleep(wait)
                 continue
 
             if response.status_code >= 500:
@@ -1353,13 +1393,23 @@ def build_bundle(base, transcript, descriptor, purpose):
     phrases = array(transcript.get("phrases"))
     if any(not isinstance(p, dict) for p in phrases):
         raise ValueError("phrases contiene elementos inválidos")
+    warnings = []
+    def ordering_number(value, kind, field, milliseconds=False):
+        try:
+            return numeric_value(milliseconds_value(value) if milliseconds else value, kind)
+        except ValueError:
+            warnings.append(f"{field} ({type(value).__name__})")
+            return None
+
     used, indexed = set(), []
     for original, phrase in enumerate(phrases):
-        index = numeric_value(phrase.get("phraseIndex"), "INTEGER")
+        index = ordering_number(phrase.get("phraseIndex"), "INTEGER", f"phrases[{original}].phraseIndex")
         if index is not None:
             if index < 0 or index in used:
-                raise ValueError("phraseIndex negativo o duplicado")
-            used.add(index)
+                warnings.append(f"phrases[{original}].phraseIndex (negativo/duplicado)")
+                index = None
+            else:
+                used.add(index)
         indexed.append((original, index, phrase))
     lightweight = []
     for original, index, phrase in indexed:
@@ -1369,13 +1419,22 @@ def build_bundle(base, transcript, descriptor, purpose):
                 index += 1
             used.add(index)
         lightweight.append({
-            "PHRASE_INDEX": index, "TEXT": phrase.get("text"),
+            "PHRASE_INDEX": index, "SOURCE_INDEX": original, "TEXT": phrase.get("text"),
             "PARTICIPANT_PURPOSE": pick(phrase, "participantPurpose", "purpose"),
-            "START_TIME_MS": numeric_value(milliseconds_value(phrase.get("startTimeMs")), "BIGINT"),
-            "OFFSET_MS": numeric_value(milliseconds_value(pick(phrase, "offsetMs", "offset")), "BIGINT"),
+            "START_TIME_MS": ordering_number(phrase.get("startTimeMs"), "BIGINT", f"phrases[{original}].startTimeMs", True),
+            "OFFSET_MS": ordering_number(pick(phrase, "offsetMs", "offset"), "BIGINT", f"phrases[{original}].offset", True),
         })
-    lightweight.sort(key=lambda p: p["PHRASE_INDEX"])
-    start = local_time(pick(transcript, "startTime", "startTimeMs"))
+    try:
+        start = local_time(pick(transcript, "startTime", "startTimeMs"))
+    except (ValueError, TypeError, OverflowError):
+        warnings.append("transcript.startTime (inválido)")
+        start = None
+    if warnings:
+        # Mantener todas las frases en su orden original sin inventar tiempos ni índices.
+        for phrase in lightweight:
+            phrase["PHRASE_INDEX"] = phrase["SOURCE_INDEX"]
+    else:
+        lightweight.sort(key=lambda p: p["PHRASE_INDEX"])
     recording = transcript.get("recordingId") or descriptor.get("recordingId")
     tid = transcript.get("transcriptId")
     instance = tid or hashlib.sha256(canonical([recording, str(start), lightweight]).encode("utf-8")).hexdigest()
@@ -1385,7 +1444,7 @@ def build_bundle(base, transcript, descriptor, purpose):
                   TRANSCRIPT_INSTANCE_ID=str(instance), TRANSCRIPT_ID=tid, RECORDING_ID=recording,
                   TRANSCRIPT_ESTADO="OK", TRANSCRIPT_ERROR=None, TRANSCRIPT_START_TIME=start,
                   MEDIA_TYPE=slash_values(transcript.get("mediaType")), PHRASES_COUNT=len(lightweight))
-    return {MAIN: [parent], "_phrases": lightweight}
+    return {MAIN: [parent], "_phrases": lightweight, "_ordering_warnings": warnings}
 
 
 def state_bundle(base, comm, state, detail, purpose=None, recording=None):
@@ -1461,6 +1520,7 @@ def process_conversation_transcripts(conv, config, token, wrapups, queues, logge
         try:
             descriptors = transcript_urls(config, token, cid, comm, logger)
         except Exception as exc:
+            logger.warning("Transcript | conversationId=%s | communicationId=%s | %s", cid, comm, safe_error(exc))
             bundles.append(state_bundle(base, comm, "ERROR", safe_error(exc), purpose))
             continue
         if not descriptors:
@@ -1482,6 +1542,7 @@ def process_conversation_transcripts(conv, config, token, wrapups, queues, logge
                     bundle = build_bundle(base, unit, descriptor, purpose)
                     row = bundle[MAIN][0]
                     row["MEDIA_TYPE"] = slash_values(row["MEDIA_TYPE"] or candidate.get("media_type"))
+                    ordering_warnings = bundle.get("_ordering_warnings", [])
                     key = tuple(row[k] for k in KEYS)
                     fingerprint = canonical([str(row.get("TRANSCRIPT_START_TIME")), bundle["_phrases"]])
                     if key in seen:
@@ -1489,14 +1550,21 @@ def process_conversation_transcripts(conv, config, token, wrapups, queues, logge
                             raise ValueError("Dos transcripts distintos comparten clave técnica; no se sobrescribirán")
                         continue
                     seen[key] = fingerprint
-                    if config.save_transcript_json or config.json_output_dir:
+                    diagnostic_path = None
+                    if config.save_transcript_json or config.json_output_dir or ordering_warnings:
                         directory = Path(config.json_output_dir or Path(__file__).parent / "output" / "json")
+                        if ordering_warnings and not (config.save_transcript_json or config.json_output_dir):
+                            directory = directory / "ordering_warnings"
                         directory.mkdir(parents=True, exist_ok=True)
                         filename = hashlib.sha256(canonical(key).encode()).hexdigest() + ".json"
-                        (directory / filename).write_text(json.dumps(unit, ensure_ascii=False, indent=2), encoding="utf-8")
+                        diagnostic_path = directory / filename
+                        diagnostic_path.write_text(json.dumps(unit, ensure_ascii=False, indent=2), encoding="utf-8")
+                    if ordering_warnings:
+                        logger.warning("Orden de transcript | conversationId=%s | communicationId=%s | texto conservado en orden de fuente | campos=%s | incidencias=%s | fuente=%s",
+                                       cid, comm, ", ".join(ordering_warnings[:5]), len(ordering_warnings), diagnostic_path)
                     bundles.append(bundle)
             except Exception as exc:
-                logger.warning("Transcript | conversationId=%s | communicationId=%s | %s", cid, comm, safe_error(exc))
+                path = None
                 if payload is not None:
                     directory = Path(config.json_output_dir or env_str("OUTPUT_DIR", "") or Path(__file__).parent / "output") / "transcript_errors"
                     directory.mkdir(parents=True, exist_ok=True)
@@ -1506,7 +1574,8 @@ def process_conversation_transcripts(conv, config, token, wrapups, queues, logge
                     temporary.write_text(json.dumps({"conversationId": cid, "communicationId": comm,
                         "error": safe_error(exc), "payload": payload}, ensure_ascii=False, indent=2), encoding="utf-8")
                     os.replace(temporary, path)
-                    logger.warning("Fuente íntegra del transcript con error: %s", path)
+                logger.warning("Transcript | conversationId=%s | communicationId=%s | %s | fuente=%s",
+                               cid, comm, safe_error(exc), path or "no descargada")
                 bundles.append(state_bundle(base, comm, "ERROR", safe_error(exc), purpose, descriptor.get("recordingId")))
         if config.api_sleep_seconds:
             time.sleep(config.api_sleep_seconds)
@@ -1552,6 +1621,7 @@ def aggregate_conversation(bundles):
     has_error = any(b[MAIN][0]["TRANSCRIPT_ESTADO"] == "ERROR" for b in selected)
     parent["TRANSCRIPT_ESTADO"] = "PARCIAL" if success and has_error else "ERROR" if has_error else "OK" if success else parent["TRANSCRIPT_ESTADO"]
     timeline = []
+    source_order = any(b.get("_ordering_warnings") for b in success)
     for bundle in success:
         row = bundle[MAIN][0]
         for phrase in bundle["_phrases"]:
@@ -1559,7 +1629,11 @@ def aggregate_conversation(bundles):
             if start is None and row.get("TRANSCRIPT_START_TIME") is not None:
                 anchor = row["TRANSCRIPT_START_TIME"].replace(tzinfo=ZoneInfo("America/Tegucigalpa"))
                 start = round(anchor.timestamp() * 1000) + (phrase["OFFSET_MS"] or 0)
-            timeline.append((start is None, start or 0, row["COMMUNICATION_ID"], row["TRANSCRIPT_INSTANCE_ID"], phrase["PHRASE_INDEX"], phrase))
+            if source_order:
+                # Si no se puede asegurar la cronología, preservar el orden fuente por transcript.
+                timeline.append((True, 0, row["COMMUNICATION_ID"], row["TRANSCRIPT_INSTANCE_ID"], phrase["SOURCE_INDEX"], phrase))
+            else:
+                timeline.append((start is None, start or 0, row["COMMUNICATION_ID"], row["TRANSCRIPT_INSTANCE_ID"], phrase["PHRASE_INDEX"], phrase))
     lines = []
     for *_, phrase in sorted(timeline, key=lambda item: item[:-1]):
         text = phrase["TEXT"]
@@ -1772,6 +1846,8 @@ class OutputWriter:
 
 
 def main():
+    global API_THROTTLE
+    API_THROTTLE = ApiThrottle()
     parser = argparse.ArgumentParser(description="Extractor de transcripciones Genesys Cloud")
     parser.add_argument("--date", default=env_str("DATE", ""), help="Fecha local específica. Ejemplo: 2026-06-01")
     parser.add_argument("--start-date", default=env_str("START_DATE", ""), help="Fecha inicial local inclusiva")
@@ -1850,7 +1926,7 @@ def main():
                     completed += 1
                     now = time.monotonic()
                     if completed == 1 or completed == total or now - last_progress >= 30:
-                        logger.info("Avance %s/%s | con texto=%s | omitidas sin texto=%s | errores=%s",
+                        logger.info("Avance %s/%s | con texto=%s | omitidas sin texto obtenido=%s | errores=%s",
                                     completed, total, total_rows, skipped_without_text, error_count)
                         print(f"PYFLOW_PROGRESS={int(90 * completed / max(1, total))}", flush=True)
                         last_progress = now
@@ -1859,7 +1935,7 @@ def main():
             hana.flush()
             output.finish()
         print("PYFLOW_PROGRESS=100", flush=True)
-        logger.info("Finalizado | filas con texto=%s | omitidas sin texto=%s | errores=%s | dry_run=%s",
+        logger.info("Finalizado | filas con texto=%s | omitidas sin texto obtenido=%s | errores=%s | dry_run=%s",
                     total_rows, skipped_without_text, error_count, config.dry_run)
         return 1 if error_count else 0
     except Exception as exc:

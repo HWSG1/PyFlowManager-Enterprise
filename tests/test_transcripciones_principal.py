@@ -84,6 +84,62 @@ class MainOnlyTests(unittest.TestCase):
         self.assertEqual(result["_phrases"][0]["OFFSET_MS"], 12)
         self.assertEqual(m.aggregate_conversation([result])[m.MAIN][0]["TEXT"], "hola")
 
+    def test_malformed_ordering_metadata_does_not_discard_text(self):
+        for field, value in (("phraseIndex", {"unexpected": 1}), ("startTimeMs", [123]),
+                             ("offsetMs", {"seconds": 1}), ("phraseIndex", "not a number")):
+            with self.subTest(field=field, value=value):
+                transcript = {"transcriptId": "x", "startTimeMs": {"unexpected": 3}, "phrases": [
+                    {"text": "primera", field: value}, {"text": "segunda", "phraseIndex": 0, "startTimeMs": 1}]}
+                b = m.build_bundle({"CONVERSATION_ID": "c"}, transcript, {"communicationId": "a"}, "customer")
+                result = m.aggregate_conversation([b])[m.MAIN][0]
+                self.assertEqual(result["TEXT"], "primera\nsegunda")
+                self.assertEqual(result["PHRASES_COUNT"], 2)
+                self.assertEqual(result["TRANSCRIPT_ESTADO"], "OK")
+                self.assertTrue(b["_ordering_warnings"])
+
+    def test_duplicate_phrase_index_preserves_both_phrases(self):
+        b = m.build_bundle({"CONVERSATION_ID": "c"}, {"phrases": [
+            {"phraseIndex": 0, "text": "repetida"}, {"phraseIndex": 0, "text": "repetida"}]},
+            {"communicationId": "a"}, None)
+        row = m.aggregate_conversation([b])[m.MAIN][0]
+        self.assertEqual(row["TEXT"], "repetida\nrepetida")
+        self.assertEqual(row["PHRASES_COUNT"], 2)
+
+    def test_global_cooldown_extends_and_spaces_requests(self):
+        throttle = m.ApiThrottle()
+        now = [100.0]
+        def sleep(seconds):
+            now[0] += seconds
+        with patch.object(m.time, "monotonic", side_effect=lambda: now[0]), patch.object(m.time, "sleep", side_effect=sleep):
+            throttle.limited(12)
+            throttle.limited(15)
+            self.assertEqual(throttle.interval, 0.25)
+            throttle.wait()
+            self.assertEqual(now[0], 115)
+            throttle.wait()
+            self.assertEqual(now[0], 115.25)
+            throttle.limited(1)
+            self.assertEqual(throttle.interval, 0.375)
+            throttle.wait()
+            self.assertEqual(now[0], 116.25)
+
+    def test_request_429_waits_before_retry_and_next_worker(self):
+        throttle = m.ApiThrottle()
+        now, calls = [100.0], []
+        responses = iter([types.SimpleNamespace(status_code=429, headers={"Retry-After": "2.5"}),
+                          types.SimpleNamespace(status_code=200, raise_for_status=lambda: None),
+                          types.SimpleNamespace(status_code=200, raise_for_status=lambda: None)])
+        def request(*args, **kwargs):
+            calls.append(now[0])
+            return next(responses)
+        config = types.SimpleNamespace(genesys_api_url="https://api.example.test", max_retries=2, request_timeout=5)
+        with patch.object(m, "API_THROTTLE", throttle), patch.object(m, "http_session", return_value=types.SimpleNamespace(request=request)), \
+             patch.object(m.time, "monotonic", side_effect=lambda: now[0]), \
+             patch.object(m.time, "sleep", side_effect=lambda seconds: now.__setitem__(0, now[0] + seconds)):
+            m.request_with_retry("GET", config.genesys_api_url + "/api/test", config, Mock())
+            m.request_with_retry("GET", config.genesys_api_url + "/api/test", config, Mock())
+        self.assertEqual(calls, [100, 102.5, 102.75])
+
     def test_conflicting_transcript_text_is_not_silently_discarded(self):
         with self.assertRaises(ValueError):
             m.aggregate_conversation([bundle(text="one"), bundle(comm="b", text="two")])
