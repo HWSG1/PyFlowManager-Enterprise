@@ -4,6 +4,7 @@
 #
 # Objetivo:
 #   Extraer transcripciones disponibles de Genesys Cloud en texto plano.
+#   Una fila principal por CONVERSATION_ID; detalle por transcript en tablas hijas.
 #
 # Modos:
 #   1) solo_transcript:
@@ -1182,6 +1183,13 @@ CHILD_SPECS = {
 for suffix, (seq, fields) in CHILD_SPECS.items():
     TABLES[MAIN + "_" + suffix] = [(n, "NVARCHAR(250)") for n in KEYS] + [(seq, "INTEGER")] + list(fields.items()) + [("FECHA_CARGA", "TIMESTAMP")]
 
+# Principal: una interacción. Los IDs/metadatos múltiples se conservan como arrays JSON.
+MULTI_COLUMNS = {"COMMUNICATION_ID", "TRANSCRIPT_INSTANCE_ID", "TRANSCRIPT_ID", "RECORDING_ID",
+                "COMMUNICATION_PURPOSE", "MEDIA_TYPE", "LANGUAGE", "PROGRAM_ID", "ENGINE_ID",
+                "SUBJECT", "MESSAGE_TYPE"}
+TABLES[MAIN] = [(name, "NCLOB" if name in MULTI_COLUMNS or name == "TRANSCRIPT_ERROR" else kind)
+                for name, kind in TABLES[MAIN]]
+
 
 def canonical(data):
     return json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
@@ -1607,10 +1615,77 @@ def process_conversation_transcripts(conv, config, token, wrapups, queues, logge
 
 
 def primary_keys(table):
-    return KEYS + ([] if table == MAIN else [CHILD_SPECS[table[len(MAIN) + 1:]][0]])
+    return ["CONVERSATION_ID"] if table == MAIN else KEYS + [CHILD_SPECS[table[len(MAIN) + 1:]][0]]
 
 
-def validate_bundle(bundle, capacities=None, check_lengths=True):
+def aggregate_conversation(bundles):
+    """No deduplicar por texto: una frase repetida puede ser legítima."""
+    if not bundles:
+        raise ValueError("Interacción sin resultados ni estado")
+    ids = {b[MAIN][0]["CONVERSATION_ID"] for b in bundles}
+    if len(ids) != 1:
+        raise ValueError("No se pueden mezclar conversaciones")
+    ordered = sorted(bundles, key=lambda b: tuple(str(b[MAIN][0].get(k) or "") for k in KEYS))
+    selected, seen = [], {}
+    for bundle in ordered:
+        row = bundle[MAIN][0]
+        identity = row.get("TRANSCRIPT_ID") or (row["COMMUNICATION_ID"], row["TRANSCRIPT_INSTANCE_ID"])
+        if row["TRANSCRIPT_ESTADO"] == "OK":
+            content = {table: [{k: str(v) if isinstance(v, (Decimal, datetime)) else v for k, v in child.items()
+                               if k not in KEYS and k != "FECHA_CARGA"} for child in bundle[table]]
+                       for table in TABLES if table != MAIN}
+            content["acoustic"] = json.loads(row.get("ACOUSTIC_JSON") or "[]")
+            fingerprint = canonical(content)
+            if identity in seen:
+                if seen[identity] != fingerprint:
+                    raise ValueError("Un transcriptId tiene contenidos distintos; no se descartará ninguno silenciosamente")
+                continue
+            seen[identity] = fingerprint
+        selected.append(bundle)
+    success = [b for b in selected if b[MAIN][0]["TRANSCRIPT_ESTADO"] == "OK"]
+    parent = dict(ordered[0][MAIN][0])
+    result = {table: [] for table in TABLES}
+    for column in MULTI_COLUMNS:
+        values = []
+        for b in ordered:
+            value = b[MAIN][0].get(column)
+            if value is not None and not str(value).startswith(("__STATUS__:", "__NO_COMMUNICATION__")) and value not in values:
+                values.append(value)
+        parent[column] = json.dumps(values, ensure_ascii=False)
+    errors = [b[MAIN][0].get("TRANSCRIPT_ERROR") for b in selected if b[MAIN][0].get("TRANSCRIPT_ERROR")]
+    has_error = any(b[MAIN][0]["TRANSCRIPT_ESTADO"] == "ERROR" for b in selected)
+    parent["TRANSCRIPT_ESTADO"] = "PARCIAL" if success and has_error else "ERROR" if has_error else "OK" if success else ordered[0][MAIN][0]["TRANSCRIPT_ESTADO"]
+    parent["TRANSCRIPT_ERROR"] = "\n".join(dict.fromkeys(errors)) or None
+    acoustic, timeline = [], []
+    for b in success:
+        row = b[MAIN][0]
+        acoustic.extend(json.loads(row.get("ACOUSTIC_JSON") or "[]"))
+        for table in TABLES:
+            if table != MAIN:
+                result[table].extend(b[table])
+        for phrase in b[MAIN + "_FRASES"]:
+            start = phrase.get("START_TIME_MS")
+            if start is None and row.get("TRANSCRIPT_START_TIME") is not None:
+                anchor = row["TRANSCRIPT_START_TIME"].replace(tzinfo=ZoneInfo("America/Tegucigalpa"))
+                start = round(anchor.timestamp() * 1000) + (phrase.get("OFFSET_MS") or 0)
+            timeline.append((start is None, start or 0, row["COMMUNICATION_ID"], row["TRANSCRIPT_INSTANCE_ID"], phrase["PHRASE_INDEX"], phrase))
+    lines = []
+    for *_, phrase in sorted(timeline, key=lambda item: item[:-1]):
+        if phrase.get("TEXT") is not None and str(phrase["TEXT"]).strip():
+            lines.append(f'{phrase["PARTICIPANT_PURPOSE"]}: {phrase["TEXT"]}' if phrase.get("PARTICIPANT_PURPOSE") else str(phrase["TEXT"]))
+    parent["TEXT"] = "\n".join(lines) or None
+    parent["PHRASES_COUNT"] = len(result[MAIN + "_FRASES"])
+    parent["ACOUSTIC_JSON"] = json.dumps(acoustic, ensure_ascii=False)
+    parent["ACOUSTIC_COUNT"] = len(acoustic)
+    starts = [b[MAIN][0]["TRANSCRIPT_START_TIME"] for b in success if b[MAIN][0].get("TRANSCRIPT_START_TIME") is not None]
+    parent["TRANSCRIPT_START_TIME"] = min(starts) if starts else None
+    # No sumar duraciones potencialmente solapadas de grabaciones diferentes.
+    parent["TRANSCRIPT_DURATION_MS"] = success[0][MAIN][0].get("TRANSCRIPT_DURATION_MS") if len(success) == 1 else None
+    result[MAIN] = [parent]
+    return result
+
+
+def validate_bundle(bundle, capacities=None, check_lengths=True, aggregate=False):
     parent = bundle[MAIN][0]
     if any(not parent.get(k) for k in KEYS):
         raise ValueError("Clave técnica vacía")
@@ -1634,7 +1709,7 @@ def validate_bundle(bundle, capacities=None, check_lengths=True):
             if key in keys:
                 raise ValueError(f"Clave duplicada: {table}")
             keys.add(key)
-            if any(row.get(k) != parent[k] for k in KEYS):
+            if any(row.get(k) != parent[k] for k in (["CONVERSATION_ID"] if aggregate else KEYS)):
                 raise ValueError("Registro hijo sin relación con su transcript")
             for column, kind in TABLES[table]:
                 value = row.get(column)
@@ -1699,7 +1774,7 @@ class HanaTranscriptWriter:
             cur.close()
 
     def add(self, bundle):
-        validate_bundle(bundle, self.capacities)
+        validate_bundle(bundle, self.capacities, aggregate=True)
         self.buffer.append(bundle)
         if len(self.buffer) >= 20:
             self.flush()
@@ -1710,25 +1785,21 @@ class HanaTranscriptWriter:
         cur = self.conn.cursor()
         counts = {}
         try:
-            # El último snapshot de una clave en este lote reemplaza íntegramente al anterior.
-            instances = {tuple(b[MAIN][0][k] for k in KEYS): b for b in self.buffer}
+            # Reemplazo atómico por interacción, incluyendo todas sus filas hijas.
+            instances = {b[MAIN][0]["CONVERSATION_ID"]: b for b in self.buffer}
+            incomplete = [cid for cid, b in instances.items() if b[MAIN][0]["TRANSCRIPT_ESTADO"] != "OK"]
+            if incomplete:
+                marks = ", ".join("?" for _ in incomplete)
+                cur.execute(f"SELECT CONVERSATION_ID FROM BI_SS.{MAIN} WHERE CONVERSATION_ID IN ({marks})", tuple(incomplete))
+                for (cid,) in cur.fetchall():
+                    instances.pop(cid, None)
+                    self.logger.warning("HANA | %s: se conserva la versión existente ante descarga incompleta/sin transcript", cid)
             for table in reversed(list(TABLES)):
-                for offset in range(0, len(instances), 100):
-                    keys = list(instances)[offset:offset + 100]
-                    where = " OR ".join("(" + " AND ".join(k + " = ?" for k in KEYS) + ")" for _ in keys)
-                    cur.execute(f"DELETE FROM BI_SS.{table} WHERE {where}", tuple(v for key in keys for v in key))
-            # Quitar marcadores anteriores solo cuando hay resultado real para esa comunicación.
-            recovered = set()
-            for key, b in instances.items():
-                row = b[MAIN][0]
-                if row["TRANSCRIPT_ESTADO"] == "OK":
-                    for comm, recording in ((key[1], row.get("RECORDING_ID") or ""), ("", "")):
-                        marker = "__STATUS__:" + hashlib.sha256((comm + ":" + recording).encode()).hexdigest()
-                        recovered.add((key[0], comm or "__NO_COMMUNICATION__", marker))
-            if recovered:
-                # No borrar errores de OTRAS grabaciones de la misma comunicación.
-                where = " OR ".join("(CONVERSATION_ID = ? AND COMMUNICATION_ID = ? AND TRANSCRIPT_INSTANCE_ID = ?)" for _ in recovered)
-                cur.execute(f"DELETE FROM BI_SS.{MAIN} WHERE {where}", tuple(v for key in sorted(recovered) for v in key))
+                keys = list(instances)
+                for offset in range(0, len(keys), 100):
+                    batch = keys[offset:offset + 100]
+                    marks = ", ".join("?" for _ in batch)
+                    cur.execute(f"DELETE FROM BI_SS.{table} WHERE CONVERSATION_ID IN ({marks})", tuple(batch))
             for table, fields in TABLES.items():
                 columns = [n for n, _ in fields]
                 rows = [row for b in instances.values() for row in b[table]]
@@ -1895,18 +1966,18 @@ def main():
                     conv = pending.pop(future)
                     # Errores inesperados no se silencian ni se convierten en éxito.
                     bundles, campaign = future.result()
-                    for bundle in bundles:
-                        validate_bundle(bundle, hana.capacities if hana else None)
-                        if hana:
-                            hana.add(bundle)
-                            output.add(bundle)
-                        error_count += bundle[MAIN][0]["TRANSCRIPT_ESTADO"] == "ERROR"
-                        total_rows += 1
+                    bundle = aggregate_conversation(bundles)
+                    validate_bundle(bundle, hana.capacities if hana else None, aggregate=True)
+                    if hana:
+                        hana.add(bundle)
+                        output.add(bundle)
+                    error_count += bundle[MAIN][0]["TRANSCRIPT_ESTADO"] in ("ERROR", "PARCIAL")
+                    total_rows += 1
                     if output:
                         output.campaign(conv.get("conversationId") or conv["id"], campaign)
                     completed += 1
                     if completed == 1 or completed % config.log_every_n == 0 or completed == total:
-                        logger.info("Avance %s/%s | transcripts/estados=%s | errores=%s", completed, total, total_rows, error_count)
+                        logger.info("Avance %s/%s | interacciones=%s | errores=%s", completed, total, total_rows, error_count)
                         print(f"PYFLOW_PROGRESS={int(90 * completed / max(1, total))}", flush=True)
                     submit_one()
         if hana:
