@@ -212,6 +212,46 @@ def genesys_login_url_from_region(region: str) -> str:
     return f"https://login.{normalize_genesys_domain(region)}/oauth/token"
 
 
+class CompactConsoleFilter(logging.Filter):
+    """Acota mensajes repetitivos entre workers; conserva errores y un balance final."""
+    PREFIXES = (
+        "HTTP %s sin reintento", "HTTP 429", "HTTP %s | intento", "Error request",
+        "Job conversaciones estado", "Conversaciones recuperadas página",
+        "Catálogo conclusiones página", "Consultando conversación específica",
+        "Normalización numérica", "Enriquecimiento campaña", "Transcript |",
+        "Fuente íntegra del transcript", "HANA | %s:", "Sin transcripción disponible |",
+    )
+
+    def __init__(self):
+        super().__init__()
+        self.lock = threading.Lock()
+        self.stats = {}
+
+    def filter(self, record):
+        if record.levelno >= logging.ERROR:
+            return True
+        category = next((p for p in self.PREFIXES if str(record.msg).startswith(p)), None)
+        if category is None:
+            return True
+        now = time.monotonic()
+        with self.lock:
+            stat = self.stats.setdefault(category, {"total": 0, "hidden": 0, "last": now})
+            stat["total"] += 1
+            if stat["total"] <= 3 or now - stat["last"] >= 60:
+                stat["last"] = now
+                return True
+            stat["hidden"] += 1
+            return False
+
+    def summarize(self, logger):
+        with self.lock:
+            summary = [(key, value.copy()) for key, value in self.stats.items()]
+        for category, stat in summary:
+            if stat["hidden"]:
+                logger.info("Resumen consola | %s | eventos=%s | líneas repetitivas omitidas=%s",
+                            category, stat["total"], stat["hidden"])
+
+
 def setup_logger() -> logging.Logger:
     logger = logging.getLogger(LOGGER_NAME)
     logger.setLevel(logging.INFO)
@@ -220,7 +260,9 @@ def setup_logger() -> logging.Logger:
     formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S")
     console = logging.StreamHandler(sys.stdout)
     console.setFormatter(formatter)
+    console.addFilter(CompactConsoleFilter())
     logger.addHandler(console)
+    logger.info("Consola compacta: hasta 3 ejemplos por categoría repetitiva y luego uno por minuto; errores fatales siempre visibles.")
     return logger
 
 
@@ -445,6 +487,8 @@ def request_with_retry(method: str, url: str, config: Config, logger: logging.Lo
     se puede pasar no_retry_statuses={404} para fallar rápido sin esperar 5 reintentos.
     """
     no_retry_statuses = set(kwargs.pop("no_retry_statuses", set()) or set())
+    # Solo los códigos explícitamente esperados durante una búsqueda alternativa.
+    quiet_statuses = set(kwargs.pop("quiet_statuses", set()) or set()) & no_retry_statuses
     last_error = None
     global LATEST_TOKEN
     is_api = url.startswith(config.genesys_api_url + "/api/")
@@ -463,7 +507,7 @@ def request_with_retry(method: str, url: str, config: Config, logger: logging.Lo
                 continue
 
             if response.status_code in no_retry_statuses:
-                if response.status_code >= 400:
+                if response.status_code >= 400 and response.status_code not in quiet_statuses:
                     logger.info("HTTP %s sin reintento | %s", response.status_code, response.text[:500])
                 response.raise_for_status()
                 return response
@@ -1266,7 +1310,8 @@ def transcript_urls(config, token, cid, comm, logger):
     for endpoint in ("transcripturls", "transcripturl"):
         try:
             response = request_with_retry("GET", base + "/" + endpoint, config, logger,
-                                          headers=genesys_headers(token), no_retry_statuses={400, 401, 403, 404})
+                                          headers=genesys_headers(token), no_retry_statuses={400, 401, 403, 404},
+                                          quiet_statuses={404})
             urls = extract_urls(response.json(), comm)
             if urls:
                 return urls
@@ -1737,6 +1782,7 @@ class HanaTranscriptWriter:
     def __init__(self, logger):
         from hdbcli import dbapi
         self.logger, self.buffer, self.capacities = logger, [], {}
+        self.written_counts = {table: 0 for table in TABLES}
         self.conn = dbapi.connect(address=env_str("HPR_HOST", required=True), port=env_int("HPR_PORT", 30015),
                                  user=env_str("HPR_USER", required=True), password=env_str("HPR_PASSWORD", required=True),
                                  connectTimeout=15000)
@@ -1814,11 +1860,14 @@ class HanaTranscriptWriter:
         finally:
             cur.close()
         for table, count in counts.items():
-            self.logger.info("HANA | %s | insertados/actualizados=%s", table, count)
+            self.written_counts[table] += count
         self.buffer.clear()
 
     def close(self):
-        self.conn.close()
+        try:
+            self.conn.close()
+        finally:
+            self.logger.info("Resumen HANA | filas confirmadas por tabla: %s", self.written_counts)
 
 
 class OutputWriter:
@@ -1948,6 +1997,7 @@ def main():
         total = len(conversations)
         logger.info("Conversaciones después de filtros y deduplicación: %s", total)
         completed = 0
+        last_progress = time.monotonic()
         iterator = iter(conversations)
         # Ventana acotada: solo workers*2 resultados en vuelo; HANA no cruza hilos.
         with ThreadPoolExecutor(max_workers=config.max_transcript_workers) as executor:
@@ -1968,6 +2018,9 @@ def main():
                     bundles, campaign = future.result()
                     bundle = aggregate_conversation(bundles)
                     validate_bundle(bundle, hana.capacities if hana else None, aggregate=True)
+                    if bundle[MAIN][0]["TRANSCRIPT_ESTADO"] in ("SIN_CANDIDATOS", "SIN_TRANSCRIPCION_API"):
+                        logger.info("Sin transcripción disponible | conversationId=%s | estado=%s | búsqueda finalizada",
+                                    bundle[MAIN][0]["CONVERSATION_ID"], bundle[MAIN][0]["TRANSCRIPT_ESTADO"])
                     if hana:
                         hana.add(bundle)
                         output.add(bundle)
@@ -1976,9 +2029,11 @@ def main():
                     if output:
                         output.campaign(conv.get("conversationId") or conv["id"], campaign)
                     completed += 1
-                    if completed == 1 or completed % config.log_every_n == 0 or completed == total:
+                    now = time.monotonic()
+                    if completed == 1 or completed == total or now - last_progress >= 30:
                         logger.info("Avance %s/%s | interacciones=%s | errores=%s", completed, total, total_rows, error_count)
                         print(f"PYFLOW_PROGRESS={int(90 * completed / max(1, total))}", flush=True)
+                        last_progress = now
                     submit_one()
         if hana:
             hana.flush()
@@ -1994,6 +2049,10 @@ def main():
             output.close()
         if hana:
             hana.close()
+        for handler in logger.handlers:
+            for log_filter in handler.filters:
+                if isinstance(log_filter, CompactConsoleFilter):
+                    log_filter.summarize(logger)
         logger.info("Duración total: %.2fs", time.monotonic() - started)
 
 
