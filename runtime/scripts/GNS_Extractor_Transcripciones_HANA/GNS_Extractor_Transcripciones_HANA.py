@@ -129,6 +129,8 @@ class ApiThrottle:
     def __init__(self):
         self.lock = threading.Lock()
         self.until = self.next_request = self.interval = 0.0
+        self.last_limited = self.last_recovery = 0.0
+        self.counts = {"transcripturls": 0, "transcripturl": 0, "otras_api": 0, "http_429": 0}
 
     def wait(self):
         while True:
@@ -147,6 +149,23 @@ class ApiThrottle:
             if now >= self.until:
                 self.interval = min(5.0, max(0.25, self.interval * 1.5))
             self.until = max(self.until, now + seconds)
+            self.last_limited = now
+
+    def record_response(self, status, endpoint):
+        with self.lock:
+            self.counts[endpoint] += 1
+            self.counts["http_429"] += status == 429
+            now = time.monotonic()
+            if status < 400 and self.interval and now - max(self.last_limited, self.last_recovery) >= 60:
+                # Recuperación gradual: un límite temporal no penaliza toda la ejecución.
+                self.interval *= 0.8
+                if self.interval < 0.05:
+                    self.interval = 0.0
+                self.last_recovery = now
+
+    def snapshot(self):
+        with self.lock:
+            return {**self.counts, "separacion_s": round(self.interval, 3)}
 
 
 API_THROTTLE = ApiThrottle()
@@ -544,6 +563,8 @@ def request_with_retry(method: str, url: str, config: Config, logger: logging.Lo
     last_error = None
     global LATEST_TOKEN
     is_api = url.startswith(config.genesys_api_url + "/api/")
+    endpoint = urlparse(url).path.rsplit("/", 1)[-1]
+    endpoint = endpoint if endpoint in ("transcripturl", "transcripturls") else "otras_api"
 
     for attempt in range(1, config.max_retries + 1):
         try:
@@ -552,6 +573,8 @@ def request_with_retry(method: str, url: str, config: Config, logger: logging.Lo
             if is_api and LATEST_TOKEN:
                 kwargs["headers"] = {**kwargs.get("headers", {}), "Authorization": "Bearer " + LATEST_TOKEN}
             response = http_session().request(method, url, timeout=config.request_timeout, **kwargs)
+            if is_api:
+                API_THROTTLE.record_response(response.status_code, endpoint)
 
             if is_api and response.status_code == 401 and attempt < config.max_retries:
                 old_token = kwargs.get("headers", {}).get("Authorization", "")
@@ -576,7 +599,8 @@ def request_with_retry(method: str, url: str, config: Config, logger: logging.Lo
                     wait = min(60, 5 * attempt)
                 wait = max(0.1, wait)
                 last_error = RuntimeError(f"HTTP 429; Retry-After={wait}s")
-                logger.warning("HTTP 429 | intento %s/%s | pausa compartida %ss", attempt, config.max_retries, wait)
+                logger.warning("HTTP 429 | ruta=%s | intento %s/%s | pausa compartida %ss",
+                               endpoint, attempt, config.max_retries, wait)
                 if is_api:
                     API_THROTTLE.limited(wait)
                 else:
@@ -1680,6 +1704,7 @@ class HanaTranscriptWriter:
         self.batch_size = max(1, min(500, env_int("HANA_BATCH_SIZE", 100)))
         self.batch_text_limit = max(1, env_int("HANA_BATCH_TEXT_CHARS", 8000000))
         self.buffer_text_chars = 0
+        self.write_seconds = 0.0
         self.conn = dbapi.connect(address=env_str("HPR_HOST", required=True), port=env_int("HPR_PORT", 30015),
                                  user=env_str("HPR_USER", required=True), password=env_str("HPR_PASSWORD", required=True),
                                  connectTimeout=15000)
@@ -1728,6 +1753,7 @@ class HanaTranscriptWriter:
     def flush(self):
         if not self.buffer:
             return
+        started = time.monotonic()
         cur = self.conn.cursor()
         counts = {}
         try:
@@ -1759,6 +1785,7 @@ class HanaTranscriptWriter:
             raise RuntimeError("Rollback del lote de transcripciones; lotes anteriores confirmados. " + safe_error(exc)) from exc
         finally:
             cur.close()
+            self.write_seconds += time.monotonic() - started
         for table, count in counts.items():
             self.written_counts[table] += count
         self.buffer.clear()
@@ -1768,7 +1795,8 @@ class HanaTranscriptWriter:
         try:
             self.conn.close()
         finally:
-            self.logger.info("Resumen HANA | filas confirmadas por tabla: %s", self.written_counts)
+            self.logger.info("Resumen HANA | filas confirmadas por tabla: %s | tiempo de escritura=%.2fs",
+                             self.written_counts, self.write_seconds)
 
 
 class OutputWriter:
@@ -1926,8 +1954,11 @@ def main():
                     completed += 1
                     now = time.monotonic()
                     if completed == 1 or completed == total or now - last_progress >= 30:
-                        logger.info("Avance %s/%s | con texto=%s | omitidas sin texto obtenido=%s | errores=%s",
-                                    completed, total, total_rows, skipped_without_text, error_count)
+                        stats = API_THROTTLE.snapshot()
+                        logger.info("Avance %s/%s | con texto=%s | omitidas sin texto obtenido=%s | errores=%s | consultas urls/url=%s/%s | 429=%s | HANA confirmadas=%s",
+                                    completed, total, total_rows, skipped_without_text, error_count,
+                                    stats["transcripturls"], stats["transcripturl"], stats["http_429"],
+                                    hana.written_counts[MAIN] if hana else 0)
                         print(f"PYFLOW_PROGRESS={int(90 * completed / max(1, total))}", flush=True)
                         last_progress = now
                     submit_one()
@@ -1947,6 +1978,7 @@ def main():
             output.close()
         if hana:
             hana.close()
+        logger.info("Resumen API | %s", API_THROTTLE.snapshot())
         for handler in logger.handlers:
             for log_filter in handler.filters:
                 if isinstance(log_filter, CompactConsoleFilter):

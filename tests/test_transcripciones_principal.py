@@ -58,6 +58,7 @@ def writer(conn):
     w.conn, w.logger = conn, logging.getLogger("test")
     w.capacities, w.buffer, w.written_counts = {}, [], {m.MAIN: 0}
     w.batch_size, w.batch_text_limit, w.buffer_text_chars = 100, 8000000, 0
+    w.write_seconds = 0.0
     return w
 
 
@@ -139,6 +140,28 @@ class MainOnlyTests(unittest.TestCase):
             m.request_with_retry("GET", config.genesys_api_url + "/api/test", config, Mock())
             m.request_with_retry("GET", config.genesys_api_url + "/api/test", config, Mock())
         self.assertEqual(calls, [100, 102.5, 102.75])
+
+    def test_throttle_recovers_only_after_stable_minute(self):
+        throttle = m.ApiThrottle()
+        with patch.object(m.time, "monotonic", return_value=100):
+            throttle.limited(15)
+            throttle.record_response(429, "transcripturls")
+        with patch.object(m.time, "monotonic", return_value=159):
+            throttle.record_response(200, "transcripturl")
+            self.assertEqual(throttle.interval, 0.25)
+        with patch.object(m.time, "monotonic", return_value=160):
+            throttle.record_response(200, "transcripturl")
+            throttle.record_response(200, "transcripturl")
+            self.assertEqual(throttle.interval, 0.2)
+        with patch.object(m.time, "monotonic", return_value=180):
+            throttle.limited(10)
+        with patch.object(m.time, "monotonic", return_value=220):
+            throttle.record_response(200, "transcripturls")
+            self.assertAlmostEqual(throttle.interval, 0.3)
+        stats = throttle.snapshot()
+        self.assertEqual(stats["transcripturls"], 2)
+        self.assertEqual(stats["transcripturl"], 3)
+        self.assertEqual(stats["http_429"], 1)
 
     def test_conflicting_transcript_text_is_not_silently_discarded(self):
         with self.assertRaises(ValueError):
@@ -236,6 +259,7 @@ class MainOnlyTests(unittest.TestCase):
             output_mode="solo_transcript", conversation_id="", max_conversations=0, max_transcript_workers=2)
         hana, output = Mock(), Mock()
         hana.capacities = {}
+        hana.written_counts = {m.MAIN: 0}
         log = Mock()
         def process(conv, *args):
             cid = conv["conversationId"]
