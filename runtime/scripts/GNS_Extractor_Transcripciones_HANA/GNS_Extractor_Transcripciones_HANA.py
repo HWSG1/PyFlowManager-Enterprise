@@ -5,6 +5,7 @@
 # Objetivo:
 #   Extraer transcripciones disponibles de Genesys Cloud en texto plano.
 #   Una fila principal por CONVERSATION_ID; detalle por transcript en tablas hijas.
+#   Principal V3: 18 columnas; dirección y medio como valores únicos separados por /.
 #
 # Modos:
 #   1) solo_transcript:
@@ -1183,7 +1184,7 @@ def resolve_output_path(output_path: str, output_format: str) -> str:
     return output_path
 
 
-# Modelo físico único para serialización, validaciones y DDL adjunto.
+# Modelo interno por transcript; STORAGE_TABLES define las columnas físicas.
 KEYS = ["CONVERSATION_ID", "COMMUNICATION_ID", "TRANSCRIPT_INSTANCE_ID"]
 MAIN = "GNS_API_TRANSCRIPCIONES"
 TABLES = {
@@ -1227,12 +1228,42 @@ CHILD_SPECS = {
 for suffix, (seq, fields) in CHILD_SPECS.items():
     TABLES[MAIN + "_" + suffix] = [(n, "NVARCHAR(250)") for n in KEYS] + [(seq, "INTEGER")] + list(fields.items()) + [("FECHA_CARGA", "TIMESTAMP")]
 
-# Principal: una interacción. Los IDs/metadatos múltiples se conservan como arrays JSON.
+# Modelo interno: conserva metadatos técnicos para agrupar y validar transcripts.
 MULTI_COLUMNS = {"COMMUNICATION_ID", "TRANSCRIPT_INSTANCE_ID", "TRANSCRIPT_ID", "RECORDING_ID",
                 "COMMUNICATION_PURPOSE", "MEDIA_TYPE", "LANGUAGE", "PROGRAM_ID", "ENGINE_ID",
                 "SUBJECT", "MESSAGE_TYPE"}
 TABLES[MAIN] = [(name, "NCLOB" if name in MULTI_COLUMNS or name == "TRANSCRIPT_ERROR" else kind)
                 for name, kind in TABLES[MAIN]]
+
+# Modelo público V3: exactamente estas 18 columnas en HANA y Excel/CSV.
+MAIN_COLUMNS = (
+    "CONVERSATION_ID", "CONVERSATION_START", "CONVERSATION_END", "DURATION_MS",
+    "ORIGINATING_DIRECTION", "QUEUE_ID", "QUEUE_NAME", "WRAP_UP_CODE_ID",
+    "WRAP_UP_CODE_ID_ULTIMA", "CONCLUSION_ORIGINAL", "CONCLUSION_ULTIMA",
+    "CONTACT_ID", "CONTACT_LIST_ID", "CAMPAIGN_ID", "MEDIA_TYPE", "PHRASES_COUNT",
+    "TEXT", "FECHA_CARGA",
+)
+STORAGE_TABLES = dict(TABLES)
+STORAGE_TABLES[MAIN] = [
+    (name, "NVARCHAR(250)" if name in ("ORIGINATING_DIRECTION", "MEDIA_TYPE") else dict(TABLES[MAIN])[name])
+    for name in MAIN_COLUMNS
+]
+
+
+def slash_values(values):
+    """Valores únicos, sin JSON, manteniendo el orden de aparición."""
+    result = []
+    def visit(value):
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                visit(item)
+        elif value is not None:
+            for item in str(value).split("/"):
+                item = item.strip()
+                if item and item not in result:
+                    result.append(item)
+    visit(values)
+    return "/".join(result) or None
 
 
 def canonical(data):
@@ -1570,7 +1601,7 @@ def process_conversation_transcripts(conv, config, token, wrapups, queues, logge
     names = wrapup_names_from_ids(wrap_ids, wrapups)
     queue_ids, queue_names = extract_queue_info(conv, queues)
     base = dict(CONVERSATION_ID=cid, CONVERSATION_START=start, CONVERSATION_END=end, DURATION_MS=duration,
-                ORIGINATING_DIRECTION=conv.get("originatingDirection"), QUEUE_ID=queue_ids, QUEUE_NAME=queue_names,
+                ORIGINATING_DIRECTION=slash_values(conv.get("originatingDirection")), QUEUE_ID=queue_ids, QUEUE_NAME=queue_names,
                 WRAP_UP_CODE_ID=";".join(wrap_ids), WRAP_UP_CODE_ID_ULTIMA=wrap_ids[-1] if wrap_ids else None,
                 CONCLUSION_ORIGINAL=names, CONCLUSION_ULTIMA=wrapups.get(wrap_ids[-1]) if wrap_ids else None,
                 CONTACT_ID=dialer.get("ContactId"), CONTACT_LIST_ID=dialer.get("ContactListId"), CAMPAIGN_ID=dialer.get("CampaignId"),
@@ -1605,7 +1636,7 @@ def process_conversation_transcripts(conv, config, token, wrapups, queues, logge
                 for unit in units:
                     bundle = build_bundle(base, unit, descriptor, purpose)
                     row = bundle[MAIN][0]
-                    row["MEDIA_TYPE"] = row["MEDIA_TYPE"] or candidate.get("media_type")
+                    row["MEDIA_TYPE"] = slash_values(row["MEDIA_TYPE"] or candidate.get("media_type"))
                     # Una grabación puede incluir varios transcripts sin transcriptId.
                     # Desambiguar determinísticamente sin mezclar textos ni usar la URL.
                     if not unit.get("transcriptId") and row["RECORDING_ID"] and len(units) > 1:
@@ -1697,6 +1728,8 @@ def aggregate_conversation(bundles):
             if value is not None and not str(value).startswith(("__STATUS__:", "__NO_COMMUNICATION__")) and value not in values:
                 values.append(value)
         parent[column] = json.dumps(values, ensure_ascii=False)
+    for column in ("ORIGINATING_DIRECTION", "MEDIA_TYPE"):
+        parent[column] = slash_values([b[MAIN][0].get(column) for b in ordered])
     errors = [b[MAIN][0].get("TRANSCRIPT_ERROR") for b in selected if b[MAIN][0].get("TRANSCRIPT_ERROR")]
     has_error = any(b[MAIN][0]["TRANSCRIPT_ESTADO"] == "ERROR" for b in selected)
     parent["TRANSCRIPT_ESTADO"] = "PARCIAL" if success and has_error else "ERROR" if has_error else "OK" if success else ordered[0][MAIN][0]["TRANSCRIPT_ESTADO"]
@@ -1756,7 +1789,7 @@ def validate_bundle(bundle, capacities=None, check_lengths=True, aggregate=False
             keys.add(key)
             if any(row.get(k) != parent[k] for k in (["CONVERSATION_ID"] if aggregate else KEYS)):
                 raise ValueError("Registro hijo sin relación con su transcript")
-            for column, kind in TABLES[table]:
+            for column, kind in (STORAGE_TABLES if aggregate else TABLES)[table]:
                 value = row.get(column)
                 if value is None:
                     continue
@@ -1796,7 +1829,7 @@ class HanaTranscriptWriter:
     def validate_schema(self):
         cur = self.conn.cursor()
         try:
-            for table, fields in TABLES.items():
+            for table, fields in STORAGE_TABLES.items():
                 cur.execute("SELECT COLUMN_NAME, DATA_TYPE_NAME, LENGTH, SCALE FROM SYS.TABLE_COLUMNS WHERE SCHEMA_NAME = ? AND TABLE_NAME = ?", ("BI_SS", table))
                 actual = {r[0]: r[1:] for r in cur.fetchall()}
                 if set(actual) != {n for n, _ in fields}:
@@ -1846,7 +1879,7 @@ class HanaTranscriptWriter:
                     batch = keys[offset:offset + 100]
                     marks = ", ".join("?" for _ in batch)
                     cur.execute(f"DELETE FROM BI_SS.{table} WHERE CONVERSATION_ID IN ({marks})", tuple(batch))
-            for table, fields in TABLES.items():
+            for table, fields in STORAGE_TABLES.items():
                 columns = [n for n, _ in fields]
                 rows = [row for b in instances.values() for row in b[table]]
                 sql = f"INSERT INTO BI_SS.{table} ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})"
@@ -1878,7 +1911,7 @@ class OutputWriter:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.partial = self.path.with_suffix(".partial.csv")
         self.stream = self.partial.open("w", newline="", encoding="utf-8-sig")
-        self.columns = [n for n, _ in TABLES[MAIN]]
+        self.columns = list(MAIN_COLUMNS)
         self.writer = csv.DictWriter(self.stream, fieldnames=self.columns)
         self.writer.writeheader()
         self.campaign_file = None
