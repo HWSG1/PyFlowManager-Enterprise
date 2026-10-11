@@ -7,6 +7,8 @@
 #   Una fila por CONVERSATION_ID; solo se utiliza GNS_API_TRANSCRIPCIONES.
 #   Principal V3: 18 columnas; dirección y medio como valores únicos separados por /.
 #   Solo se cargan/exportan interacciones con TEXT no vacío.
+#   Primero descarga a SQLite local; después conecta a HANA y carga por lotes.
+#   RESUME_FILE/--resume-file retoma pendientes; una descarga completa no consulta Genesys.
 #
 # Modos:
 #   1) solo_transcript:
@@ -46,6 +48,8 @@ import time
 import math
 import argparse
 import logging
+import sqlite3
+import uuid
 import traceback
 import hashlib
 import threading
@@ -113,6 +117,8 @@ PYFLOW_PARAMS = {
     "MAX_TRANSCRIPT_WORKERS": {"type": "number", "label": "Consultas paralelas de transcript", "required": False, "default": "6"},
     "OUTPUT_FORMAT": {"type": "select", "label": "Formato salida", "required": False, "options": ["xlsx", "csv"], "default": "xlsx"},
     "OUTPUT_CSV": {"type": "text", "label": "Ruta de salida opcional", "required": False},
+    "RESUME_FILE": {"type": "text", "label": "Archivo local para reanudar (opcional)", "required": False},
+    "STAGING_DIR": {"type": "text", "label": "Carpeta local de descarga (opcional)", "required": False},
     "JSON_OUTPUT_DIR": {"type": "text", "label": "Carpeta JSON opcional", "required": False}
 }
 
@@ -301,6 +307,10 @@ class CompactConsoleFilter(logging.Filter):
     def filter(self, record):
         if record.levelno >= logging.ERROR:
             return True
+        if record.levelno < logging.WARNING:
+            return bool(getattr(record, "stage_progress", False))
+        if str(record.msg).startswith("No hay filtros adicionales"):
+            return False
         category = next((p for p in self.PREFIXES if str(record.msg).startswith(p)), None)
         if category is None:
             return True
@@ -378,7 +388,7 @@ class Config:
     participant_purpose: str = "todos"
 
 
-def load_config() -> Config:
+def load_config(require_genesys=True) -> Config:
     load_dotenv()
     region = env_str("GENESYS_REGION", "mypurecloud.com", required=True)
     output_mode = env_str("OUTPUT_MODE", "solo_transcript")
@@ -396,8 +406,8 @@ def load_config() -> Config:
     if output_format not in ("xlsx", "csv"):
         raise ValueError("OUTPUT_FORMAT debe ser xlsx o csv")
     return Config(
-        genesys_client_id=env_str("GENESYS_CLIENT_ID", required=True),
-        genesys_client_secret=env_str("GENESYS_CLIENT_SECRET", required=True),
+        genesys_client_id=env_str("GENESYS_CLIENT_ID", required=require_genesys),
+        genesys_client_secret=env_str("GENESYS_CLIENT_SECRET", required=require_genesys),
         genesys_api_url=genesys_api_url_from_region(region),
         genesys_login_url=genesys_login_url_from_region(region),
         timezone_name=env_str("GENESYS_TIMEZONE", "America/Tegucigalpa"),
@@ -1701,7 +1711,7 @@ class HanaTranscriptWriter:
         from hdbcli import dbapi
         self.logger, self.buffer, self.capacities = logger, [], {}
         self.written_counts = {table: 0 for table in STORAGE_TABLES}
-        self.batch_size = max(1, min(500, env_int("HANA_BATCH_SIZE", 100)))
+        self.batch_size = max(1, min(500, env_int("HANA_BATCH_SIZE", 500)))
         self.batch_text_limit = max(1, env_int("HANA_BATCH_TEXT_CHARS", 8000000))
         self.buffer_text_chars = 0
         self.write_seconds = 0.0
@@ -1748,7 +1758,7 @@ class HanaTranscriptWriter:
         self.buffer.append(bundle)
         self.buffer_text_chars += len(bundle[MAIN][0]["TEXT"])
         if len(self.buffer) >= self.batch_size or self.buffer_text_chars >= self.batch_text_limit:
-            self.flush()
+            return self.flush()
 
     def flush(self):
         if not self.buffer:
@@ -1759,6 +1769,7 @@ class HanaTranscriptWriter:
         try:
             # Reemplazo atómico de la única tabla, por interacción.
             instances = {b[MAIN][0]["CONVERSATION_ID"]: b for b in self.buffer}
+            processed_ids = list(instances)
             incomplete = [cid for cid, b in instances.items() if b[MAIN][0]["TRANSCRIPT_ESTADO"] != "OK"]
             if incomplete:
                 marks = ", ".join("?" for _ in incomplete)
@@ -1790,6 +1801,7 @@ class HanaTranscriptWriter:
             self.written_counts[table] += count
         self.buffer.clear()
         self.buffer_text_chars = 0
+        return processed_ids
 
     def close(self):
         try:
@@ -1873,117 +1885,286 @@ class OutputWriter:
         self.stream.close()
 
 
+class StageProgress:
+    """Una línea por porcentaje que cambia; 100 solo al completar la etapa."""
+    def __init__(self, logger, name):
+        self.logger, self.name, self.last = logger, name, 0
+        self.update(0, 1)
+
+    def update(self, done, total, finished=False):
+        percent = 100 if finished else max(1, min(99, int(done * 100 / max(1, total))))
+        if percent > self.last:
+            self.logger.info("%s | %s%%", self.name, percent, extra={"stage_progress": True})
+            print(f"PYFLOW_PROGRESS={percent}", flush=True)
+            self.last = percent
+
+
+class LocalStage:
+    """SQLite local: resultados durables, cola reanudable y confirmación por lote HANA."""
+    def __init__(self, path, resume=False):
+        self.path = Path(path).resolve()
+        if resume and not self.path.is_file():
+            raise ValueError(f"No existe el archivo para reanudar: {self.path}")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.guard = sqlite3.connect(str(self.path) + ".lock", timeout=0)
+        self.db = None
+        try:
+            self.guard.execute("BEGIN EXCLUSIVE")
+            self.db = sqlite3.connect(self.path)
+            self.db.execute("PRAGMA synchronous=FULL")
+            if not resume:
+                self.db.executescript("""
+                    CREATE TABLE meta (name TEXT PRIMARY KEY, value TEXT NOT NULL);
+                    CREATE TABLE work (seq INTEGER PRIMARY KEY, cid TEXT UNIQUE NOT NULL,
+                        source TEXT, result TEXT, state TEXT NOT NULL DEFAULT 'pending',
+                        uploaded INTEGER NOT NULL DEFAULT 0);
+                """)
+                self.set_meta("format", 1)
+            if self.meta("format") != 1:
+                raise ValueError("Formato de archivo local incompatible")
+            if resume and not self.meta("prepared", False):
+                raise ValueError("La preparación no terminó; inicia una ejecución nueva sin RESUME_FILE")
+        except Exception:
+            self.close()
+            raise
+
+    def set_meta(self, key, value):
+        self.db.execute("INSERT OR REPLACE INTO meta VALUES (?, ?)", (key, json.dumps(value, ensure_ascii=False)))
+        self.db.commit()
+
+    def meta(self, key, default=None):
+        row = self.db.execute("SELECT value FROM meta WHERE name=?", (key,)).fetchone()
+        return json.loads(row[0]) if row else default
+
+    def prepare(self, conversations, settings, wrapups, queues):
+        self.db.executemany("INSERT OR IGNORE INTO work (cid, source) VALUES (?, ?)",
+                            ((str(c.get("conversationId") or c["id"]), json.dumps(c, ensure_ascii=False)) for c in conversations))
+        self.db.commit()
+        self.set_meta("settings", settings)
+        self.set_meta("wrapups", wrapups)
+        self.set_meta("queues", queues)
+        self.set_meta("prepared", True)
+
+    def pending(self):
+        # Paginación acotada; no dejar un cursor vivo durante los commits.
+        after = 0
+        while True:
+            rows = self.db.execute("SELECT seq, source FROM work WHERE state='pending' AND seq>? ORDER BY seq LIMIT 100", (after,)).fetchall()
+            if not rows:
+                return
+            for seq, source in rows:
+                after = seq
+                yield json.loads(source)
+
+    def save(self, bundle):
+        row = bundle[MAIN][0]
+        state = row.get("TRANSCRIPT_ESTADO", "OK")
+        result = None
+        if has_transcript_text(bundle):
+            validate_bundle(bundle, check_lengths=False, aggregate=True)
+            result = json.dumps(row, ensure_ascii=False, default=lambda v: v.isoformat() if isinstance(v, datetime) else str(v))
+        self.db.execute("UPDATE work SET result=?, state=?, source=NULL WHERE cid=?",
+                        (result, state, row["CONVERSATION_ID"]))
+        # Un único coordinador confirma hasta 100 resultados; la interrupción solo repite ese bloque.
+
+    def commit(self):
+        self.db.commit()
+
+    def counts(self):
+        row = self.db.execute("""SELECT COUNT(*),
+            COALESCE(SUM(state='pending'),0), COALESCE(SUM(result IS NOT NULL),0),
+            COALESCE(SUM(state IN ('ERROR','PARCIAL')),0),
+            COALESCE(SUM(result IS NOT NULL AND uploaded=0),0) FROM work""").fetchone()
+        return dict(zip(("total", "pending", "text", "errors", "upload_pending"), row))
+
+    def results(self, only_pending=False):
+        after = 0
+        while True:
+            query = "SELECT seq, result FROM work WHERE result IS NOT NULL AND seq>?"
+            if only_pending:
+                query += " AND uploaded=0"
+            # Un resultado a la vez: el NCLOB puede ser grande.
+            item = self.db.execute(query + " ORDER BY seq LIMIT 1", (after,)).fetchone()
+            if not item:
+                return
+            after, payload = item
+            row = json.loads(payload)
+            for column, kind in STORAGE_TABLES[MAIN]:
+                if kind == "TIMESTAMP" and row.get(column) is not None:
+                    row[column] = datetime.fromisoformat(row[column])
+            yield {MAIN: [row]}
+
+    def mark_uploaded(self, ids):
+        if ids:
+            self.db.executemany("UPDATE work SET uploaded=1 WHERE cid=?", ((cid,) for cid in ids))
+            self.db.commit()
+
+    def close(self):
+        if self.db is not None:
+            self.db.close()
+        self.guard.close()
+
+
+def prepare_stage(config, args, stage, logger):
+    progress = StageProgress(logger, "Preparación de conversaciones")
+    start, end, _ = parse_dates(args, config.timezone_name)
+    token = get_access_token(config, logger)
+    config = apply_resolved_filters(config, token, logger)
+    wrapups, queues = get_wrapup_catalog(config, token, logger), get_queue_catalog(config, token, logger)
+    validate_filter_safety(config, logger)
+    ids = split_filter_values(config.conversation_id)
+    if ids:
+        conversations = [fetch_conversation_details_by_id(config, token, cid, logger) for cid in ids]
+    else:
+        job = create_conversation_details_job(config, token, start, end, logger)
+        wait_details_job(config, token, job, logger)
+        conversations = fetch_details_job_results(config, token, job, logger)
+    unique = {}
+    for conv in conversations:
+        if conversation_matches_post_filters(conv, config):
+            cid = conv.get("conversationId") or conv.get("id")
+            if not cid:
+                raise ValueError("Analytics devolvió conversación sin ID")
+            unique[cid] = conv
+    selected = list(unique.values())
+    if config.max_conversations:
+        selected = selected[:config.max_conversations]
+    settings = {name: getattr(config, name) for name in (
+        "genesys_api_url", "timezone_name", "media_type", "save_transcript_json", "json_output_dir", "output_format")}
+    settings["output_csv"] = resolve_output_path(config.output_csv, config.output_format)
+    stage.prepare(selected, settings, wrapups, queues)
+    progress.update(1, 1, finished=True)
+    return token
+
+
+def download_stage(config, token, stage, logger):
+    progress = StageProgress(logger, "Descarga de transcripciones")
+    counts = stage.counts()
+    total, completed = counts["total"], counts["total"] - counts["pending"]
+    wrapups, queues = stage.meta("wrapups"), stage.meta("queues")
+    iterator = iter(stage.pending())
+    with ThreadPoolExecutor(max_workers=config.max_transcript_workers) as executor:
+        pending = {}
+        def submit_one():
+            conv = next(iterator, None)
+            if conv is not None:
+                pending[executor.submit(process_conversation_transcripts, conv, config, token, wrapups, queues, logger)] = conv
+        for _ in range(config.max_transcript_workers * 2):
+            submit_one()
+        while pending:
+            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                pending.pop(future)
+                stage.save(aggregate_conversation(future.result()))
+                completed += 1
+                if completed % 100 == 0:
+                    stage.commit()
+                progress.update(completed, total)
+                submit_one()
+    stage.commit()
+    if stage.counts()["pending"]:
+        raise RuntimeError("La descarga aún tiene conversaciones pendientes")
+    stage.set_meta("download_complete", True)
+    progress.update(total, total, finished=True)
+
+
+def upload_stage(stage, logger):
+    if not stage.meta("download_complete", False):
+        raise ValueError("No se cargará HANA antes de terminar la descarga")
+    progress = StageProgress(logger, "Carga a HANA")
+    total, completed = stage.counts()["upload_pending"], 0
+    if total:
+        hana = HanaTranscriptWriter(logger)
+        try:
+            for bundle in stage.results(only_pending=True):
+                committed = hana.add(bundle)
+                if committed:
+                    stage.mark_uploaded(committed)
+                    completed += len(committed)
+                    progress.update(completed, total)
+            committed = hana.flush()
+            stage.mark_uploaded(committed)
+        finally:
+            hana.close()
+    stage.set_meta("upload_complete", True)
+    progress.update(total, total, finished=True)
+
+
+def export_stage(config, stage, logger):
+    progress = StageProgress(logger, "Generación de archivo de salida")
+    output = OutputWriter(config, logger)
+    try:
+        total = stage.counts()["text"]
+        for done, bundle in enumerate(stage.results(), 1):
+            output.add(bundle)
+            progress.update(done, total)
+        output.finish()
+        stage.set_meta("export_complete", True)
+    finally:
+        output.close()
+    progress.update(total, total, finished=True)
+
+
 def main():
     global API_THROTTLE
     API_THROTTLE = ApiThrottle()
-    parser = argparse.ArgumentParser(description="Extractor de transcripciones Genesys Cloud")
-    parser.add_argument("--date", default=env_str("DATE", ""), help="Fecha local específica. Ejemplo: 2026-06-01")
-    parser.add_argument("--start-date", default=env_str("START_DATE", ""), help="Fecha inicial local inclusiva")
-    parser.add_argument("--end-date", default=env_str("END_DATE", ""), help="Fecha final local inclusiva")
-    parser.add_argument("--dry-run", action="store_true", help="No genera CSV")
+    parser = argparse.ArgumentParser(description="Descarga local y carga posterior de transcripciones a HANA")
+    parser.add_argument("--date", default=env_str("DATE", ""))
+    parser.add_argument("--start-date", default=env_str("START_DATE", ""))
+    parser.add_argument("--end-date", default=env_str("END_DATE", ""))
+    parser.add_argument("--dry-run", action="store_true", help="Descarga local sin cargar HANA ni exportar")
+    parser.add_argument("--resume-file", default=env_str("RESUME_FILE", ""), help="Archivo SQLite local de una ejecución anterior")
     args = parser.parse_args()
     logger = setup_logger()
     started = time.monotonic()
-    hana = output = None
-    error_count = total_rows = skipped_without_text = 0
+    stage = None
     try:
-        config = load_config()
+        config = load_config(require_genesys=not bool(args.resume_file))
         config.dry_run = config.dry_run or args.dry_run
-        start, end, mode = parse_dates(args, config.timezone_name)
-        logger.info("Intervalo Genesys: %s/%s | %s | modo=%s", start, end, mode, config.output_mode)
-        # Preflight HANA antes de descargar: credenciales, tablas, tipos y claves.
-        if not config.dry_run:
-            hana = HanaTranscriptWriter(logger)
-            output = OutputWriter(config, logger)
-        token = get_access_token(config, logger)
-        config = apply_resolved_filters(config, token, logger)
-        wrapups = get_wrapup_catalog(config, token, logger)
-        queues = get_queue_catalog(config, token, logger)
-        validate_filter_safety(config, logger)
-        ids = split_filter_values(config.conversation_id)
-        if ids:
-            conversations = [fetch_conversation_details_by_id(config, token, cid, logger) for cid in ids]
+        # En Windows evitar por defecto el directorio del proyecto si está en OneDrive.
+        local_default = (Path(os.environ["LOCALAPPDATA"]) / "PyFlowManager" / "transcripciones"
+                         if os.getenv("LOCALAPPDATA") else Path(__file__).parent / "output" / "staging")
+        staging_dir = Path(env_str("STAGING_DIR", str(local_default)))
+        path = args.resume_file or (staging_dir /
+            ("transcripciones_" + datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8] + ".sqlite"))
+        stage = LocalStage(path, resume=bool(args.resume_file))
+        logger.info("Archivo local para reanudar: %s", stage.path, extra={"stage_progress": True})
+        token = None
+        if not args.resume_file:
+            token = prepare_stage(config, args, stage, logger)
+        settings = stage.meta("settings")
+        if stage.counts()["pending"] and settings["genesys_api_url"] != config.genesys_api_url:
+            raise ValueError("La región Genesys no coincide con la descarga guardada")
+        for key, value in settings.items():
+            setattr(config, key, value)
+        if not stage.meta("download_complete", False):
+            if stage.counts()["pending"] and token is None:
+                if not config.genesys_client_id or not config.genesys_client_secret:
+                    raise ValueError("La descarga pendiente requiere las credenciales de Genesys")
+                token = get_access_token(config, logger)
+            download_stage(config, token, stage, logger)
         else:
-            job = create_conversation_details_job(config, token, start, end, logger)
-            wait_details_job(config, token, job, logger)
-            conversations = fetch_details_job_results(config, token, job, logger)
-        unique = {}
-        for conv in conversations:
-            if conversation_matches_post_filters(conv, config):
-                cid = conv.get("conversationId") or conv.get("id")
-                if not cid:
-                    raise ValueError("Analytics devolvió conversación sin ID")
-                unique[cid] = conv
-        conversations = list(unique.values())
-        if config.max_conversations:
-            conversations = conversations[:config.max_conversations]
-        total = len(conversations)
-        logger.info("Conversaciones después de filtros y deduplicación: %s", total)
-        completed = 0
-        last_progress = time.monotonic()
-        iterator = iter(conversations)
-        # Ventana acotada: solo workers*2 resultados en vuelo; HANA no cruza hilos.
-        with ThreadPoolExecutor(max_workers=config.max_transcript_workers) as executor:
-            pending = {}
-            def submit_one():
-                conv = next(iterator, None)
-                if conv is None:
-                    return
-                future = executor.submit(process_conversation_transcripts, conv, config, token, wrapups, queues, logger)
-                pending[future] = conv
-            for _ in range(config.max_transcript_workers * 2):
-                submit_one()
-            while pending:
-                done, _ = wait(pending, return_when=FIRST_COMPLETED)
-                for future in done:
-                    conv = pending.pop(future)
-                    # Errores inesperados no se silencian ni se convierten en éxito.
-                    bundles = future.result()
-                    bundle = aggregate_conversation(bundles)
-                    error_count += bundle[MAIN][0]["TRANSCRIPT_ESTADO"] in ("ERROR", "PARCIAL")
-                    if has_transcript_text(bundle):
-                        if hana:
-                            hana.add(bundle)
-                        else:
-                            validate_bundle(bundle, aggregate=True)
-                        if output:
-                            output.add(bundle)
-                        total_rows += 1
-                    else:
-                        skipped_without_text += 1
-                    completed += 1
-                    now = time.monotonic()
-                    if completed == 1 or completed == total or now - last_progress >= 30:
-                        stats = API_THROTTLE.snapshot()
-                        logger.info("Avance %s/%s | con texto=%s | omitidas sin texto obtenido=%s | errores=%s | consultas urls/url=%s/%s | 429=%s | HANA confirmadas=%s",
-                                    completed, total, total_rows, skipped_without_text, error_count,
-                                    stats["transcripturls"], stats["transcripturl"], stats["http_429"],
-                                    hana.written_counts[MAIN] if hana else 0)
-                        print(f"PYFLOW_PROGRESS={int(90 * completed / max(1, total))}", flush=True)
-                        last_progress = now
-                    submit_one()
-        if hana:
-            hana.flush()
-            output.finish()
-        print("PYFLOW_PROGRESS=100", flush=True)
-        logger.info("Finalizado | filas con texto=%s | omitidas sin texto obtenido=%s | errores=%s | dry_run=%s",
-                    total_rows, skipped_without_text, error_count, config.dry_run)
-        return 1 if error_count else 0
+            logger.info("Descarga local ya completa; no se consultará Genesys.", extra={"stage_progress": True})
+        # Ninguna conexión HANA se abre hasta haber cerrado y confirmado toda la descarga.
+        close_http_sessions()
+        if not config.dry_run:
+            upload_stage(stage, logger)
+            if not stage.meta("export_complete", False):
+                export_stage(config, stage, logger)
+        counts = stage.counts()
+        logger.info("Finalizado | con texto=%s | sin texto obtenido=%s | errores=%s | duración=%.2fs | dry_run=%s",
+                    counts["text"], counts["total"] - counts["text"], counts["errors"],
+                    time.monotonic() - started, config.dry_run, extra={"stage_progress": True})
+        return 1 if counts["errors"] else 0
     except Exception as exc:
         logger.error("Proceso fallido: %s", safe_error(exc))
+        if stage is not None:
+            logger.error("Archivo conservado. Para reanudar usa RESUME_FILE: %s", stage.path)
         return 1
     finally:
         close_http_sessions()
-        if output:
-            output.close()
-        if hana:
-            hana.close()
-        logger.info("Resumen API | %s", API_THROTTLE.snapshot())
-        for handler in logger.handlers:
-            for log_filter in handler.filters:
-                if isinstance(log_filter, CompactConsoleFilter):
-                    log_filter.summarize(logger)
-        logger.info("Duración total: %.2fs", time.monotonic() - started)
+        if stage is not None:
+            stage.close()
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ import logging
 import re
 import sqlite3
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -256,8 +257,12 @@ class MainOnlyTests(unittest.TestCase):
 
     def test_main_pipeline_includes_only_text_and_counts_errors(self):
         config = types.SimpleNamespace(dry_run=False, timezone_name="America/Tegucigalpa",
-            output_mode="solo_transcript", conversation_id="", max_conversations=0, max_transcript_workers=2)
+            output_mode="solo_transcript", conversation_id="", max_conversations=0, max_transcript_workers=2,
+            genesys_api_url="https://api.test", media_type="todos", save_transcript_json=False,
+            json_output_dir="", output_format="csv", output_csv="test-output.csv")
         hana, output = Mock(), Mock()
+        hana.add.return_value = None
+        hana.flush.return_value = ["9"]
         hana.capacities = {}
         hana.written_counts = {m.MAIN: 0}
         log = Mock()
@@ -267,7 +272,7 @@ class MainOnlyTests(unittest.TestCase):
                 return [m.state_bundle({"CONVERSATION_ID": cid}, "comm", "ERROR", "failed")]
             return [bundle(cid=cid, text="hola" if cid == "9" else " \t")]
         replacements = {
-            "setup_logger": lambda: log, "load_config": lambda: config,
+            "setup_logger": lambda: log, "load_config": lambda **kwargs: config,
             "parse_dates": lambda *a: ("start", "end", "test"),
             "HanaTranscriptWriter": lambda *a: hana, "OutputWriter": lambda *a: output,
             "get_access_token": lambda *a: "token", "apply_resolved_filters": lambda *a: config,
@@ -279,6 +284,19 @@ class MainOnlyTests(unittest.TestCase):
         }
         log.handlers = []
         with ExitStack() as stack:
+            tmp = stack.enter_context(tempfile.TemporaryDirectory())
+            original_stage = m.LocalStage
+            stages = []
+            def make_stage(*args, **kwargs):
+                stage = original_stage(Path(tmp) / "test.sqlite")
+                stages.append(stage)
+                return stage
+            def make_hana(*args):
+                self.assertTrue(stages[0].meta("download_complete"))
+                self.assertEqual(stages[0].counts()["pending"], 0)
+                return hana
+            replacements["LocalStage"] = make_stage
+            replacements["HanaTranscriptWriter"] = make_hana
             stack.enter_context(patch.object(sys, "argv", ["test"]))
             stack.enter_context(redirect_stdout(io.StringIO()))
             for key, value in replacements.items():
