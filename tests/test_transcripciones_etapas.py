@@ -1,5 +1,6 @@
 """Persistencia local, recuperación tras fallos y progreso por etapa, sin servicios reales."""
 import io
+import json
 import logging
 import tempfile
 import sys
@@ -45,6 +46,50 @@ class StageTests(unittest.TestCase):
             with patch.object(m, "HanaTranscriptWriter") as hana, self.assertRaises(ValueError):
                 m.upload_stage(stage, Mock())
             hana.assert_not_called()
+        finally:
+            stage.close()
+
+    def test_diagnostics_preserved_without_individual_json_files(self):
+        config = types.SimpleNamespace(timezone_name="America/Tegucigalpa", media_type="todos",
+            save_transcript_json=True, json_output_dir=str(Path(self.temp.name) / "json"), api_sleep_seconds=0)
+        conv = {"conversationId": "1", "participants": [{"purpose": "customer", "sessions": [
+            {"sessionId": "a", "mediaType": "message"}]}]}
+        payload = {"transcriptId": "t", "phrases": [
+            {"text": "primera", "offset": {"unknown": 1}}, {"text": "segunda"}]}
+        stage = self.stage(["1"])
+        try:
+            with patch.object(m, "transcript_urls", return_value=[{"url": "test", "communicationId": "a"}]), \
+                 patch.object(m, "download_payload", return_value=payload):
+                result = m.aggregate_conversation(m.process_conversation_transcripts(conv, config, "token", {}, {}, Mock()))
+            stage.save(result)
+            stage.commit()
+            stage.close()
+            stage = m.LocalStage(self.path, resume=True)
+            self.assertEqual(stage.diagnostic_counts(), {"ordering": 1})
+            diagnostic = json.loads(stage.db.execute("SELECT payload FROM diagnostics").fetchone()[0])
+            self.assertEqual(diagnostic["source"], payload)
+            self.assertEqual(next(stage.results())[m.MAIN][0]["TEXT"], "primera\nsegunda")
+            self.assertFalse(Path(config.json_output_dir).exists())
+            with patch.object(m, "transcript_urls", side_effect=RuntimeError("API failure")):
+                failed = m.aggregate_conversation(m.process_conversation_transcripts(conv, config, "token", {}, {}, Mock()))
+            stage.save(failed)
+            stage.commit()
+            self.assertEqual(stage.diagnostic_counts(), {"error": 1})
+            self.assertEqual(stage.counts()["errors"], 1)
+            self.assertFalse(list(Path(self.temp.name).rglob("*.json")))
+        finally:
+            stage.close()
+
+    def test_resume_older_stage_adds_diagnostics_table(self):
+        stage = self.stage(["1"])
+        stage.save(m.aggregate_conversation([bundle(cid="1")]))
+        stage.db.execute("DROP TABLE diagnostics")
+        stage.commit()
+        stage.close()
+        stage = m.LocalStage(self.path, resume=True)
+        try:
+            self.assertEqual(stage.diagnostic_counts(), {})
+            self.assertEqual(next(stage.results())[m.MAIN][0]["TEXT"], "customer: hola")
         finally:
             stage.close()
 
@@ -116,6 +161,9 @@ class StageTests(unittest.TestCase):
         logger.propagate = False
         with redirect_stdout(io.StringIO()):
             logger.info("Routine API message")
+            for _ in range(1000):
+                logger.warning("Orden de transcript | very long diagnostic")
+                logger.warning("HTTP 429 | retry")
             for name in ("Descarga", "Carga HANA"):
                 progress = m.StageProgress(logger, name)
                 for i in range(1000):

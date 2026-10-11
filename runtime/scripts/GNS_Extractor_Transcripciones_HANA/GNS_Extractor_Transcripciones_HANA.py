@@ -119,7 +119,6 @@ PYFLOW_PARAMS = {
     "OUTPUT_CSV": {"type": "text", "label": "Ruta de salida opcional", "required": False},
     "RESUME_FILE": {"type": "text", "label": "Archivo local para reanudar (opcional)", "required": False},
     "STAGING_DIR": {"type": "text", "label": "Carpeta local de descarga (opcional)", "required": False},
-    "JSON_OUTPUT_DIR": {"type": "text", "label": "Carpeta JSON opcional", "required": False}
 }
 
 LOGGER_NAME = "gns_extractor_transcripciones_pyflow"
@@ -307,6 +306,8 @@ class CompactConsoleFilter(logging.Filter):
     def filter(self, record):
         if record.levelno >= logging.ERROR:
             return True
+        if str(record.msg).startswith(("Orden de transcript |", "HTTP 429")):
+            return False
         if record.levelno < logging.WARNING:
             return bool(getattr(record, "stage_progress", False))
         if str(record.msg).startswith("No hay filtros adicionales"):
@@ -1554,8 +1555,11 @@ def process_conversation_transcripts(conv, config, token, wrapups, queues, logge
         try:
             descriptors = transcript_urls(config, token, cid, comm, logger)
         except Exception as exc:
-            logger.warning("Transcript | conversationId=%s | communicationId=%s | %s", cid, comm, safe_error(exc))
-            bundles.append(state_bundle(base, comm, "ERROR", safe_error(exc), purpose))
+            logger.warning("Transcript | conversationId=%s | %s", cid, safe_error(exc)[:180])
+            failed = state_bundle(base, comm, "ERROR", safe_error(exc), purpose)
+            failed["_diagnostics"] = [{"kind": "error", "communication_id": comm,
+                                        "error": safe_error(exc), "source": None}]
+            bundles.append(failed)
             continue
         if not descriptors:
             bundles.append(state_bundle(base, comm, "SIN_TRANSCRIPCION_API", "Sin URLs disponibles", purpose))
@@ -1584,33 +1588,19 @@ def process_conversation_transcripts(conv, config, token, wrapups, queues, logge
                             raise ValueError("Dos transcripts distintos comparten clave técnica; no se sobrescribirán")
                         continue
                     seen[key] = fingerprint
-                    diagnostic_path = None
-                    if config.save_transcript_json or config.json_output_dir or ordering_warnings:
-                        directory = Path(config.json_output_dir or Path(__file__).parent / "output" / "json")
-                        if ordering_warnings and not (config.save_transcript_json or config.json_output_dir):
-                            directory = directory / "ordering_warnings"
-                        directory.mkdir(parents=True, exist_ok=True)
-                        filename = hashlib.sha256(canonical(key).encode()).hexdigest() + ".json"
-                        diagnostic_path = directory / filename
-                        diagnostic_path.write_text(json.dumps(unit, ensure_ascii=False, indent=2), encoding="utf-8")
-                    if ordering_warnings:
-                        logger.warning("Orden de transcript | conversationId=%s | communicationId=%s | texto conservado en orden de fuente | campos=%s | incidencias=%s | fuente=%s",
-                                       cid, comm, ", ".join(ordering_warnings[:5]), len(ordering_warnings), diagnostic_path)
+                    if ordering_warnings or config.save_transcript_json:
+                        bundle["_diagnostics"] = [{
+                            "kind": "ordering" if ordering_warnings else "source",
+                            "communication_id": comm, "transcript_id": row.get("TRANSCRIPT_ID"),
+                            "fields": ordering_warnings, "source": unit,
+                        }]
                     bundles.append(bundle)
             except Exception as exc:
-                path = None
-                if payload is not None:
-                    directory = Path(config.json_output_dir or env_str("OUTPUT_DIR", "") or Path(__file__).parent / "output") / "transcript_errors"
-                    directory.mkdir(parents=True, exist_ok=True)
-                    filename = hashlib.sha256(canonical([cid, comm, payload]).encode("utf-8")).hexdigest() + ".json"
-                    path = directory / filename
-                    temporary = path.with_suffix(".part.json")
-                    temporary.write_text(json.dumps({"conversationId": cid, "communicationId": comm,
-                        "error": safe_error(exc), "payload": payload}, ensure_ascii=False, indent=2), encoding="utf-8")
-                    os.replace(temporary, path)
-                logger.warning("Transcript | conversationId=%s | communicationId=%s | %s | fuente=%s",
-                               cid, comm, safe_error(exc), path or "no descargada")
-                bundles.append(state_bundle(base, comm, "ERROR", safe_error(exc), purpose, descriptor.get("recordingId")))
+                logger.warning("Transcript | conversationId=%s | %s", cid, safe_error(exc)[:180])
+                failed = state_bundle(base, comm, "ERROR", safe_error(exc), purpose, descriptor.get("recordingId"))
+                failed["_diagnostics"] = [{"kind": "error", "communication_id": comm,
+                                            "error": safe_error(exc), "source": payload}]
+                bundles.append(failed)
         if config.api_sleep_seconds:
             time.sleep(config.api_sleep_seconds)
     # Un marcador sin-transcript no debe sobrevivir al éxito en la misma comunicación.
@@ -1676,7 +1666,11 @@ def aggregate_conversation(bundles):
     parent["TEXT"] = "\n".join(lines) or None
     parent["PHRASES_COUNT"] = len(timeline)
     # Liberar frases/metadata auxiliar antes de acumular el lote de escritura.
-    return {MAIN: [parent]}
+    result = {MAIN: [parent]}
+    diagnostics = [item for b in ordered for item in b.get("_diagnostics", [])]
+    if diagnostics:
+        result["_diagnostics"] = diagnostics
+    return result
 
 
 def validate_bundle(bundle, capacities=None, check_lengths=True, aggregate=False):
@@ -1924,6 +1918,11 @@ class LocalStage:
                 raise ValueError("Formato de archivo local incompatible")
             if resume and not self.meta("prepared", False):
                 raise ValueError("La preparación no terminó; inicia una ejecución nueva sin RESUME_FILE")
+            # Compatible con archivos de descargas anteriores: no modifica sus resultados.
+            self.db.execute("""CREATE TABLE IF NOT EXISTS diagnostics (
+                cid TEXT NOT NULL, diagnostic_id TEXT NOT NULL, kind TEXT NOT NULL,
+                payload TEXT NOT NULL, PRIMARY KEY(cid, diagnostic_id))""")
+            self.db.commit()
         except Exception:
             self.close()
             raise
@@ -1965,6 +1964,12 @@ class LocalStage:
             result = json.dumps(row, ensure_ascii=False, default=lambda v: v.isoformat() if isinstance(v, datetime) else str(v))
         self.db.execute("UPDATE work SET result=?, state=?, source=NULL WHERE cid=?",
                         (result, state, row["CONVERSATION_ID"]))
+        self.db.execute("DELETE FROM diagnostics WHERE cid=?", (row["CONVERSATION_ID"],))
+        for diagnostic in bundle.get("_diagnostics", []):
+            payload = json.dumps(diagnostic, ensure_ascii=False, sort_keys=True)
+            identity = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+            self.db.execute("INSERT OR IGNORE INTO diagnostics VALUES (?, ?, ?, ?)",
+                            (row["CONVERSATION_ID"], identity, diagnostic["kind"], payload))
         # Un único coordinador confirma hasta 100 resultados; la interrupción solo repite ese bloque.
 
     def commit(self):
@@ -1976,6 +1981,9 @@ class LocalStage:
             COALESCE(SUM(state IN ('ERROR','PARCIAL')),0),
             COALESCE(SUM(result IS NOT NULL AND uploaded=0),0) FROM work""").fetchone()
         return dict(zip(("total", "pending", "text", "errors", "upload_pending"), row))
+
+    def diagnostic_counts(self):
+        return dict(self.db.execute("SELECT kind, COUNT(*) FROM diagnostics GROUP BY kind").fetchall())
 
     def results(self, only_pending=False):
         after = 0
@@ -2152,6 +2160,9 @@ def main():
             if not stage.meta("export_complete", False):
                 export_stage(config, stage, logger)
         counts = stage.counts()
+        logger.info("Avisos de orden guardados: %s | pausas de Genesys en esta ejecución: %s",
+                    stage.diagnostic_counts().get("ordering", 0), API_THROTTLE.snapshot()["http_429"],
+                    extra={"stage_progress": True})
         logger.info("Finalizado | con texto=%s | sin texto obtenido=%s | errores=%s | duración=%.2fs | dry_run=%s",
                     counts["text"], counts["total"] - counts["text"], counts["errors"],
                     time.monotonic() - started, config.dry_run, extra={"stage_progress": True})
