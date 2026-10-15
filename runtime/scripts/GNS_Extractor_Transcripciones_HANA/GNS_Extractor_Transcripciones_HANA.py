@@ -92,16 +92,16 @@ PYFLOW_PARAMS = {
         "default": "solo_transcript"
     },
     "ORIGINAL_DIRECTION": {
-        "type": "select",
+        "type": "multiselect",
         "label": "Dirección original",
         "required": False,
         "options": ["ambas", "inbound", "outbound"],
         "default": "ambas"
     },
     "FLOW_SELECTION_ID": {"type": "genesys_flow", "label": "Nombre de flujo (buscar y seleccionar)", "required": False},
-    "FLOW_ID": {"type": "text", "label": "ID del flujo (prioridad sobre el nombre seleccionado)", "required": False},
-    "MEDIA_TYPE": {"type": "select", "label": "Tipo de medio (voice = voz, message = mensaje)", "required": False, "options": ["todos", "voice", "message", "email", "chat", "callback", "cobrowse", "internalmessage", "screenmonitoring", "screenshare", "video", "unknown"], "default": "todos"},
-    "PARTICIPANT_PURPOSE": {"type": "select", "label": "Segmento / propósito del participante", "required": False, "options": ["todos", "acd", "agent", "api", "botflow", "campaign", "customer", "dialer", "external", "fax", "group", "inbound", "ivr", "manual", "outbound", "station", "user", "voicemail", "voicesurveyflow", "workflow"], "default": "todos"},
+    "FLOW_ID": {"type": "tags", "label": "ID del flujo (prioridad sobre el nombre seleccionado)", "required": False},
+    "MEDIA_TYPE": {"type": "multiselect", "label": "Tipo de medio (voice = voz, message = mensaje)", "required": False, "options": ["todos", "voice", "message", "email", "chat", "callback", "cobrowse", "internalmessage", "screenmonitoring", "screenshare", "video", "unknown"], "default": "todos"},
+    "PARTICIPANT_PURPOSE": {"type": "multiselect", "label": "Segmento / propósito del participante", "required": False, "options": ["todos", "acd", "agent", "api", "botflow", "campaign", "customer", "dialer", "external", "fax", "group", "inbound", "ivr", "manual", "outbound", "station", "user", "voicemail", "voicesurveyflow", "workflow"], "default": "todos"},
     "CONVERSATION_ID": {"type": "tags", "label": "Conversation ID específico", "required": False},
     "USER_ID": {"type": "tags", "label": "User ID del agente", "required": False},
     "USER_NAME": {"type": "genesys_users", "label": "Nombre/correo del agente", "required": False},
@@ -396,13 +396,16 @@ def load_config(require_genesys=True) -> Config:
     if output_mode not in ("solo_transcript", "transcript_campania"):
         raise ValueError("OUTPUT_MODE debe ser solo_transcript o transcript_campania")
     original_direction = env_str("ORIGINAL_DIRECTION", "ambas").lower()
-    if original_direction not in ("ambas", "inbound", "outbound"):
+    if any(v not in ("ambas", "inbound", "outbound") for v in split_filter_values(original_direction)):
         raise ValueError("ORIGINAL_DIRECTION debe ser ambas, inbound u outbound")
     media_type = env_str("MEDIA_TYPE", "todos").lower()
     participant_purpose = env_str("PARTICIPANT_PURPOSE", "todos").lower()
     for key, value in (("MEDIA_TYPE", media_type), ("PARTICIPANT_PURPOSE", participant_purpose)):
-        if value not in PYFLOW_PARAMS[key]["options"]:
+        if any(v not in PYFLOW_PARAMS[key]["options"] for v in split_filter_values(value)):
             raise ValueError(f"{key} no válido: {value}")
+    original_direction = "ambas" if "ambas" in split_filter_values(original_direction) else join_filter_values(split_filter_values(original_direction)) or "ambas"
+    media_type = "todos" if "todos" in split_filter_values(media_type) else join_filter_values(split_filter_values(media_type)) or "todos"
+    participant_purpose = "todos" if "todos" in split_filter_values(participant_purpose) else join_filter_values(split_filter_values(participant_purpose)) or "todos"
     output_format = env_str("OUTPUT_FORMAT", "xlsx").lower()
     if output_format not in ("xlsx", "csv"):
         raise ValueError("OUTPUT_FORMAT debe ser xlsx o csv")
@@ -918,7 +921,7 @@ def build_details_job_body(start_utc: str, end_utc: str, config: Config) -> Dict
     }
     if segment_filters:
         body["segmentFilters"] = segment_filters
-    if config.original_direction in ("inbound", "outbound"):
+    if config.original_direction and config.original_direction != "ambas":
         body["conversationFilters"] = [build_dimension_filter("originatingDirection", config.original_direction)]
     return body
 
@@ -931,7 +934,7 @@ def conversation_matches_post_filters(conversation: Dict[str, Any], config: Conf
             return False
 
     direction = str(conversation.get("originatingDirection") or "").lower()
-    if config.original_direction in ("inbound", "outbound") and direction != config.original_direction:
+    if config.original_direction != "ambas" and not filter_contains(direction, config.original_direction):
         return False
 
     dialer = extract_dialer_attributes(conversation)
@@ -944,10 +947,10 @@ def conversation_matches_post_filters(conversation: Dict[str, Any], config: Conf
     sessions = [s for p in participants for s in p.get("sessions") or []]
     # Flujo y agente pueden estar en sesiones diferentes de la conversación.
     if config.participant_purpose != "todos" and not any(
-        p.get("purpose") == config.participant_purpose for p in participants
+        filter_contains(str(p.get("purpose") or ""), config.participant_purpose) for p in participants
     ):
         return False
-    if config.media_type != "todos" and not any(s.get("mediaType") == config.media_type for s in sessions):
+    if config.media_type != "todos" and not any(filter_contains(str(s.get("mediaType") or ""), config.media_type) for s in sessions):
         return False
     if config.flow_id and not any(
         filter_contains(str((s.get("flow") or {}).get("flowId") or ""), config.flow_id) for s in sessions
@@ -1210,7 +1213,7 @@ def obtener_session_ids_para_transcript(conversation_details: Dict[str, Any], me
 
         for session in participant.get("sessions") or []:
             media_type = str(session.get("mediaType") or "").lower()
-            if media_filter != "todos" and media_type != media_filter:
+            if media_filter != "todos" and not filter_contains(media_type, media_filter):
                 continue
 
             communication_id = session.get("sessionId") or session.get("communicationId")

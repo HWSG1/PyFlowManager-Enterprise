@@ -70,6 +70,8 @@ import { GenesysFlowSelectComponent } from '../genesys-flow-select/genesys-flow-
                           <option [value]="opt">{{ opt }}</option>
                         }
                       </select>
+                    } @else if (p.control_type === 'multiselect') {
+                      <app-genesys-flow-select catalog="options" [options]="getOptions(p)" [(value)]="p.value" />
                     } @else if (p.control_type === 'select') {
                       <select
                         [(ngModel)]="p.value"

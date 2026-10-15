@@ -180,6 +180,8 @@ import { GenesysFlowSelectComponent } from '../genesys-flow-select/genesys-flow-
                           <option [value]="opt">{{ opt }}</option>
                         }
                       </select>
+                    } @else if (param.control_type === 'multiselect') {
+                      <app-genesys-flow-select catalog="options" [options]="parseOptions(param.options_json)" [(value)]="paramValues[param.param_key]" />
                     } @else if (param.control_type === 'select') {
                       <select
                         [(ngModel)]="paramValues[param.param_key]"

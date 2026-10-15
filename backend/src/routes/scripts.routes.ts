@@ -579,14 +579,16 @@ router.get('/:id/parameters', requireAuth, requireScriptAccess('view'), async (r
     const rows = result.recordset;
     const isGnsIvr = rows.some((row: any) => row.script_name === 'GNS_IVR.py');
     const isTranscriptionExtractor = rows.some((row: any) => row.script_name === 'GNS_Extractor_Transcripciones.py');
+    const isHanaTranscriptionExtractor = rows.some((row: any) => row.script_name === 'GNS_Extractor_Transcripciones_HANA.py');
     const isGnsColasVolumenes = rows.some((row: any) => row.script_name === 'GNS_Colas_y_Volumenes.py');
     const isGnsPerformance = rows.some((row: any) => row.script_name === 'GNS_Performance.py');
     const isGnsAdherencia = rows.some((row: any) => row.script_name === 'GNS_Adherencia.py');
     const isGnsEstadosAgentes = rows.some((row: any) => row.script_name === 'GNS_Estados_Agentes.py');
 
-    if (isTranscriptionExtractor) {
+    if (isTranscriptionExtractor || isHanaTranscriptionExtractor) {
       // Lee los nuevos controles desde el archivo sin borrar parámetros guardados.
-      const source = path.join(scriptsDir, 'GNS_Extractor_Transcripciones', 'GNS_Extractor_Transcripciones.py');
+      const extractor = isHanaTranscriptionExtractor ? 'GNS_Extractor_Transcripciones_HANA' : 'GNS_Extractor_Transcripciones';
+      const source = path.join(scriptsDir, extractor, `${extractor}.py`);
       const definitions = extractPyflowParams(fs.readFileSync(source, 'utf8'));
       for (const key of ['FLOW_SELECTION_ID', 'FLOW_ID', 'MEDIA_TYPE', 'PARTICIPANT_PURPOSE', 'ORIGINAL_DIRECTION', 'USER_NAME', 'QUEUE_NAME', 'CAMPAIGN_NAME', 'CONTACT_LIST_NAME', 'WRAPUP_CODE_NAME']) {
         const definition = definitions[key];
