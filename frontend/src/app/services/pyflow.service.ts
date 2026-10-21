@@ -430,9 +430,11 @@ export class PyflowService {
     };
   }
 
-  getExecutionLogs(executionId: string | number) {
+  getExecutionLogs(executionId: string | number, afterId = '0') {
     const id = String(executionId).replace('EX-', '');
-    return this.http.get<any[]>(`${this.apiUrl}/executions/${id}/logs`);
+    return this.http.get<{
+      rows: any[]; nextAfterId: string; hasMore: boolean; status: string | null;
+    }>(`${this.apiUrl}/executions/${id}/logs`, { params: { afterId } });
   }
 
   getExecutionParameters(executionId: string | number) {

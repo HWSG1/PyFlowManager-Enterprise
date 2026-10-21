@@ -54,22 +54,32 @@ router.get('/:id/logs', requireAuth, requireExecutionAccess('view'), async (req,
     const pool = await getPool();
     const id = Number(req.params.id);
 
+    const afterId = String(req.query.afterId ?? '0');
+    if (!Number.isInteger(id) || id <= 0 || !/^\d{1,19}$/.test(afterId)
+        || BigInt(afterId) > 9223372036854775807n) {
+      return res.status(400).json({ message: 'ID de ejecución o cursor inválido.' });
+    }
     const result = await pool.request()
       .input('id', sql.Int, id)
+      .input('after_id', sql.BigInt, afterId)
       .query(`
-        SELECT
-          id,
-          execution_id,
-          log_level,
-          message,
-          logged_at,
-          source
+        SELECT TOP (501)
+          CONVERT(varchar(20), id) AS id,
+          execution_id, log_level, message, logged_at, source
         FROM dbo.ExecutionLogs
-        WHERE execution_id = @id
-        ORDER BY logged_at ASC, id ASC
+        WHERE execution_id = @id AND id > @after_id
+        ORDER BY id ASC;
+
+        SELECT status FROM dbo.ScriptExecutions WHERE id = @id;
       `);
 
-    res.json(result.recordset);
+    const rows = result.recordsets[0].slice(0, 500);
+    res.json({
+      rows,
+      nextAfterId: rows.length ? rows[rows.length - 1].id : afterId,
+      hasMore: result.recordsets[0].length > 500,
+      status: result.recordsets[1][0]?.status ?? null
+    });
   } catch (err) {
     next(err);
   }

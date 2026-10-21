@@ -860,51 +860,7 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
     this.stopConsoleWatch();
     const sessionId = this.consoleSessionId;
 
-    const seen = new Set<string>();
-
-    const loadLogsFromDb = () => {
-      this.svc.getExecutionLogs(executionId).subscribe({
-        next: rows => {
-          if (sessionId !== this.consoleSessionId || this.currentExecutionId !== executionId) return;
-
-          for (const row of rows) {
-            const key = `${row.id}-${row.message}`;
-
-            if (seen.has(key)) continue;
-            seen.add(key);
-
-            const progress = this.readProgress(row.message);
-            if (progress !== null) {
-              this.progress = progress;
-              continue;
-            }
-
-            let css = 'text-slate-300';
-
-            if (row.log_level === 'ERROR') css = 'text-red-400';
-            if (row.log_level === 'WARNING') css = 'text-amber-400';
-            if (row.message?.toLowerCase().includes('exitosamente')) {
-              css = 'text-emerald-400 font-bold';
-            }
-
-            this.consoleLines.push({
-              text: `[${row.log_level}] ${row.message}`,
-              cls: css
-            });
-            this.scrollConsoleToBottom();
-          }
-
-          this.scrollConsoleToBottom();
-        }
-      });
-    };
-
-    loadLogsFromDb();
-
-    this.intervalId = setInterval(() => {
-      loadLogsFromDb();
-      this.svc.loadExecutions();
-    }, 2000);
+    this.startIncrementalLogWatch(executionId, sessionId);
 
     const token = encodeURIComponent(localStorage.getItem('pyflow_token') || '');
     this.eventSource = new EventSource(`${environment.apiUrl}/executions/${executionId}/stream?access_token=${token}`);
@@ -946,15 +902,10 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
         this.progress = 100;
         this.statusText = payload.status;
 
-        if (this.intervalId) {
-          clearInterval(this.intervalId);
-          this.intervalId = null;
-        }
-
         this.eventSource?.close();
         this.eventSource = null;
 
-        loadLogsFromDb();
+        // The incremental watcher drains remaining logs and confirms final status.
         this.svc.loadExecutions();
         this.svc.loadScripts();
       }
@@ -1150,79 +1101,68 @@ export class ScriptDetailComponent implements OnInit, OnDestroy {
     this.loadExecutionParametersForLog(cleanId);
     const sessionId = this.consoleSessionId;
 
-    const loadLogs = () => {
-      this.svc.getExecutionLogs(cleanId).subscribe({
-        next: rows => {
-          if (sessionId !== this.consoleSessionId || this.currentExecutionId !== cleanId) return;
+    this.startIncrementalLogWatch(cleanId, sessionId);
+  }
 
-          this.consoleLines = [];
+  private startIncrementalLogWatch(executionId: number, sessionId: number) {
+    let afterId = '0';
+    let loading = false;
+    let finished = false;
+    let hasMore = false;
+    const isCurrent = () => sessionId === this.consoleSessionId
+      && this.currentExecutionId === executionId;
 
-          if (!rows || rows.length === 0) {
-            this.consoleLines.push({
-              text: `[SYSTEM] No hay logs registrados para EX-${cleanId}.`,
-              cls: 'text-slate-500'
-            });
-            this.scrollConsoleToBottom();
-          }
-
-          for (const row of rows) {
+    const load = () => {
+      if (loading || finished || !isCurrent()) return;
+      loading = true;
+      this.svc.getExecutionLogs(executionId, afterId).subscribe({
+        next: page => {
+          if (!isCurrent()) return;
+          afterId = page.nextAfterId;
+          hasMore = page.hasMore;
+          for (const row of page.rows) {
             const progress = this.readProgress(row.message);
             if (progress !== null) {
               this.progress = progress;
               continue;
             }
-
             let css = 'text-slate-300';
-
             if (row.log_level === 'ERROR') css = 'text-red-400';
             if (row.log_level === 'WARNING') css = 'text-amber-400';
             if (row.message?.toLowerCase().includes('exitosamente')) {
               css = 'text-emerald-400 font-bold';
             }
-
-            this.consoleLines.push({
-              text: `[${row.log_level}] ${row.message}`,
-              cls: css
-            });
-            this.scrollConsoleToBottom();
+            this.consoleLines.push({ text: `[${row.log_level}] ${row.message}`, cls: css });
           }
-
-          this.svc.loadExecutions();
-
-          const selectedExecution = this.scriptExecutions.find(
-            ex => String(ex.id).replace('EX-', '') === String(cleanId)
-          );
-
-          if (selectedExecution?.status === 'Ejecutando') {
-            this.isRunning = true;
-            this.isPaused = false;
-            this.statusText = 'Ejecutando';
-            this.progress = 50;
-          } else if (selectedExecution?.status === 'Pausado') {
-            this.isRunning = false;
-            this.isPaused = true;
-            this.statusText = 'Pausado';
-          } else {
-            this.isRunning = false;
-            this.isPaused = false;
-            this.statusText = selectedExecution?.status || 'Detenido / En espera';
-
-            if (selectedExecution?.status === 'Exitoso' || selectedExecution?.status === 'Cancelado') {
-              this.progress = 100;
-            }
-          }
-
           this.scrollConsoleToBottom();
+          if (page.status) {
+            this.isRunning = page.status === 'Ejecutando';
+            this.isPaused = page.status === 'Pausado';
+            this.statusText = page.status;
+          }
+          const terminal = ['Exitoso', 'Error', 'Cancelado'].includes(page.status || '');
+          if (terminal && !page.hasMore) {
+            finished = true;
+            if (this.intervalId) clearInterval(this.intervalId);
+            this.intervalId = null;
+            this.eventSource?.close();
+            this.eventSource = null;
+            if (page.status === 'Exitoso' || page.status === 'Cancelado') this.progress = 100;
+            this.svc.loadExecutions();
+            this.svc.loadScripts();
+          }
+        },
+        error: () => { loading = false; },
+        complete: () => {
+          loading = false;
+          // Drain history sequentially without waiting for the polling interval.
+          if (hasMore && isCurrent() && !finished) setTimeout(load, 0);
         }
       });
     };
-
-    loadLogs();
-
-    this.intervalId = setInterval(() => {
-      loadLogs();
-      this.svc.loadScripts();
-    }, 2000);
+    // One bounded page at a time; slow requests never overlap.
+    this.intervalId = setInterval(load, 5000);
+    load();
   }
 
   cancelDeleteConfirm() {
