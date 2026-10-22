@@ -120,6 +120,14 @@ router.get('/:id/stream', requireAuth, requireExecutionAccess('view'), async (re
     Connection: 'keep-alive'
   });
 
+  // SSE comments keep idle proxy connections active without dispatching onmessage.
+  res.flushHeaders();
+  res.write(': connected\n\n');
+  const heartbeat = setInterval(() => {
+    res.write(': heartbeat\n\n');
+  }, 15000);
+  heartbeat.unref();
+
   const eventName = `execution:${executionId}`;
 
   const handler = (payload: any) => {
@@ -128,7 +136,8 @@ router.get('/:id/stream', requireAuth, requireExecutionAccess('view'), async (re
 
   logBus.on(eventName, handler);
 
-  req.on('close', () => {
+  res.on('close', () => {
+    clearInterval(heartbeat);
     logBus.off(eventName, handler);
   });
 });
