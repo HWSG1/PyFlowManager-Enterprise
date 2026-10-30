@@ -1,0 +1,9 @@
+{
+  "name": "pyflow-inbound-excel",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=18" },
+  "scripts": { "test": "node --test build_excel.test.mjs" },
+  "dependencies": { "exceljs": "4.4.0" }
+}

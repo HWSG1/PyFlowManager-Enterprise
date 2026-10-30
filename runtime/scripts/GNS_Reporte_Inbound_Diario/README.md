@@ -91,11 +91,33 @@ fuente principal Neo Sans Std, con Arial como alternativa en el correo.
 La fuente no venia en el ZIP y no se instala ni distribuye con el reporte.
 El destinatario debe tenerla disponible para verla exactamente.
 
-`config/build_excel.mjs` genera el Excel con `@oai/artifact-tool` desde el JSON de metricas
-originales. Requiere Node.js en PATH (o `PYFLOW_NODE_COMMAND`) y esa biblioteca.
-En esta PC, `node_modules` es una junction al runtime de bibliotecas de Codex.
-Al mover el proceso a otra PC hay que provisionar esa dependencia y conservar
-`config/build_excel.mjs` y `input` junto al script Python. No son secretos.
+`config/build_excel.mjs` genera el Excel con ExcelJS desde el JSON de metricas
+originales. Requiere Node.js 18 o superior en PATH (o `PYFLOW_NODE_COMMAND`).
+No requiere Codex, `@oai/artifact-tool`, ni enlaces a carpetas de otra PC.
+Conservar la carpeta `config` completa y `input` junto al script Python.
+
+### Instalar en produccion
+
+Desde la raiz del repositorio, despues de actualizar con Git:
+
+```powershell
+npm ci --prefix "runtime/scripts/GNS_Reporte_Inbound_Diario/config" --omit=dev
+```
+
+El comando instala ExcelJS y sus dependencias en `config/node_modules` usando
+las versiones del `package-lock.json`. No se sube `node_modules` a Git.
+Python sigue necesitando Pillow y tzdata del archivo `requirements.txt`.
+
+Para verificar el Excel sin consultar Genesys ni enviar correo, usar el JSON que
+dejo la ejecucion fallida (ajustar las fechas al archivo existente):
+
+```powershell
+node "runtime/scripts/GNS_Reporte_Inbound_Diario/config/build_excel.mjs" "runtime/scripts/GNS_Reporte_Inbound_Diario/output/inbound_2026-10-01_2026-10-29.json" "runtime/scripts/GNS_Reporte_Inbound_Diario/output/inbound_2026-10-01_2026-10-29.xlsx"
+```
+
+Pruebas locales del generador: `npm test --prefix runtime/scripts/GNS_Reporte_Inbound_Diario/config`.
+El generador conserva resultados numericos calculados desde las sumas originales
+junto con las formulas; Excel recalcula las formulas al abrir el archivo.
 
 El archivo Excel es obligatorio para el envio: si no se puede generar, el proceso
 falla antes de enviar el correo. El adjunto directo se limita a menos de 3 MB;
