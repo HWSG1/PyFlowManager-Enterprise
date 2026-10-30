@@ -31,6 +31,7 @@ __pycache__/
 # Recursos necesarios del reporte, no son datos de ejecucion
 !/runtime/scripts/ABA_Reporte_Diario/input/Logo_Banco_Atlantida_Email.png
 !/runtime/scripts/ABA_Reporte_Diario/input/plantilla_correo_ordenes_aba.html
+!/runtime/scripts/GNS_Reporte_Inbound_Diario/input/logo-04.png
 
 /runtime/scripts/.uploads/
 /.codex_tmp*/

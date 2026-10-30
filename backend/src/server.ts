@@ -50,7 +50,7 @@ app.use((err: any, _req: express.Request, res: express.Response, _next: express.
   });
 });
 
-app.listen(env.port, () => {
+app.listen(env.port, '127.0.0.1', () => {
   console.log(`PyFlow backend listening on http://localhost:${env.port}`);
 
   startScheduler();
